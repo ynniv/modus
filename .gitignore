@@ -1,0 +1,29 @@
+# Build artifacts
+*.img
+*.o
+*.fasl
+*.core
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*~
+
+# Quicklisp
+quicklisp.lisp
+quicklisp/
+
+# Local configuration
+*.local.lisp
+
+# Temp files
+tmp/
+temp/
+nohup.out
+
+# Logs
+modus/log/
+
+# Movitz build state
+lib/movitz/bootblock-id.txt

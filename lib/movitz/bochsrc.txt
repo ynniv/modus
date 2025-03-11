@@ -1,0 +1,55 @@
+######################################################################
+## 
+##    Copyright (C) 2003-2004, 
+##    Department of Computer Science, University of Tromso, Norway.
+## 
+##    For distribution policy, see the accompanying file COPYING.
+## 
+## Filename:      bochsrc.txt
+## Description:   Bochs configuration file for frodef's Movitz setup.
+##                You can use this as a template, but you'll need to
+##                change the file paths etc.
+## Author:        Frode Vatvedt Fjeld <frodef@acm.org>
+## Created at:    Wed Jul 21 13:41:59 2004
+##                
+######################################################################
+
+# how much memory the emulated machine will have
+megs: 64
+
+# filename of ROM images
+#romimage: file=/usr/local/bochs/1.2.1/BIOS-bochs-latest, address=0xf0000
+#vgaromimage: /usr/local/bochs/1.2.1/VGABIOS-elpin-2.40
+romimage: file=../../tmp/bochs-cvs/bios/BIOS-bochs-latest, address=0xf0000
+vgaromimage: ../../tmp/bochs-cvs/bios/VGABIOS-elpin-2.40
+
+# This is just to make X11 clipboard pasting into bochs work.
+keyboard_mapping: enabled=1, map=../../tmp/bochs-cvs/gui/keymaps/x11-pc-us.map
+
+# what disk images will be used 
+floppya: 1_44=los0-image, status=inserted
+#floppya: 1_44=grub, status=inserted
+#floppyb: 1_44=floppyb.img, status=inserted
+#diskc: file=hd10meg.img, cyl=306, heads=4, spt=17
+#newharddrivesupport: enabled=1
+
+
+# choose the boot disk.
+boot: a
+
+# where do we send log messages?
+log: bochsout.txt
+
+vga_update_interval: 100000
+
+# disable the mouse, since DLX is text only
+mouse: enabled=0
+
+ne2k: ioaddr=0x300, irq=3, mac=00:40:05:18:66:d9, ethmod=fbsd, ethdev=nge0
+
+# panic: action=report
+error: action=report
+# debug: action=report
+
+ips: 2000000
+# com1: dev=/dev/ptypv

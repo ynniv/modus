@@ -1,0 +1,61 @@
+######################################################################
+## 
+##    Copyright (C) 2003-2004, 
+##    Department of Computer Science, University of Tromsoe, Norway.
+## 
+##    For distribution policy, see the accompanying file COPYING.
+## 
+## Filename:      ideas.txt
+## Description:   
+## Author:        Frode Vatvedt Fjeld <frodef@acm.org>
+## Created at:    Fri Dec 12 19:19:39 2003
+##                
+## $Id: ideas.txt,v 1.4 2007/03/15 16:11:17 ffjeld Exp $
+##                
+######################################################################
+
+** Symbols and global variables
+
+  - I'm starting to suspect that there should be no global
+    symbol-value cell. I don't think they're required, and perhaps
+    there's really no scenario where they're the adequate solution.
+
+** Method dispatch caching
+
+  - Can we make the cache per caller funobj? This should be possible
+    if we add one cache slot to each (caller) funobj. In many cases
+    this would allow for a cache-size of 1 or 2, say. And it'd be
+    possible to determine these cases dynamically.
+
+  - It might be feasible to locate some specialization-tables directly
+    in the instance structure. For example eql-specialized methods.
+
+
+** Function calls via symbols
+
+  - It's a CPU-cache utilization problem that whenever a function is
+    called via a symbol, the entire symbol is likely to be loaded into
+    the cache (cache-lines are 32 bytes or more), whereas only the
+    function-value cell is likely to be used. If symbols are assigned
+    a small structure, like a cons cell, for holding their
+    function-value, then funcalls can go via this cell rather than the
+    symbol. If suchs cells are located cleverly wrt. CPU caching, a
+    substantial improvement in cache performance might be feasible.
+
+  - The above idea can be taken one step further. Observe that a cons
+    cell such as described above will represent a mapping from a
+    symbol S to a function F. Now, we can represent this same mapping
+    by a funobj FS which is a copy of the funobj F, and with the same
+    code-vectors. This way, the entire indirect reference to get a
+    symbol's function-value can be eliminated in the normal case. The
+    cost is the space overhead of the funobj copies, and a somewhat
+    more complicated (setf symbol-function). I.e. it would have to
+    install in the old FS a code-vector that updates the caller
+    function's references to the new FS, before trampolining to the
+    new FS. The performance gain could be substantial.
+
+
+** Caching strategies
+
+  - Might e.g. write-combining or other relaxed memory coherence
+    models be used, e.g. within one "thread" area?
