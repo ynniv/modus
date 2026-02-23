@@ -1,0 +1,483 @@
+;;;; x64-asm.lisp - x86-64 Instruction Encoder
+;;;;
+;;;; Part of Modus64 cross-compiler (runs on SBCL)
+;;;; Minimal, purpose-built for bootstrap - not a general assembler
+;;;;
+;;;; References:
+;;;;   - Intel SDM Volume 2 (Instruction Set Reference)
+;;;;   - AMD64 Architecture Programmer's Manual Volume 3
+
+;; Package defined in packages.lisp
+
+(in-package :modus64.asm)
+
+;;; ============================================================
+;;; Code Buffer
+;;; ============================================================
+
+(defstruct code-buffer
+  (bytes (make-array 4096 :element-type '(unsigned-byte 8)
+                          :adjustable t :fill-pointer 0))
+  (labels (make-hash-table :test 'eq))      ; label -> position
+  (fixups nil))                              ; list of (position label offset-size)
+
+(defun emit-byte (buf byte)
+  (vector-push-extend (ldb (byte 8 0) byte) (code-buffer-bytes buf)))
+
+(defun emit-bytes (buf &rest bytes)
+  (dolist (b bytes)
+    (emit-byte buf b)))
+
+(defun emit-u16 (buf value)
+  (emit-byte buf (ldb (byte 8 0) value))
+  (emit-byte buf (ldb (byte 8 8) value)))
+
+(defun emit-u32 (buf value)
+  (emit-byte buf (ldb (byte 8 0) value))
+  (emit-byte buf (ldb (byte 8 8) value))
+  (emit-byte buf (ldb (byte 8 16) value))
+  (emit-byte buf (ldb (byte 8 24) value)))
+
+(defun emit-u64 (buf value)
+  (emit-u32 buf (ldb (byte 32 0) value))
+  (emit-u32 buf (ldb (byte 32 32) value)))
+
+(defun emit-s32 (buf value)
+  ;; Sign-extend if negative
+  (emit-u32 buf (if (minusp value)
+                    (logand #xFFFFFFFF value)
+                    value)))
+
+(defun code-buffer-position (buf)
+  (fill-pointer (code-buffer-bytes buf)))
+
+;;; ============================================================
+;;; Labels and Fixups
+;;; ============================================================
+
+(defstruct label
+  (name (gensym "L"))
+  (position nil))
+
+(defun emit-label (buf label)
+  (setf (label-position label) (code-buffer-position buf))
+  (setf (gethash label (code-buffer-labels buf)) (label-position label)))
+
+(defun emit-label-ref-rel32 (buf label)
+  "Emit a 32-bit relative reference to label (filled in later)"
+  (push (list (code-buffer-position buf) label 4) (code-buffer-fixups buf))
+  (emit-u32 buf 0))  ; placeholder
+
+(defun fixup-labels (buf)
+  "Resolve all label references"
+  (let ((bytes (code-buffer-bytes buf)))
+    (dolist (fixup (code-buffer-fixups buf))
+      (destructuring-bind (pos label size) fixup
+        (let* ((target (or (label-position label)
+                           (error "Undefined label: ~A" (label-name label))))
+               ;; rel32 is relative to end of instruction (pos + 4)
+               (rel (- target (+ pos size))))
+          (ecase size
+            (4 (setf (aref bytes pos) (ldb (byte 8 0) rel)
+                     (aref bytes (+ pos 1)) (ldb (byte 8 8) rel)
+                     (aref bytes (+ pos 2)) (ldb (byte 8 16) rel)
+                     (aref bytes (+ pos 3)) (ldb (byte 8 24) rel))))))))
+  buf)
+
+;;; ============================================================
+;;; Registers
+;;; ============================================================
+
+;; Register encoding: (code size needs-rex-for-low-byte)
+(eval-when (:compile-toplevel :load-toplevel :execute)
+  (defparameter *registers*
+    '((rax  0 64 nil) (rcx  1 64 nil) (rdx  2 64 nil) (rbx  3 64 nil)
+      (rsp  4 64 nil) (rbp  5 64 nil) (rsi  6 64 nil) (rdi  7 64 nil)
+      (r8   8 64 t)   (r9   9 64 t)   (r10 10 64 t)   (r11 11 64 t)
+      (r12 12 64 t)   (r13 13 64 t)   (r14 14 64 t)   (r15 15 64 t)
+      ;; 32-bit
+      (eax  0 32 nil) (ecx  1 32 nil) (edx  2 32 nil) (ebx  3 32 nil)
+      (esp  4 32 nil) (ebp  5 32 nil) (esi  6 32 nil) (edi  7 32 nil)
+      (r8d  8 32 t)   (r9d  9 32 t)   (r10d 10 32 t)  (r11d 11 32 t)
+      (r12d 12 32 t)  (r13d 13 32 t)  (r14d 14 32 t)  (r15d 15 32 t)
+      ;; 8-bit
+      (al   0 8 nil)  (cl   1 8 nil)  (dl   2 8 nil)  (bl   3 8 nil)
+      (spl  4 8 t)    (bpl  5 8 t)    (sil  6 8 t)    (dil  7 8 t)
+      (r8b  8 8 t)    (r9b  9 8 t)    (r10b 10 8 t)   (r11b 11 8 t)
+      (r12b 12 8 t)   (r13b 13 8 t)   (r14b 14 8 t)   (r15b 15 8 t))))
+
+;; Define register symbols
+(defmacro define-registers ()
+  `(progn
+     ,@(mapcar (lambda (r) `(defconstant ,(first r) ',(first r)))
+               *registers*)))
+(define-registers)
+
+(defun reg-info (reg)
+  (or (assoc reg *registers*)
+      (error "Unknown register: ~A" reg)))
+
+(defun reg-code (reg)
+  (logand 7 (second (reg-info reg))))  ; Low 3 bits
+
+(defun reg-size (reg)
+  (third (reg-info reg)))
+
+(defun reg-needs-rex-p (reg)
+  "Does this register need REX prefix? (R8-R15 or SPL/BPL/SIL/DIL)"
+  (let ((info (reg-info reg)))
+    (or (>= (second info) 8)        ; R8-R15
+        (fourth info))))            ; SPL, BPL, SIL, DIL
+
+(defun reg-extended-p (reg)
+  "Is this R8-R15?"
+  (>= (second (reg-info reg)) 8))
+
+;;; ============================================================
+;;; REX Prefix
+;;; ============================================================
+
+(defun rex-prefix (w r x b)
+  "Build REX prefix byte.
+   W = 64-bit operand size
+   R = ModR/M reg field extension
+   X = SIB index field extension
+   B = ModR/M r/m or SIB base extension"
+  (logior #x40
+          (if w #x08 0)
+          (if r #x04 0)
+          (if x #x02 0)
+          (if b #x01 0)))
+
+(defun emit-rex-if-needed (buf reg1 &optional reg2 force-64)
+  "Emit REX prefix if needed for these registers"
+  (let* ((size (if reg1 (reg-size reg1) 64))
+         (w (or force-64 (= size 64)))
+         (r (and reg1 (reg-extended-p reg1)))
+         (b (and reg2 (reg-extended-p reg2))))
+    (when (or w r b
+              (and reg1 (reg-needs-rex-p reg1))
+              (and reg2 (reg-needs-rex-p reg2)))
+      (emit-byte buf (rex-prefix w r nil b)))))
+
+;;; ============================================================
+;;; ModR/M and SIB
+;;; ============================================================
+
+(defun modrm (mod reg rm)
+  "Build ModR/M byte"
+  (logior (ash (logand mod #x3) 6)
+          (ash (logand reg #x7) 3)
+          (logand rm #x7)))
+
+(defun emit-modrm-reg-reg (buf reg rm)
+  "Emit ModR/M for register-to-register"
+  (emit-byte buf (modrm #b11 (reg-code reg) (reg-code rm))))
+
+;;; ============================================================
+;;; Instructions
+;;; ============================================================
+
+;;; Simple instructions
+
+(defun emit-ret (buf)
+  (emit-byte buf #xC3))
+
+(defun emit-nop (buf)
+  (emit-byte buf #x90))
+
+(defun emit-int (buf n)
+  (emit-bytes buf #xCD n))
+
+;;; Push/Pop
+
+(defun emit-push (buf reg)
+  (when (reg-extended-p reg)
+    (emit-byte buf (rex-prefix nil nil nil t)))
+  (emit-byte buf (+ #x50 (reg-code reg))))
+
+(defun emit-pop (buf reg)
+  (when (reg-extended-p reg)
+    (emit-byte buf (rex-prefix nil nil nil t)))
+  (emit-byte buf (+ #x58 (reg-code reg))))
+
+;;; MOV
+
+(defun emit-mov-reg-reg (buf dst src)
+  "MOV dst, src (register to register)"
+  (emit-rex-if-needed buf src dst)
+  (emit-byte buf #x89)  ; MOV r/m64, r64
+  (emit-modrm-reg-reg buf src dst))
+
+(defun emit-mov-reg-imm (buf reg imm)
+  "MOV reg, imm64"
+  (let ((size (reg-size reg)))
+    (cond
+      ;; 64-bit immediate
+      ((= size 64)
+       (emit-byte buf (rex-prefix t nil nil (reg-extended-p reg)))
+       (emit-byte buf (+ #xB8 (reg-code reg)))
+       (emit-u64 buf imm))
+      ;; 32-bit
+      ((= size 32)
+       (when (reg-extended-p reg)
+         (emit-byte buf (rex-prefix nil nil nil t)))
+       (emit-byte buf (+ #xB8 (reg-code reg)))
+       (emit-u32 buf imm))
+      ;; 8-bit
+      ((= size 8)
+       (when (reg-needs-rex-p reg)
+         (emit-byte buf (rex-prefix nil nil nil (reg-extended-p reg))))
+       (emit-byte buf (+ #xB0 (reg-code reg)))
+       (emit-byte buf imm)))))
+
+(defun emit-mov-reg-mem (buf reg base &optional (offset 0))
+  "MOV reg, [base + offset]"
+  (emit-rex-if-needed buf reg base)
+  (emit-byte buf #x8B)  ; MOV r64, r/m64
+  ;; RSP (code 4) in r/m means "SIB follows" - need special handling
+  (let ((needs-sib (= (logand (reg-code base) 7) 4)))  ; RSP or R12
+    (cond
+      ((zerop offset)
+       (cond
+         ((= (reg-code base) 5)  ; RBP/R13 need disp8
+          (emit-byte buf (modrm #b01 (reg-code reg) (reg-code base)))
+          (emit-byte buf 0))
+         (needs-sib
+          (emit-byte buf (modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
+          (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4(RSP)
+         (t
+          (emit-byte buf (modrm #b00 (reg-code reg) (reg-code base))))))
+      ((<= -128 offset 127)
+       (emit-byte buf (modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-byte buf (logand offset #xFF)))
+      (t
+       (emit-byte buf (modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-s32 buf offset)))))
+
+(defun emit-mov-mem-reg (buf base reg &optional (offset 0))
+  "MOV [base + offset], reg"
+  (emit-rex-if-needed buf reg base)
+  (emit-byte buf #x89)  ; MOV r/m64, r64
+  ;; RSP (code 4) in r/m means "SIB follows" - need special handling
+  (let ((needs-sib (= (logand (reg-code base) 7) 4)))  ; RSP or R12
+    (cond
+      ((zerop offset)
+       (cond
+         ((= (reg-code base) 5)  ; RBP/R13 need disp8
+          (emit-byte buf (modrm #b01 (reg-code reg) (reg-code base)))
+          (emit-byte buf 0))
+         (needs-sib
+          (emit-byte buf (modrm #b00 (reg-code reg) 4))  ; r/m=4 means SIB
+          (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4(RSP)
+         (t
+          (emit-byte buf (modrm #b00 (reg-code reg) (reg-code base))))))
+      ((<= -128 offset 127)
+       (emit-byte buf (modrm #b01 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-byte buf (logand offset #xFF)))
+      (t
+       (emit-byte buf (modrm #b10 (reg-code reg) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-s32 buf offset)))))
+
+;;; ALU operations
+
+(defmacro define-alu-reg-reg (name opcode)
+  `(defun ,name (buf dst src)
+     (emit-rex-if-needed buf src dst)
+     (emit-byte buf ,opcode)
+     (emit-modrm-reg-reg buf src dst)))
+
+(defmacro define-alu-reg-imm (name opcode modrm-reg)
+  `(defun ,name (buf reg imm)
+     ;; For ALU reg, imm: register is in R/M field, so use reg as reg2 for REX.B
+     (emit-rex-if-needed buf nil reg t)  ; force 64-bit, reg in R/M position
+     (cond
+       ((<= -128 imm 127)
+        (emit-byte buf #x83)  ; sign-extended imm8
+        (emit-byte buf (modrm #b11 ,modrm-reg (reg-code reg)))
+        (emit-byte buf (logand imm #xFF)))
+       (t
+        (if (eq reg 'rax)
+            (progn
+              (emit-byte buf ,(+ opcode 5))  ; op RAX, imm32
+              (emit-s32 buf imm))
+            (progn
+              (emit-byte buf #x81)
+              (emit-byte buf (modrm #b11 ,modrm-reg (reg-code reg)))
+              (emit-s32 buf imm)))))))
+
+(define-alu-reg-reg emit-add-reg-reg #x01)
+(define-alu-reg-reg emit-sub-reg-reg #x29)
+(define-alu-reg-reg emit-cmp-reg-reg #x39)
+(define-alu-reg-reg emit-and-reg-reg #x21)
+(define-alu-reg-reg emit-or-reg-reg  #x09)
+(define-alu-reg-reg emit-xor-reg-reg #x31)
+(define-alu-reg-reg emit-test-reg-reg #x85)
+
+(define-alu-reg-imm emit-add-reg-imm #x00 0)
+(define-alu-reg-imm emit-sub-reg-imm #x28 5)
+(define-alu-reg-imm emit-cmp-reg-imm #x38 7)
+(define-alu-reg-imm emit-and-reg-imm #x20 4)
+(define-alu-reg-imm emit-or-reg-imm  #x08 1)
+(define-alu-reg-imm emit-xor-reg-imm #x30 6)
+;; TEST has special encoding - don't use the macro
+(defun emit-test-reg-imm (buf reg imm)
+  "TEST reg, imm - sets flags based on AND without storing result"
+  (cond
+    ;; For small immediates that fit in a byte and only test low bits,
+    ;; we can use TEST AL, imm8 (0xA8) which is simpler
+    ((and (eq reg 'rax) (<= 0 imm 255))
+     (emit-byte buf #xA8)
+     (emit-byte buf imm))
+    ;; General case: TEST r/m64, imm32 uses 0xF7 /0
+    (t
+     (emit-rex-if-needed buf nil reg t)  ; REX.W for 64-bit
+     (emit-byte buf #xF7)
+     (emit-byte buf (modrm #b11 0 (reg-code reg)))
+     (emit-s32 buf imm))))
+
+;;; Shifts
+
+(defun emit-shl-reg-imm (buf reg count)
+  (emit-rex-if-needed buf reg nil)
+  (if (= count 1)
+      (progn
+        (emit-byte buf #xD1)
+        (emit-byte buf (modrm #b11 4 (reg-code reg))))
+      (progn
+        (emit-byte buf #xC1)
+        (emit-byte buf (modrm #b11 4 (reg-code reg)))
+        (emit-byte buf count))))
+
+(defun emit-shr-reg-imm (buf reg count)
+  (emit-rex-if-needed buf reg nil)
+  (if (= count 1)
+      (progn
+        (emit-byte buf #xD1)
+        (emit-byte buf (modrm #b11 5 (reg-code reg))))
+      (progn
+        (emit-byte buf #xC1)
+        (emit-byte buf (modrm #b11 5 (reg-code reg)))
+        (emit-byte buf count))))
+
+(defun emit-sar-reg-imm (buf reg count)
+  (emit-rex-if-needed buf reg nil)
+  (if (= count 1)
+      (progn
+        (emit-byte buf #xD1)
+        (emit-byte buf (modrm #b11 7 (reg-code reg))))
+      (progn
+        (emit-byte buf #xC1)
+        (emit-byte buf (modrm #b11 7 (reg-code reg)))
+        (emit-byte buf count))))
+
+;;; Jumps and Calls
+
+(defun emit-jmp (buf target)
+  "JMP rel32 to label or offset"
+  (emit-byte buf #xE9)
+  (if (label-p target)
+      (emit-label-ref-rel32 buf target)
+      ;; For a raw offset, compute relative from end of instruction
+      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))))
+
+(defun emit-jmp-reg (buf reg)
+  "JMP reg (indirect)"
+  (when (reg-extended-p reg)
+    (emit-byte buf (rex-prefix nil nil nil t)))
+  (emit-byte buf #xFF)
+  (emit-byte buf (modrm #b11 4 (reg-code reg))))
+
+(defun emit-call (buf target)
+  "CALL rel32 to label or offset"
+  (emit-byte buf #xE8)
+  (if (label-p target)
+      (emit-label-ref-rel32 buf target)
+      ;; For a raw offset, compute relative from end of instruction
+      ;; rel32 = target - (current_pos + 4)  (we already emitted E8)
+      (emit-s32 buf (- target (+ (code-buffer-position buf) 4)))))
+
+(defun emit-call-reg (buf reg)
+  "CALL reg (indirect)"
+  (when (reg-extended-p reg)
+    (emit-byte buf (rex-prefix nil nil nil t)))
+  (emit-byte buf #xFF)
+  (emit-byte buf (modrm #b11 2 (reg-code reg))))
+
+;;; Conditional jumps
+
+(defparameter *condition-codes*
+  '((:o  . #x0) (:no . #x1) (:b  . #x2) (:ae . #x3)
+    (:e  . #x4) (:ne . #x5) (:be . #x6) (:a  . #x7)
+    (:s  . #x8) (:ns . #x9) (:p  . #xA) (:np . #xB)
+    (:l  . #xC) (:ge . #xD) (:le . #xE) (:g  . #xF)
+    ;; Aliases
+    (:z  . #x4) (:nz . #x5) (:c  . #x2) (:nc . #x3)
+    (:nae . #x2) (:nb . #x3) (:nbe . #x7) (:na . #x6)
+    (:nge . #xC) (:nl . #xD) (:ng . #xE) (:nle . #xF)))
+
+(defun emit-jcc (buf cc target)
+  "Conditional jump: Jcc rel32"
+  (let ((code (cdr (assoc cc *condition-codes*))))
+    (unless code
+      (error "Unknown condition code: ~A" cc))
+    (emit-bytes buf #x0F (+ #x80 code))
+    (if (label-p target)
+        (emit-label-ref-rel32 buf target)
+        (emit-s32 buf (- target 6)))))
+
+;;; LEA
+
+(defun emit-lea (buf dst base &optional (offset 0))
+  "LEA dst, [base + offset]"
+  (emit-rex-if-needed buf dst base)
+  (emit-byte buf #x8D)
+  ;; RSP (code 4) in r/m means "SIB follows" - need special handling
+  (let ((needs-sib (= (logand (reg-code base) 7) 4)))  ; RSP or R12
+    (cond
+      ((zerop offset)
+       (cond
+         ((= (reg-code base) 5)  ; RBP/R13 need disp8
+          (emit-byte buf (modrm #b01 (reg-code dst) (reg-code base)))
+          (emit-byte buf 0))
+         (needs-sib
+          (emit-byte buf (modrm #b00 (reg-code dst) 4))  ; r/m=4 means SIB
+          (emit-byte buf #x24))  ; SIB: scale=0, index=4(none), base=4
+         (t
+          (emit-byte buf (modrm #b00 (reg-code dst) (reg-code base))))))
+      ((<= -128 offset 127)
+       (emit-byte buf (modrm #b01 (reg-code dst) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-byte buf (logand offset #xFF)))
+      (t
+       (emit-byte buf (modrm #b10 (reg-code dst) (if needs-sib 4 (reg-code base))))
+       (when needs-sib
+         (emit-byte buf #x24))  ; SIB
+       (emit-s32 buf offset)))))
+
+;;; ============================================================
+;;; Testing
+;;; ============================================================
+
+(defun test-assembler ()
+  "Basic sanity test"
+  (let ((buf (make-code-buffer)))
+    ;; mov rax, 42
+    (emit-mov-reg-imm buf 'rax 42)
+    ;; add rax, rbx
+    (emit-add-reg-reg buf 'rax 'rbx)
+    ;; ret
+    (emit-ret buf)
+    (format t "Generated ~D bytes: ~{~2,'0X ~}~%"
+            (code-buffer-position buf)
+            (coerce (code-buffer-bytes buf) 'list))
+    buf))
