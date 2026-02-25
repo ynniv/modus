@@ -298,6 +298,7 @@
          ((string-equal op-name "CLI")       (compile-cli))
          ((string-equal op-name "STI-HLT")  (compile-sti-hlt))
          ((string-equal op-name "SWITCH-IDLE-STACK") (compile-switch-idle-stack))
+         ((string-equal op-name "SET-RSP")   (compile-set-rsp (cadr form) env))
          ((string-equal op-name "LIDT")      (compile-lidt (cadr form) env))
          ;; Function call
          (t (compile-call op (cdr form) env)))))
@@ -1732,6 +1733,18 @@
   ;; SIB 25 = scale=00 index=100(none) base=101(disp32)
   ;; 38 00 00 00 = displacement 0x38
   (emit-bytes *code-buffer* #x65 #x48 #x8B #x24 #x25 #x38 #x00 #x00 #x00)
+  ;; Return 0 (tagged fixnum)
+  (emit-bytes *code-buffer* #x31 #xC0))    ; xor eax, eax
+
+(defun compile-set-rsp (addr-form env)
+  "Compile (set-rsp addr) - set RSP to the given address.
+   addr is a tagged fixnum. Used to switch the boot context to actor 1's stack
+   so that GC stack scanning covers the correct range."
+  (compile-form addr-form env)
+  ;; RAX = tagged address, untag it
+  (emit-bytes *code-buffer* #x48 #xD1 #xF8)  ; sar rax, 1
+  ;; mov rsp, rax
+  (emit-bytes *code-buffer* #x48 #x89 #xC4)
   ;; Return 0 (tagged fixnum)
   (emit-bytes *code-buffer* #x31 #xC0))    ; xor eax, eax
 

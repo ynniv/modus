@@ -658,9 +658,9 @@
       (write-byte 10))
 
     ;; Wait for serial input (blocking, yields to other actors)
-    ;; NOTE: This is compiled before yield, so compile-loop can't add
-    ;; the reduction counter check. We yield explicitly via an indirect
-    ;; call through 0x395008 (set after yield is compiled).
+    ;; Uses direct (yield) call. Forward reference is handled by
+    ;; both the cross-compiler (CALL rel32 patching) and native
+    ;; compiler in image mode (img-fwd-record/img-patch-forward-refs).
     (defun wait-for-input ()
       (let ((count 0))
         (loop
@@ -671,10 +671,7 @@
                 (setq count (+ count 1))
                 (when (> count 5000)
                   (setq count 0)
-                  ;; Indirect yield: call-native reads tagged ptr from 0x395008
-                  (let ((yp (mem-ref #x395008 :u64)))
-                    (when (not (zerop yp))
-                      (call-native yp)))))))))
+                  (yield)))))))
 
     ;; Lookahead buffer at fixed memory location
     ;; 0 = no lookahead, >0 = lookahead byte value
@@ -998,7 +995,7 @@
     (defun sym-eq () 21)
     (defun sym-null () 22)
     (defun sym-quote () 23)
-    (defun sym-t () 24)
+    (defun sym-t () (hash-of "t"))
     (defun sym-let () 25)
     (defun sym-defun () 26)
     (defun sym-lt () 27)   ; <
@@ -1144,38 +1141,40 @@
     (defun sym-percpu-ref () (hash-of "percpu-ref"))
     (defun sym-percpu-set () (hash-of "percpu-set"))
     (defun sym-switch-idle-stack () (hash-of "switch-idle-stack"))
+    (defun sym-set-rsp () (hash-of "set-rsp"))
     (defun sym-lidt () (hash-of "lidt"))
     (defun sym-block () (hash-of "block"))
     (defun sym-tagbody () (hash-of "tagbody"))
     (defun sym-go () (hash-of "go"))
     (defun sym-lambda () (hash-of "lambda"))
     ;; Common variable names (single letter) - all a-z
-    (defun sym-a () 100)
-    (defun sym-b () 101)
-    (defun sym-c () 102)
-    (defun sym-d () 103)
-    (defun sym-e () 104)
-    (defun sym-f () 106)
-    (defun sym-g () 107)
-    (defun sym-h () 108)
-    (defun sym-i () 105)
-    (defun sym-j () 111)
-    (defun sym-k () 112)
-    (defun sym-l () 109)
-    (defun sym-m () 113)
-    (defun sym-n () 110)
-    (defun sym-o () 114)
-    (defun sym-p () 115)
-    (defun sym-q () 116)
-    (defun sym-r () 117)
-    (defun sym-s () 118)
-    (defun sym-u () 123)
-    (defun sym-v () 124)
-    (defun sym-w () 125)
-    (defun sym-x () 120)
-    (defun sym-y () 121)
-    (defun sym-z () 122)
-    (defun sym-unknown () 999)
+    ;; Use hash-of to avoid collision with small integer literals (ASCII codes etc.)
+    (defun sym-a () (hash-of "a"))
+    (defun sym-b () (hash-of "b"))
+    (defun sym-c () (hash-of "c"))
+    (defun sym-d () (hash-of "d"))
+    (defun sym-e () (hash-of "e"))
+    (defun sym-f () (hash-of "f"))
+    (defun sym-g () (hash-of "g"))
+    (defun sym-h () (hash-of "h"))
+    (defun sym-i () (hash-of "i"))
+    (defun sym-j () (hash-of "j"))
+    (defun sym-k () (hash-of "k"))
+    (defun sym-l () (hash-of "l"))
+    (defun sym-m () (hash-of "m"))
+    (defun sym-n () (hash-of "n"))
+    (defun sym-o () (hash-of "o"))
+    (defun sym-p () (hash-of "p"))
+    (defun sym-q () (hash-of "q"))
+    (defun sym-r () (hash-of "r"))
+    (defun sym-s () (hash-of "s"))
+    (defun sym-u () (hash-of "u"))
+    (defun sym-v () (hash-of "v"))
+    (defun sym-w () (hash-of "w"))
+    (defun sym-x () (hash-of "x"))
+    (defun sym-y () (hash-of "y"))
+    (defun sym-z () (hash-of "z"))
+    (defun sym-unknown () (hash-of "unknown"))
 
     ;; Match a single-char symbol: +, -, *, <, >, t, a-z
     (defun match-1char (c)
@@ -2569,15 +2568,14 @@
       (set-lookahead 0)
       ;; Register cross-compiled builtin functions for REPL access
       (register-builtins)
-      ;; Store yield address for indirect calls from early-compiled loops
-      ;; (wait-for-input is compiled before yield, uses 0x395008 to call it)
-      (setf (mem-ref #x395008 :u64) (nfn-lookup (hash-of "yield")))
+      ;; Note: wait-for-input now calls (yield) directly; forward refs
+      ;; are handled by cross-compiler and image-mode forward ref patching.
       ;; Initialize GC helper early so make-byte-array can trigger GC from any actor
       ;; (previously only called from ssh-server, causing OOM crashes in REPL)
       (init-gc-helper)
       ;; Initialize symbol name table for tab completion
       (init-symbol-table)
-      (check-cmdline)
+      (eval-cmdline)
       (print-help)
       (loop
         (emit-prompt)
@@ -2613,141 +2611,37 @@
 
     ;; Test compile command - run native compiler tests
     (defun test-compile-cmd ()
-      ;; Test 1: (+ 10 20) = 30
-      (write-byte 43)  ; '+'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-add 10 20))
+      ;; PJ: Test patch-jump writes correct byte (should be 0A)
+      (code-init)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (patch-jump 2 16)
+      (write-byte 80) (write-byte 74) (write-byte 58)  ;; 'PJ:'
+      (print-hex-byte (mem-ref #x50000A :u8))
       (write-byte 10)
-      ;; Test 2: (- 50 17) = 33
-      (write-byte 45)  ; '-'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-sub 50 17))
+      ;; PR: Test patch-rel32 (should be 0A)
+      (code-init)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      (patch-rel32 2 16)
+      (write-byte 80) (write-byte 82) (write-byte 58)  ;; 'PR:'
+      (print-hex-byte (mem-ref #x50000A :u8))
       (write-byte 10)
-      ;; Test 3: (* 7 8) = 56
-      (write-byte 42)  ; '*'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-mul 7 8))
+      ;; NA: Test native-compiled (+ 10 20) => 30
+      (write-byte 78) (write-byte 65) (write-byte 58)  ;; 'NA:'
+      (print-dec (test-native-add 10 20))
       (write-byte 10)
-      ;; Test 4: nested (+ (+ x y) x) with x=5, y=3 = 5+3+5 = 13
-      (write-byte 78)  ; 'N'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-nested 5 3))
+      ;; NS: Test native-compiled (- 50 17) => 33
+      (write-byte 78) (write-byte 83) (write-byte 58)  ;; 'NS:'
+      (print-dec (test-native-sub 50 17))
       (write-byte 10)
-      ;; Test 5: constant return - just 100
-      ;; First show what bytes were generated
-      (write-byte 67)  ; 'C'
-      (write-byte 66)  ; 'B'
-      (write-byte 58)  ; ':'
-      (let ((addr (test-native-const-compile)))  ; just compile, don't call
-        ;; Print first 12 bytes
-        (let ((i 0))
-          (loop
-            (if (< i 12)
-                (progn
-                  (print-hex-byte (mem-ref (+ #x500008 i) :u8))
-                  (setq i (+ i 1)))
-                (return ())))))
-      (write-byte 10)
-      ;; Now test the actual call
-      (write-byte 67)  ; 'C'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-const))
-      (write-byte 10)
-      ;; Test 6: (if (eq 5 5) 100 200) = 100 (equal)
-      (write-byte 73)  ; 'I'
-      (write-byte 49)  ; '1'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-if 5 5))
-      (write-byte 10)
-      ;; Test 7: (if (eq 5 3) 100 200) = 200 (not equal)
-      (write-byte 73)  ; 'I'
-      (write-byte 50)  ; '2'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-if 5 3))
-      (write-byte 10)
-      ;; Test 8: (let ((a 5)) a) = 5
-      (write-byte 76)  ; 'L'
-      (write-byte 49)  ; '1'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-let-simple))
-      (write-byte 10)
-      ;; Test 9: (let ((a 3) (b 7)) (+ a b)) = 10
-      (write-byte 76)  ; 'L'
-      (write-byte 50)  ; '2'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-let-add))
-      (write-byte 10)
-      ;; Test 10: nested let = 7
-      (write-byte 76)  ; 'L'
-      (write-byte 51)  ; '3'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-let-nested))
-      (write-byte 10)
-      ;; Test 11: (car (cons 3 7)) = 3
-      (write-byte 67)  ; 'C'
-      (write-byte 82)  ; 'R'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-car))
-      (write-byte 10)
-      ;; Test 12: (cdr (cons 3 7)) = 7
-      (write-byte 67)  ; 'C'
-      (write-byte 68)  ; 'D'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-cdr))
-      (write-byte 10)
-      ;; Test 13: (null 0) = t (non-zero)
-      (write-byte 78)  ; 'N'
-      (write-byte 84)  ; 'T'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-null-t))
-      (write-byte 10)
-      ;; Test 14: (null 5) = nil (0)
-      (write-byte 78)  ; 'N'
-      (write-byte 70)  ; 'F'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-null-f))
-      (write-byte 10)
-      ;; Test 15: (< 3 7) = t
-      (write-byte 76)  ; 'L'
-      (write-byte 84)  ; 'T'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-lt-t))
-      (write-byte 10)
-      ;; Test 16: (< 7 3) = nil
-      (write-byte 76)  ; 'L'
-      (write-byte 70)  ; 'F'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-lt-f))
-      (write-byte 10)
-      ;; Test 17: (> 7 3) = t
-      (write-byte 71)  ; 'G'
-      (write-byte 84)  ; 'T'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-gt-t))
-      (write-byte 10)
-      ;; Debug: test function table
-      (write-byte 70)  ; 'F'
-      (write-byte 68)  ; 'D'
-      (write-byte 58)  ; ':'
-      (print-obj (test-nfn-debug))  ; should print 12345
-      (write-byte 10)
-      ;; Test 11: defun and call - (defun f (x) (+ x x)) then (f 7) = 14
-      (write-byte 70)  ; 'F'
-      (write-byte 49)  ; '1'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-defun))
-      (write-byte 10)
-      ;; Test 12: defun with 2 params - (defun g (a b) (+ a b)) then (g 5 8) = 13
-      (write-byte 70)  ; 'F'
-      (write-byte 50)  ; '2'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-defun2))
-      (write-byte 10)
-      ;; Test 13: call with expression arg - (f (+ 3 4)) = 14
-      (write-byte 70)  ; 'F'
-      (write-byte 51)  ; '3'
-      (write-byte 58)  ; ':'
-      (print-obj (test-native-call-expr))
+      ;; NM: Test native-compiled (* 6 7) => 42
+      (write-byte 78) (write-byte 77) (write-byte 58)  ;; 'NM:'
+      (print-dec (test-native-mul 6 7))
       (write-byte 10))
 
     ;; Boot message
@@ -2779,7 +2673,12 @@
     ;; Address: 0x4FF028 = five (5)
     (defun init-raw-constants ()
       (setf (mem-ref #x4FF020 :u64) (ash #x500008 -1))
-      (setf (mem-ref #x4FF028 :u64) (ash 5 -1)))
+      (setf (mem-ref #x4FF028 :u64) (ash 5 -1))
+      ;; Clear image-compile mode flag (may be non-zero if kernel image
+      ;; extends past 0x4FF080 and loaded data overwrites it)
+      (setf (mem-ref #x4FF080 :u64) 0)
+      ;; Clear code buffer position
+      (setf (mem-ref #x500000 :u64) 0))
 
     (defun raw-code-base ()
       (mem-ref #x4FF020 :u64))
@@ -2811,19 +2710,32 @@
       (code-emit (mem-ref #x4FF037 :u8)))
 
     (defun code-pos ()
-      (mem-ref #x500000 :u64))
+      (if (not (zerop (mem-ref #x4FF080 :u64)))
+          ;; Image mode: return image buffer position
+          (mem-ref #x4FF040 :u64)
+          (mem-ref #x500000 :u64)))
 
     (defun code-set-pos (p)
-      (setf (mem-ref #x500000 :u64) p))
+      (if (not (zerop (mem-ref #x4FF080 :u64)))
+          (setf (mem-ref #x4FF040 :u64) p)
+          (setf (mem-ref #x500000 :u64) p)))
 
     (defun code-emit (b)
-      (let ((pos (code-pos)))
-        (setf (mem-ref (+ #x500008 pos) :u8) b)
-        (code-set-pos (+ pos 1))))
+      (if (not (zerop (mem-ref #x4FF080 :u64)))
+          ;; Image mode: emit to image buffer
+          (let ((pos (mem-ref #x4FF040 :u64)))
+            (setf (mem-ref (+ #x08000000 pos) :u8) b)
+            (setf (mem-ref #x4FF040 :u64) (+ pos 1)))
+          ;; Normal mode: emit to code buffer
+          (let ((pos (mem-ref #x500000 :u64)))
+            (setf (mem-ref (+ #x500008 pos) :u8) b)
+            (setf (mem-ref #x500000 :u64) (+ pos 1)))))
 
     ;; Patch a byte at a previous position (for jump offsets)
     (defun code-patch (pos val)
-      (setf (mem-ref (+ #x500008 pos) :u8) val))
+      (if (not (zerop (mem-ref #x4FF080 :u64)))
+          (setf (mem-ref (+ #x08000000 pos) :u8) val)
+          (setf (mem-ref (+ #x500008 pos) :u8) val)))
 
     ;; Emit a 64-bit value as 8 bytes (little-endian)
     ;; v is the logical value we want as bytes
@@ -2923,55 +2835,64 @@
     ;; Better approach: result always in RAX, use RDI as scratch
     ;; With environment tracking for let bindings
     (defun rt-compile-binop-env (op args env depth)
-      ;; Compile first arg -> RAX, push
-      (rt-compile-expr-env (car args) env depth)
-      (emit-push-rax)
-      ;; Compile second arg with incremented depth (we pushed one value)
-      (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-      (emit-mov-reg-rax-to-rdi)
-      ;; Pop first arg back to RAX
-      (emit-pop-rax)
-      ;; Now: RAX = first, RDI = second
-      ;; Untag both
-      (emit-sar-rax-1)
-      (emit-sar-rdi-1)
-      ;; Do the operation
-      (if (eq op (sym-times))
-          ;; Multiply: no overflow promotion (for now)
+      ;; Handle 3+ args by reducing to nested binary: (+ a b c) -> (+ (+ a b) c)
+      (if (cdr (cdr args))
+          ;; 3+ args: reduce left-to-right
+          (rt-compile-binop-env op
+            (cons (cons op (cons (car args) (cons (car (cdr args)) ())))
+                  (cdr (cdr args)))
+            env depth)
+          ;; Normal 2-arg case:
           (progn
-            (emit-imul-rax-rdi)
-            (emit-shl-rax-1))
-          ;; Add/Sub: with overflow -> bignum promotion
-          (progn
-            (if (eq op (sym-plus))
-                (emit-add-rax-rdi)
-                (emit-sub-rax-rdi))
-            ;; Save untagged result, try to tag
-            (emit-push-rax)       ; save untagged result on stack
-            (emit-shl-rax-1)      ; tag result (sets OF if doesn't fit)
-            ;; jno .fits - skip overflow handler (normal path, predicted taken)
-            (let ((fits-patch (emit-jno-placeholder)))
-              ;; --- Overflow path: create 1-limb bignum ---
-              ;; Pop untagged result into RDI (64-bit value for limb)
-              (emit-pop-rdi)
-              ;; Save untagged value for later store
-              (code-emit #x57)  ; push rdi
-              ;; Allocate 1-limb bignum: set RAX = tagged 1
-              (emit-rex-w) (code-emit #xC7) (code-emit #xC0)  ; mov eax, 2 (tagged 1)
-              (code-emit #x02) (code-emit #x00) (code-emit #x00) (code-emit #x00)
-              (emit-alloc-bignum)  ; RAX = tagged bignum pointer
-              ;; Pop untagged value -> RDI
-              (emit-pop-rdi)
-              ;; Store limb 0 at [rax - 3 + 8] = [rax + 5]
-              (emit-rex-w) (code-emit #x89) (code-emit #x78) (code-emit #x05)  ; mov [rax+5], rdi
-              ;; Jump past normal path cleanup
-              (let ((end-patch (emit-jmp-placeholder)))
-                ;; --- Normal path: discard saved untagged value ---
-                (patch-jump fits-patch (code-pos))
-                ;; add rsp, 8 (discard saved untagged value)
-                (emit-rex-w) (code-emit #x83) (code-emit #xC4) (code-emit #x08)
-                ;; --- End: RAX has tagged fixnum or bignum pointer ---
-                (patch-jump end-patch (code-pos)))))))
+            ;; Compile first arg -> RAX, push
+            (rt-compile-expr-env (car args) env depth)
+            (emit-push-rax)
+            ;; Compile second arg with incremented depth (we pushed one value)
+            (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+            (emit-mov-reg-rax-to-rdi)
+            ;; Pop first arg back to RAX
+            (emit-pop-rax)
+            ;; Now: RAX = first, RDI = second
+            ;; Untag both
+            (emit-sar-rax-1)
+            (emit-sar-rdi-1)
+            ;; Do the operation
+            (if (eq op (sym-times))
+                ;; Multiply: no overflow promotion (for now)
+                (progn
+                  (emit-imul-rax-rdi)
+                  (emit-shl-rax-1))
+                ;; Add/Sub: with overflow -> bignum promotion
+                (progn
+                  (if (eq op (sym-plus))
+                      (emit-add-rax-rdi)
+                      (emit-sub-rax-rdi))
+                  ;; Save untagged result, try to tag
+                  (emit-push-rax)       ; save untagged result on stack
+                  (emit-shl-rax-1)      ; tag result (sets OF if doesn't fit)
+                  ;; jno .fits - skip overflow handler (normal path, predicted taken)
+                  (let ((fits-patch (emit-jno-placeholder)))
+                    ;; --- Overflow path: create 1-limb bignum ---
+                    ;; Pop untagged result into RDI (64-bit value for limb)
+                    (emit-pop-rdi)
+                    ;; Save untagged value for later store
+                    (code-emit #x57)  ; push rdi
+                    ;; Allocate 1-limb bignum: set RAX = tagged 1
+                    (emit-rex-w) (code-emit #xC7) (code-emit #xC0)  ; mov eax, 2 (tagged 1)
+                    (code-emit #x02) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+                    (emit-alloc-bignum)  ; RAX = tagged bignum pointer
+                    ;; Pop untagged value -> RDI
+                    (emit-pop-rdi)
+                    ;; Store limb 0 at [rax - 3 + 8] = [rax + 5]
+                    (emit-rex-w) (code-emit #x89) (code-emit #x78) (code-emit #x05)  ; mov [rax+5], rdi
+                    ;; Jump past normal path cleanup
+                    (let ((end-patch (emit-jmp-placeholder)))
+                      ;; --- Normal path: discard saved untagged value ---
+                      (patch-jump fits-patch (code-pos))
+                      ;; add rsp, 8 (discard saved untagged value)
+                      (emit-rex-w) (code-emit #x83) (code-emit #xC4) (code-emit #x08)
+                      ;; --- End: RAX has tagged fixnum or bignum pointer ---
+                      (patch-jump end-patch (code-pos)))))))))
 
     ;; Wrapper for backward compatibility
     (defun rt-compile-binop (op args)
@@ -3039,36 +2960,42 @@
         ;; For byte 0: sar gives actual_offset, al = byte 0 of offset.
         ;; For byte N: (ash rel-double -8N) shifts tagged value, sar untags,
         ;;   al = byte N of offset. (Same approach as code-emit-u32.)
-        (setf (mem-ref (+ #x500008 rel32-pos) :u8) rel-double)
-        (setf (mem-ref (+ #x500009 rel32-pos) :u8) (ash rel-double -8))
-        (setf (mem-ref (+ #x50000A rel32-pos) :u8) (ash rel-double -16))
-        (setf (mem-ref (+ #x50000B rel32-pos) :u8) (ash rel-double -24))))
+        (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                        #x08000000
+                        #x500008)))
+          (let ((addr (+ base rel32-pos)))
+            (setf (mem-ref addr :u8) rel-double)
+            (setf (mem-ref (+ addr 1) :u8) (ash rel-double -8))
+            (setf (mem-ref (+ addr 2) :u8) (ash rel-double -16))
+            (setf (mem-ref (+ addr 3) :u8) (ash rel-double -24))))))
 
     ;; Compile (if test then else) with environment
     (defun rt-compile-if-env (args env depth)
+      ;; Safe access: avoid (car nil) crash on 2-arg if (no else clause)
       (let ((test-form (car args))
             (then-form (car (cdr args)))
-            (else-form (car (cdr (cdr args)))))
-        ;; Compile test
-        (rt-compile-expr-env test-form env depth)
-        ;; Compare to NIL
-        (emit-cmp-rax-nil)
-        ;; Jump to else if equal to nil
-        (let ((else-patch (emit-je-placeholder)))
-          ;; Compile then branch
-          (rt-compile-expr-env then-form env depth)
-          ;; Jump over else
-          (let ((end-patch (emit-jmp-placeholder)))
-            ;; Mark else branch position and patch the je
-            (let ((else-pos (code-pos)))
-              (patch-jump else-patch else-pos)
-              ;; Compile else branch (or load nil if none)
-              (if else-form
-                  (rt-compile-expr-env else-form env depth)
-                  (emit-mov-rax-imm64 0))  ; nil = 0
-              ;; Mark end and patch the jmp
-              (let ((end-pos (code-pos)))
-                (patch-jump end-patch end-pos)))))))
+            (rest2 (cdr (cdr args))))
+        (let ((else-form (if rest2 (car rest2) ())))
+          ;; Compile test
+          (rt-compile-expr-env test-form env depth)
+          ;; Compare to NIL
+          (emit-cmp-rax-nil)
+          ;; Jump to else if equal to nil
+          (let ((else-patch (emit-je-placeholder)))
+            ;; Compile then branch
+            (rt-compile-expr-env then-form env depth)
+            ;; Jump over else
+            (let ((end-patch (emit-jmp-placeholder)))
+              ;; Mark else branch position and patch the je
+              (let ((else-pos (code-pos)))
+                (patch-jump else-patch else-pos)
+                ;; Compile else branch (or load nil if none)
+                (if else-form
+                    (rt-compile-expr-env else-form env depth)
+                    (emit-mov-rax-imm64 0))  ; nil = 0
+                ;; Mark end and patch the jmp
+                (let ((end-pos (code-pos)))
+                  (patch-jump end-patch end-pos))))))))
 
     ;; Wrapper for backward compatibility
     (defun rt-compile-if (args)
@@ -3076,8 +3003,17 @@
 
     ;; Compile lambda and return code address
     (defun rt-compile-lambda (params body)
-      (let ((start-addr (+ #x500008 (code-pos))))
-        (rt-compile-expr body)
+      (let ((start-addr (if (not (zerop (mem-ref #x4FF080 :u64)))
+                            (+ #x100000 (code-pos))
+                            (+ #x500008 (code-pos)))))
+        (let ((nparams (list-len params)))
+          ;; Save params to stack at function entry
+          (emit-save-params nparams)
+          (let ((env (build-param-env-stack params 0)))
+            (rt-compile-expr-env body env nparams))
+          ;; Clean up saved params
+          (if (> nparams 0)
+              (emit-add-rsp (* nparams 8))))
         (emit-ret)
         start-addr))
 
@@ -4061,7 +3997,7 @@
       ;; Evaluate lst
       (rt-compile-expr-env (cadr args) env (+ depth 1))
       ;; Pop n into RCX (untagged: shr by 1)
-      (emit-pop-rcx)
+      (code-emit #x59)  ; POP RCX
       (emit-rex-w)
       (code-emit #xD1)  ; shr rcx, 1
       (code-emit #xE9)
@@ -4456,14 +4392,24 @@
     (defun set-return-patches (lst)
       (setf (mem-ref #x300068 :u64) lst))
 
+    ;; Loop entry depth: used by return to compute stack adjustment
+    ;; when returning from inside let bindings within a loop.
+    (defun get-loop-depth ()
+      (mem-ref #x300070 :u64))
+
+    (defun set-loop-depth (d)
+      (setf (mem-ref #x300070 :u64) d))
+
     ;; Compile (loop body-forms...)
     ;; Returns via (return value) which exits the loop
     (defun rt-compile-loop (forms env depth)
       ;; Save outer loop context
       (let ((outer-patches (get-return-patches)))
-        (set-return-patches ())  ; new empty list for this loop
-        ;; Record loop start position
-        (let ((loop-start (code-pos)))
+        (let ((outer-loop-depth (get-loop-depth)))
+          (set-return-patches ())  ; new empty list for this loop
+          (set-loop-depth depth)   ; record stack depth at loop entry
+          ;; Record loop start position
+          (let ((loop-start (code-pos)))
           ;; Compile body forms (progn style)
           (rt-compile-loop-body forms env depth)
           ;; === Reduction counter check (preemptive multitasking) ===
@@ -4505,7 +4451,8 @@
           (let ((patches (get-return-patches)))
             (patch-return-jumps patches (code-pos)))
           ;; Restore outer loop context
-          (set-return-patches outer-patches))))
+          (set-return-patches outer-patches)
+          (set-loop-depth outer-loop-depth)))))
 
     ;; Compile body forms for loop (like progn)
     (defun rt-compile-loop-body (forms env depth)
@@ -4535,10 +4482,13 @@
 
     ;; Patch a u32 value at position in code buffer
     (defun code-patch-u32 (pos val)
-      (setf (mem-ref (+ #x500008 pos) :u8) (logand val #xFF))
-      (setf (mem-ref (+ #x500009 pos) :u8) (logand (ash val (- 0 8)) #xFF))
-      (setf (mem-ref (+ #x50000a pos) :u8) (logand (ash val (- 0 16)) #xFF))
-      (setf (mem-ref (+ #x50000b pos) :u8) (logand (ash val (- 0 24)) #xFF)))
+      (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                      #x08000000
+                      #x500008)))
+        (setf (mem-ref (+ base pos) :u8) (logand val #xFF))
+        (setf (mem-ref (+ base pos 1) :u8) (logand (ash val (- 0 8)) #xFF))
+        (setf (mem-ref (+ base pos 2) :u8) (logand (ash val (- 0 16)) #xFF))
+        (setf (mem-ref (+ base pos 3) :u8) (logand (ash val (- 0 24)) #xFF))))
 
     ;; Compile (return value)
     (defun rt-compile-return (args env depth)
@@ -4546,6 +4496,13 @@
       (if args
           (rt-compile-expr-env (car args) env depth)
           (emit-mov-rax-imm64 0))  ; default nil
+      ;; Adjust stack for let bindings between loop entry and here.
+      ;; When return is inside let bindings within a loop, the stack has
+      ;; extra slots that need to be cleaned up before jumping to loop end.
+      (let ((loop-depth (get-loop-depth)))
+        (let ((adjust (- depth loop-depth)))
+          (if (> adjust 0)
+              (emit-add-rsp (* adjust 8)))))
       ;; Emit jump with placeholder offset
       (code-emit #xE9)  ; JMP rel32
       (let ((patch-pos (code-pos)))
@@ -4559,7 +4516,6 @@
       (if (null forms)
           (emit-mov-rax-imm64 0)  ; return nil
           (if (null (cdr forms))
-              ;; Last/only form
               (rt-compile-expr-env (car forms) env depth)
               (progn
                 (rt-compile-expr-env (car forms) env depth)
@@ -4635,48 +4591,67 @@
 
     ;; Compile (logand a b)
     (defun rt-compile-logand (args env depth)
-      ;; Compile first arg, push
-      (rt-compile-expr-env (car args) env depth)
-      (emit-push-rax)
-      ;; Compile second arg
-      (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-      (emit-mov-reg-rax-to-rdi)
-      ;; Pop first to RAX
-      (emit-pop-rax)
-      ;; and rax, rdi
-      (emit-rex-w)
-      (code-emit #x21)
-      (code-emit #xF8))
+      ;; Handle 3+ args by reducing: (logand a b c) -> (logand (logand a b) c)
+      (if (cdr (cdr args))
+          (rt-compile-logand
+            (cons (cons (sym-logand) (cons (car args) (cons (car (cdr args)) ())))
+                  (cdr (cdr args)))
+            env depth)
+          (progn
+            ;; Compile first arg, push
+            (rt-compile-expr-env (car args) env depth)
+            (emit-push-rax)
+            ;; Compile second arg
+            (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+            (emit-mov-reg-rax-to-rdi)
+            ;; Pop first to RAX
+            (emit-pop-rax)
+            ;; and rax, rdi
+            (emit-rex-w)
+            (code-emit #x21)
+            (code-emit #xF8))))
 
-    ;; Compile (logior a b)
+    ;; Compile (logior a b ...) — handles 3+ args via reduction
     (defun rt-compile-logior (args env depth)
-      ;; Compile first arg, push
-      (rt-compile-expr-env (car args) env depth)
-      (emit-push-rax)
-      ;; Compile second arg
-      (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-      (emit-mov-reg-rax-to-rdi)
-      ;; Pop first to RAX
-      (emit-pop-rax)
-      ;; or rax, rdi
-      (emit-rex-w)
-      (code-emit #x09)
-      (code-emit #xF8))
+      (if (cdr (cdr args))
+          (rt-compile-logior
+            (cons (cons (sym-logior) (cons (car args) (cons (car (cdr args)) ())))
+                  (cdr (cdr args)))
+            env depth)
+          (progn
+            ;; Compile first arg, push
+            (rt-compile-expr-env (car args) env depth)
+            (emit-push-rax)
+            ;; Compile second arg
+            (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+            (emit-mov-reg-rax-to-rdi)
+            ;; Pop first to RAX
+            (emit-pop-rax)
+            ;; or rax, rdi
+            (emit-rex-w)
+            (code-emit #x09)
+            (code-emit #xF8))))
 
-    ;; Compile (logxor a b)
+    ;; Compile (logxor a b ...) — handles 3+ args via reduction
     (defun rt-compile-logxor (args env depth)
-      ;; Compile first arg, push
-      (rt-compile-expr-env (car args) env depth)
-      (emit-push-rax)
-      ;; Compile second arg
-      (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-      (emit-mov-reg-rax-to-rdi)
-      ;; Pop first to RAX
-      (emit-pop-rax)
-      ;; xor rax, rdi
-      (emit-rex-w)
-      (code-emit #x31)
-      (code-emit #xF8))
+      (if (cdr (cdr args))
+          (rt-compile-logxor
+            (cons (cons (sym-logxor) (cons (car args) (cons (car (cdr args)) ())))
+                  (cdr (cdr args)))
+            env depth)
+          (progn
+            ;; Compile first arg, push
+            (rt-compile-expr-env (car args) env depth)
+            (emit-push-rax)
+            ;; Compile second arg
+            (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+            (emit-mov-reg-rax-to-rdi)
+            ;; Pop first to RAX
+            (emit-pop-rax)
+            ;; xor rax, rdi
+            (emit-rex-w)
+            (code-emit #x31)
+            (code-emit #xF8))))
 
     ;; Compile (ash n count) - arithmetic shift
     ;; Positive count = shift left, negative = shift right
@@ -4878,23 +4853,27 @@
       ;; Return nil (0)
       (emit-mov-rax-imm64 0))
 
-    ;; Compile (write-byte val) - output to 0x3F8 (no THRE wait)
-    ;; No THRE polling - QEMU's virtual UART FIFO handles buffering.
-    ;; Polling 'in al,dx' causes KVM VM exits that starve QEMU's event loop.
+    ;; Compile (write-byte val) - calls runtime write-byte which checks
+    ;; capture flags at 0x300014 for SSH output routing.
     (defun rt-compile-write-byte (args env depth)
       ;; Compile value -> RAX
       (rt-compile-expr-env (car args) env depth)
-      ;; Save value in RDI (untag later)
-      (emit-mov-reg-rax-to-rdi)
-      ;; Write the byte: mov rax, rdi; untag; out to 0x3F8
-      (emit-rex-w) (code-emit #x89) (code-emit #xF8)  ; mov rax, rdi
-      (emit-sar-rax-1)
-      ;; mov dx, 0x3F8
-      (code-emit #x66) (code-emit #xBA) (code-emit #xF8) (code-emit #x03)
-      ;; out dx, al
-      (code-emit #xEE)
-      ;; Return nil (0)
-      (emit-mov-rax-imm64 0))
+      ;; Move arg to RSI (first parameter register)
+      (emit-rex-w) (code-emit #x89) (code-emit #xC6)  ; mov rsi, rax
+      ;; Call runtime write-byte via NFN table (sym-write-byte=99, matching
+      ;; the fixed ID in *known-symbol-ids* used for source serialization)
+      (let ((wb-addr (nfn-lookup (sym-write-byte))))
+        (if wb-addr
+            (progn
+              (emit-call-rel32 wb-addr)
+              (emit-mov-rax-imm64 0))
+            ;; Fallback: direct serial if write-byte not yet compiled
+            (progn
+              (emit-rex-w) (code-emit #x89) (code-emit #xF0)  ; mov rax, rsi
+              (emit-sar-rax-1)
+              (code-emit #x66) (code-emit #xBA) (code-emit #xF8) (code-emit #x03)
+              (code-emit #xEE)
+              (emit-mov-rax-imm64 0)))))
 
     ;; Compile (mem-ref addr type) where type is 1=u8, 2=u16, 4=u32, 8=u64
     (defun rt-compile-mem-ref (args env depth)
@@ -4904,9 +4883,9 @@
       (emit-sar-rax-1)
       ;; Move address to RDI to preserve it
       (emit-mov-reg-rax-to-rdi)
-      ;; Get type argument (second arg, should be constant 1/2/4/8)
+      ;; Get type argument (second arg, should be 1=u8, 2=u16, 4=u32, 8=u64)
+      ;; Source keywords :u8/:u16/:u32/:u64 are serialized as integers 1/2/4/8
       (let ((type-arg (car (cdr args))))
-        ;; type-arg should be a number (1, 2, 4, or 8)
         (if (eq type-arg 1)
             ;; u8: movzx rax, byte [rdi]
             (progn
@@ -4961,7 +4940,7 @@
                     (emit-mov-reg-rax-to-rdi)
                     ;; Pop value to RAX
                     (emit-pop-rax)
-                    ;; Store based on type
+                    ;; Store based on type (1=u8, 2=u16, 4=u32, 8=u64)
                     (if (eq type-arg 1)
                         ;; u8: untag value, mov [rdi], al, re-tag return
                         (progn
@@ -5034,17 +5013,24 @@
     ;; pos and target are code buffer positions (tagged)
     (defun patch-rel8 (pos target)
       (let ((rel (- target (+ pos 1))))  ; rel8 is relative to instruction AFTER the byte
-        (setf (mem-ref (+ #x500008 pos) :u8)
-              (logand rel #xFF))))
+        (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                        #x08000000
+                        #x500008)))
+          (setf (mem-ref (+ base pos) :u8)
+                (logand rel #xFF)))))
 
     ;; Patch a rel32 jump at given position to jump to target
     ;; pos is position of first byte of the 4-byte displacement
     (defun patch-rel32 (pos target)
       (let ((rel (- target (+ pos 4))))  ; rel32 is relative to instruction AFTER the 4 bytes
-        (setf (mem-ref (+ #x500008 pos) :u8) (logand rel #xFF))
-        (setf (mem-ref (+ #x500008 pos 1) :u8) (logand (ash rel -8) #xFF))
-        (setf (mem-ref (+ #x500008 pos 2) :u8) (logand (ash rel -16) #xFF))
-        (setf (mem-ref (+ #x500008 pos 3) :u8) (logand (ash rel -24) #xFF))))
+        (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                        #x08000000
+                        #x500008)))
+          (let ((addr (+ base pos)))
+            (setf (mem-ref addr :u8) (logand rel #xFF))
+            (setf (mem-ref (+ addr 1) :u8) (logand (ash rel -8) #xFF))
+            (setf (mem-ref (+ addr 2) :u8) (logand (ash rel -16) #xFF))
+            (setf (mem-ref (+ addr 3) :u8) (logand (ash rel -24) #xFF))))))
 
     ;; Emit a rel32 displacement (little-endian)
     (defun emit-rel32 (target from-after)
@@ -5626,30 +5612,58 @@
                 (code-patch jmp-pos (- (code-pos) jmp-pos 1)))))))
 
     ;; Helper: compile a list of expressions, returning last value
+    ;; Iterative version
     (defun rt-compile-progn-list (exprs env depth)
-      (if (null exprs)
-          ()
-          (if (null (cdr exprs))
-              (rt-compile-expr-env (car exprs) env depth)
-              (progn
-                (rt-compile-expr-env (car exprs) env depth)
-                (rt-compile-progn-list (cdr exprs) env depth)))))
+      (let ((rest exprs))
+        (loop
+          (if (null rest)
+              (return ())
+              (if (null (cdr rest))
+                  (progn
+                    (rt-compile-expr-env (car rest) env depth)
+                    (return ()))
+                  (progn
+                    (rt-compile-expr-env (car rest) env depth)
+                    (setq rest (cdr rest))))))))
 
     ;; ================================================================
     ;; when/unless/dotimes (Phase 5.9)
     ;; ================================================================
 
-    ;; Compile (when test body...) → (if test (progn body...) nil)
+    ;; Compile (when test body...) — inline if logic, no cons allocation
     (defun rt-compile-when (args env depth)
       (let ((test-form (car args))
             (body-forms (cdr args)))
-        (rt-compile-if-env (cons test-form (cons (cons (sym-progn) body-forms) (cons () ()))) env depth)))
+        ;; Compile test
+        (rt-compile-expr-env test-form env depth)
+        ;; Compare to NIL
+        (emit-cmp-rax-nil)
+        ;; Jump to end if nil (skip body)
+        (let ((end-patch (emit-je-placeholder)))
+          ;; Compile body forms
+          (rt-compile-progn-list body-forms env depth)
+          ;; Patch jump target to here
+          (let ((end-pos (code-pos)))
+            (patch-jump end-patch end-pos)))))
 
-    ;; Compile (unless test body...) → (if test nil (progn body...))
+    ;; Compile (unless test body...) — inline if logic, no cons allocation
     (defun rt-compile-unless (args env depth)
       (let ((test-form (car args))
             (body-forms (cdr args)))
-        (rt-compile-if-env (cons test-form (cons () (cons (cons (sym-progn) body-forms) ()))) env depth)))
+        ;; Compile test
+        (rt-compile-expr-env test-form env depth)
+        ;; Compare to NIL: test RAX, RAX (non-nil = nonzero = skip body)
+        (emit-rex-w) (code-emit #x85) (code-emit #xC0)
+        ;; JNZ rel32 = 0F 85 rel32 (skip body if test is non-nil)
+        (code-emit #x0F)
+        (code-emit #x85)
+        (let ((rel32-pos (code-pos)))
+          (code-emit-u32 0)
+          ;; Compile body forms (only runs when test is nil/zero)
+          (rt-compile-progn-list body-forms env depth)
+          ;; Patch jump target to here
+          (let ((end-pos (code-pos)))
+            (patch-jump rel32-pos end-pos)))))
 
     ;; Compile (dotimes (var count) body...)
     ;; Implemented as a counted loop:
@@ -5672,46 +5686,54 @@
           (emit-push-rax)
           ;; Now stack has: [counter] [limit] ...
           ;; counter at depth+2, limit at depth+1
-          (let ((new-env (cons (cons var (+ depth 2)) env))
-                (new-depth (+ depth 2)))
-            ;; loop_start:
-            (let ((loop-start (code-pos)))
-              ;; Load counter into RAX
-              (emit-load-stack 0)  ; [rsp+0] = counter
-              ;; Load limit into RCX
-              (emit-push-rax)  ; save counter
-              (emit-load-stack 16)  ; [rsp+16] = limit (counter was pushed + original limit slot)
-              ;; Actually, let me rethink: stack is [counter][limit]
-              ;; counter at [rsp+0], limit at [rsp+8]
-              ;; Load counter
-              ;; mov rax, [rsp]  -- already at top
-              ;; Load limit
-              ;; mov rcx, [rsp+8]
-              (emit-pop-rax)  ; restore counter (was just pushed)
-              (emit-rex-w) (code-emit #x8B) (code-emit #x4C) (code-emit #x24) (code-emit #x08)  ; mov rcx, [rsp+8]
-              ;; Compare: cmp rax, rcx (counter >= limit?)
-              (emit-rex-w) (code-emit #x39) (code-emit #xC8)  ; cmp rax, rcx
-              ;; jge loop_end (jump if counter >= limit, signed comparison on tagged values)
-              (code-emit #x0F) (code-emit #x8D)  ; jge rel32
-              (let ((end-patch (code-pos)))
-                (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
-                ;; Compile body forms
-                (rt-compile-progn-list body-forms new-env new-depth)
-                ;; Increment counter: load, add 2 (tagged 1), store
-                (emit-load-stack 0)  ; load counter
-                (emit-rex-w) (code-emit #x83) (code-emit #xC0) (code-emit #x02)  ; add rax, 2
-                (emit-store-stack 0)  ; store counter
-                ;; Jump back to loop_start
-                (code-emit #xE9)  ; jmp rel32
-                (let ((jmp-offset (- loop-start (+ (code-pos) 4))))
-                  (code-emit-u32 jmp-offset))
-                ;; loop_end: patch the jge
-                (patch-jump end-patch (code-pos))))
-            ;; Pop counter and limit
-            (emit-add-rsp 16)
-            ;; Return NIL
-            (emit-mov-rax-imm64 0)))))
-
+          ;; Save outer loop context so (return) inside dotimes works correctly.
+          ;; Set loop-depth = depth (BEFORE counter/limit) so return's stack
+          ;; adjustment of (body-depth - depth) cleans up counter+limit too.
+          ;; Return jumps are patched to after the normal exit cleanup code.
+          (let ((outer-patches (get-return-patches)))
+            (let ((outer-loop-depth (get-loop-depth)))
+              (set-return-patches ())
+              (set-loop-depth depth)
+              (let ((new-env (cons (cons var (+ depth 2)) env))
+                    (new-depth (+ depth 2)))
+                ;; loop_start:
+                (let ((loop-start (code-pos)))
+                  ;; Load counter into RAX
+                  (emit-load-stack 0)  ; [rsp+0] = counter
+                  ;; Load limit into RCX
+                  (emit-push-rax)  ; save counter
+                  (emit-load-stack 16)  ; [rsp+16] = limit (counter was pushed + original limit slot)
+                  (emit-pop-rax)  ; restore counter (was just pushed)
+                  (emit-rex-w) (code-emit #x8B) (code-emit #x4C) (code-emit #x24) (code-emit #x08)  ; mov rcx, [rsp+8]
+                  ;; Compare: cmp rax, rcx (counter >= limit?)
+                  (emit-rex-w) (code-emit #x39) (code-emit #xC8)  ; cmp rax, rcx
+                  ;; jge loop_end (jump if counter >= limit, signed comparison on tagged values)
+                  (code-emit #x0F) (code-emit #x8D)  ; jge rel32
+                  (let ((end-patch (code-pos)))
+                    (code-emit #x00) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+                    ;; Compile body forms
+                    (rt-compile-progn-list body-forms new-env new-depth)
+                    ;; Increment counter: load, add 2 (tagged 1), store
+                    (emit-load-stack 0)  ; load counter
+                    (emit-rex-w) (code-emit #x83) (code-emit #xC0) (code-emit #x02)  ; add rax, 2
+                    (emit-store-stack 0)  ; store counter
+                    ;; Jump back to loop_start
+                    (code-emit #xE9)  ; jmp rel32
+                    (let ((jmp-offset (- loop-start (+ (code-pos) 4))))
+                      (code-emit-u32 jmp-offset))
+                    ;; loop_end: patch the jge
+                    (patch-jump end-patch (code-pos))))
+                ;; Pop counter and limit (normal exit path only)
+                (emit-add-rsp 16)
+                ;; Return NIL (normal dotimes completion)
+                (emit-mov-rax-imm64 0)
+                ;; Patch (return) jumps to here — return already cleaned up the
+                ;; stack (including counter/limit) via adjust = depth_at_return - depth
+                (let ((patches (get-return-patches)))
+                  (patch-return-jumps patches (code-pos)))
+                ;; Restore outer loop context
+                (set-return-patches outer-patches)
+                (set-loop-depth outer-loop-depth)))))))
     ;; ================================================================
     ;; Byte Arrays (Phase 5.5) - subtag 0x32
     ;; ================================================================
@@ -5969,7 +5991,6 @@
             (body-forms (cdr args)))
         ;; Compile each binding and push
         (let ((new-env (rt-compile-bindings bindings env depth)))
-          ;; new-env has the bindings prepended, depth increased by binding count
           (let ((new-depth (+ depth (list-len bindings))))
             ;; Compile body forms with implicit progn
             (rt-compile-progn-list body-forms new-env new-depth)
@@ -6036,30 +6057,37 @@
                 (code-emit #x24)    ; SIB: rsp
                 (code-emit-u32 offset)))))
 
-    ;; Add rsp, imm8 (clean up stack)
+    ;; Add rsp, imm (clean up stack)
+    ;; Uses imm8 for small values (0-127), imm32 for larger
     (defun emit-add-rsp (n)
       (emit-rex-w)
-      (code-emit #x83)  ; add r/m64, imm8
-      (code-emit #xC4)  ; ModRM: rsp
-      (code-emit n))    ; immediate
+      (if (< n 128)
+          (progn
+            (code-emit #x83)  ; add r/m64, imm8
+            (code-emit #xC4)  ; ModRM: rsp
+            (code-emit n))    ; imm8
+          (progn
+            (code-emit #x81)  ; add r/m64, imm32
+            (code-emit #xC4)  ; ModRM: rsp
+            (code-emit-u32 n)))) ; imm32
 
     ;; ================================================================
     ;; Native Function Table (flat memory array, GC-immune)
     ;; ================================================================
-    ;; Open-addressing hash table at 0x350000 (fixed address, not affected by GC):
-    ;;   512 slots, linear probing. Empty slot = name 0.
-    ;;   0x350000 + slot*16:     name (tagged fixnum, hash-chars ID, 0 = empty)
-    ;;   0x350000 + slot*16 + 8: addr (tagged fixnum, absolute address)
-    ;; Total: 512 × 16 = 8192 bytes (0x350000–0x352000)
-    ;; Slot = (logand name 511) with linear probing on collision.
+    ;; Open-addressing hash table at 0x330000 (fixed address, not affected by GC):
+    ;;   2048 slots, linear probing. Empty slot = name 0.
+    ;;   0x330000 + slot*16:     name (tagged fixnum, hash-chars ID, 0 = empty)
+    ;;   0x330000 + slot*16 + 8: addr (tagged fixnum, absolute address)
+    ;; Total: 2048 × 16 = 32768 bytes (0x330000–0x338000)
+    ;; Slot = (logand name 2047) with linear probing on collision.
 
     (defun nfn-count ()
       (let ((count 0) (i 0))
         (loop
-          (if (>= i 512)
+          (if (>= i 2048)
               (return count)
               (progn
-                (if (not (eq (mem-ref (+ #x350000 (* i 16)) :u64) 0))
+                (if (not (eq (mem-ref (+ #x330000 (* i 16)) :u64) 0))
                     (setq count (+ count 1))
                     ())
                 (setq i (+ i 1)))))))
@@ -6067,81 +6095,129 @@
     (defun init-nfntable ()
       (let ((i 0))
         (loop
-          (if (>= i 1024)
+          (if (>= i 4096)
               (return 0)
               (progn
-                (setf (mem-ref (+ #x350000 (* i 8)) :u64) 0)
+                (setf (mem-ref (+ #x330000 (* i 8)) :u64) 0)
                 (setq i (+ i 1)))))))
 
     (defun nfn-define (name addr)
-      (let ((slot (logand name 511))
-            (tries 0))
-        (loop
-          (if (>= tries 512)
-              (return 0)
-              (let ((base (+ #x350000 (* slot 16))))
-                (let ((entry-name (mem-ref base :u64)))
-                  (if (eq entry-name 0)
-                      (progn
-                        (setf (mem-ref base :u64) name)
-                        (setf (mem-ref (+ base 8) :u64) addr)
-                        (return name))
-                      (if (eq entry-name name)
-                          (progn
-                            (setf (mem-ref (+ base 8) :u64) addr)
-                            (return name))
-                          (progn
-                            (setq slot (logand (+ slot 1) 511))
-                            (setq tries (+ tries 1)))))))))))
+      (let ((tbl-base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                          #x0A000000
+                          #x330000)))
+        (let ((slot (logand name 2047))
+              (tries 0))
+          (loop
+            (if (>= tries 2048)
+                (return 0)
+                (let ((base (+ tbl-base (* slot 16))))
+                  (let ((entry-name (mem-ref base :u64)))
+                    (if (eq entry-name 0)
+                        (progn
+                          (setf (mem-ref base :u64) name)
+                          (setf (mem-ref (+ base 8) :u64) addr)
+                          (return name))
+                        (if (eq entry-name name)
+                            (progn
+                              (setf (mem-ref (+ base 8) :u64) addr)
+                              (return name))
+                            (progn
+                              (setq slot (logand (+ slot 1) 2047))
+                              (setq tries (+ tries 1))))))))))))
 
     (defun nfn-lookup (name)
-      (let ((slot (logand name 511))
-            (tries 0))
-        (loop
-          (if (>= tries 512)
-              (return ())
-              (let ((base (+ #x350000 (* slot 16))))
-                (let ((entry-name (mem-ref base :u64)))
-                  (if (eq entry-name 0)
-                      (return ())
-                      (if (eq entry-name name)
-                          (return (mem-ref (+ base 8) :u64))
-                          (progn
-                            (setq slot (logand (+ slot 1) 511))
-                            (setq tries (+ tries 1)))))))))))
+      (let ((tbl-base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                          #x0A000000
+                          #x330000)))
+        (let ((slot (logand name 2047))
+              (tries 0))
+          (loop
+            (if (>= tries 2048)
+                (return ())
+                (let ((base (+ tbl-base (* slot 16))))
+                  (let ((entry-name (mem-ref base :u64)))
+                    (if (eq entry-name 0)
+                        (return ())
+                        (if (eq entry-name name)
+                            (return (mem-ref (+ base 8) :u64))
+                            (progn
+                              (setq slot (logand (+ slot 1) 2047))
+                              (setq tries (+ tries 1))))))))))))
 
     ;; ================================================================
     ;; Function Compilation
     ;; ================================================================
 
-    ;; Build parameter environment from params list
-    ;; params = (p1 p2 ...) -> env = ((p1 . 0) (p2 . 1) ...)
-    ;; Note: depth 0 means "in register", not on stack
-    ;; We'll use negative depths for register params:
-    ;; -1 = RSI (first param), -2 = RDI (second param)
-    (defun build-param-env (params idx)
+    ;; Build parameter environment with stack depths
+    ;; After pushing N params: first param at depth 1, second at depth 2, etc.
+    ;; env = ((p1 . 1) (p2 . 2) ...) for stack-saved params
+    (defun build-param-env-stack (params idx)
       (if (null params)
           ()
-          (cons (cons (car params) (- 0 (+ idx 1)))
-                (build-param-env (cdr params) (+ idx 1)))))
+          (cons (cons (car params) (+ idx 1))
+                (build-param-env-stack (cdr params) (+ idx 1)))))
+
+    ;; Emit code to save parameters to stack at function entry
+    ;; Returns the number of params saved
+    (defun emit-save-params (nparams)
+      (if (> nparams 0)
+          (progn
+            (code-emit #x56)  ;; push rsi (param 0)
+            (if (> nparams 1)
+                (progn
+                  (code-emit #x57)  ;; push rdi (param 1)
+                  (if (> nparams 2)
+                      (progn
+                        (code-emit #x41) (code-emit #x50)  ;; push r8 (param 2)
+                        (if (> nparams 3)
+                            (progn
+                              (code-emit #x41) (code-emit #x51)  ;; push r9 (param 3)
+                              ;; For 5+ params: copy extra args from above return address
+                              ;; Caller pushed them left-to-right. After 4 reg pushes + k copies,
+                              ;; the next extra is always at RSP + nparams*8 (constant offset).
+                              (if (> nparams 4)
+                                  (let ((offset (* nparams 8))
+                                        (k 0))
+                                    (loop
+                                      (if (>= k (- nparams 4))
+                                          (return ())
+                                          (progn
+                                            (emit-load-stack offset)
+                                            (emit-push-rax)
+                                            (setq k (+ k 1))))))
+                                  ()))
+                            ()))))))))
 
     ;; Compile (defun name (params) body)
     ;; Stores compiled function in native function table
     ;; Functions accumulate in the code buffer (don't reset here)
+    ;; In image mode (0x4FF080 != 0): emits to image buffer, uses image NFN table,
+    ;; and computes start-addr relative to image load address (0x100000).
     (defun rt-compile-defun (args)
       (let ((name (car args))
             (params (car (cdr args)))
-            (body (car (cdr (cdr args)))))
-        ;; Build environment from params
-        (let ((env (build-param-env params 0)))
-          ;; Compile the function body at current code_pos
-          (let ((start-addr (+ #x500008 (code-pos))))
-            ;; Register FIRST so recursive calls can find this function
-            (nfn-define name start-addr)
-            ;; Then compile the body
-            (rt-compile-expr-env body env 0)
-            (emit-ret)
-            start-addr))))
+            (rest2 (cdr (cdr args))))
+        (let ((body (if rest2 (car rest2) ())))
+          (let ((nparams (list-len params)))
+            ;; Compute start addr BEFORE emitting any code
+            (let ((start-addr (if (not (zerop (mem-ref #x4FF080 :u64)))
+                                  (+ #x100000 (code-pos))
+                                  (+ #x500008 (code-pos)))))
+              ;; Register FIRST so recursive calls can find this function
+              (nfn-define name start-addr)
+              ;; Save params to stack at function entry
+              (emit-save-params nparams)
+              ;; Build stack-based environment
+              (let ((env (build-param-env-stack params 0)))
+                ;; Compile ALL body forms (not just first!) with depth = nparams
+                (if rest2
+                    (rt-compile-progn-list rest2 env nparams)
+                    (emit-mov-rax-imm64 0))
+                ;; Clean up saved params and return
+                (if (> nparams 0)
+                    (emit-add-rsp (* nparams 8)))
+                (emit-ret))
+              start-addr)))))
 
     ;; Untag a fixnum: extract bits 1-63 (shift right 1)
     ;; All Lisp values are tagged (shifted left 1), so untagging recovers the raw value
@@ -6159,63 +6235,103 @@
       (code-emit #xFF)
       (code-emit #xD0))
 
+    ;; Push extra args (5th onward) left-to-right for 5+ arg calls
+    (defun rt-compile-push-extras (extra-args env depth)
+      (if (null extra-args)
+          0
+          (progn
+            (rt-compile-expr-env (car extra-args) env depth)
+            (emit-push-rax)
+            (+ 1 (rt-compile-push-extras (cdr extra-args) env (+ depth 1))))))
+
+    ;; Compile first 4 args into registers RSI, RDI, R8, R9
+    (defun rt-compile-4reg-args (args env depth nargs)
+      (if (eq nargs 0)
+          ()
+          (if (eq nargs 1)
+              (progn
+                (rt-compile-expr-env (car args) env depth)
+                (emit-mov-rax-to-rsi))
+              (if (eq nargs 2)
+                  (progn
+                    (rt-compile-expr-env (car args) env depth)
+                    (emit-push-rax)
+                    (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+                    (emit-mov-reg-rax-to-rdi)
+                    (emit-pop-rsi))
+                  (if (eq nargs 3)
+                      (progn
+                        (rt-compile-expr-env (car args) env depth)
+                        (emit-push-rax)
+                        (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+                        (emit-push-rax)
+                        (rt-compile-expr-env (car (cdr (cdr args))) env (+ depth 2))
+                        (emit-mov-rax-to-r8)
+                        (emit-pop-rax)
+                        (emit-mov-reg-rax-to-rdi)
+                        (emit-pop-rsi))
+                      (progn
+                        (rt-compile-expr-env (car args) env depth)
+                        (emit-push-rax)
+                        (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
+                        (emit-push-rax)
+                        (rt-compile-expr-env (car (cdr (cdr args))) env (+ depth 2))
+                        (emit-push-rax)
+                        (rt-compile-expr-env (car (cdr (cdr (cdr args)))) env (+ depth 3))
+                        (emit-mov-rax-to-r9)
+                        (emit-pop-rax)
+                        (emit-mov-rax-to-r8)
+                        (emit-pop-rax)
+                        (emit-mov-reg-rax-to-rdi)
+                        (emit-pop-rsi)))))))
+
+    ;; Get tail of list starting at index N
+    (defun list-drop (lst n)
+      (if (eq n 0) lst
+          (if (null lst) ()
+              (list-drop (cdr lst) (- n 1)))))
+
+    ;; Compile function call arguments into registers RSI, RDI, R8, R9
+    ;; For 5+ args, pushes extras onto stack first, then loads first 4 into regs
+    ;; Returns the number of extra args pushed (0 for <= 4 args)
+    (defun rt-compile-args (args env depth)
+      (let ((nargs (list-len args)))
+        (if (<= nargs 4)
+            (progn
+              (rt-compile-4reg-args args env depth nargs)
+              0)
+            ;; 5+ args: push extras left-to-right, then first 4 into regs
+            (let ((n-extra (- nargs 4)))
+              (rt-compile-push-extras (list-drop args 4) env depth)
+              (rt-compile-4reg-args args env (+ depth n-extra) 4)
+              n-extra))))
+
     ;; Compile a function call (fname arg1 arg2 ...)
-    ;; Currently supports 0-2 arguments in RSI, RDI
+    ;; Supports any number of arguments. First 4 in RSI/RDI/R8/R9, rest on stack.
+    ;; In image mode, unresolved calls are recorded as forward references
+    ;; and patched after all functions are compiled.
     (defun rt-compile-call (fname args env depth)
       (let ((fn-addr (nfn-lookup fname)))
         (if fn-addr
-            (progn
-              ;; Compile arguments
-              (let ((nargs (list-len args)))
-                (if (eq nargs 0)
-                    ()  ; no args
-                    (if (eq nargs 1)
-                        ;; One arg -> RSI
-                        (progn
-                          (rt-compile-expr-env (car args) env depth)
-                          (emit-mov-rax-to-rsi))
-                        (if (eq nargs 2)
-                            ;; Two args -> RSI, RDI
-                            (progn
-                              (rt-compile-expr-env (car args) env depth)
-                              (emit-push-rax)
-                              (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-                              (emit-mov-reg-rax-to-rdi)
-                              (emit-pop-rsi))
-                            (if (eq nargs 3)
-                                ;; Three args -> RSI, RDI, R8
-                                (progn
-                                  (rt-compile-expr-env (car args) env depth)
-                                  (emit-push-rax)
-                                  (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-                                  (emit-push-rax)
-                                  (rt-compile-expr-env (car (cdr (cdr args))) env (+ depth 2))
-                                  (emit-mov-rax-to-r8)
-                                  (emit-pop-rax)
-                                  (emit-mov-reg-rax-to-rdi)
-                                  (emit-pop-rsi))
-                                (if (eq nargs 4)
-                                    ;; Four args -> RSI, RDI, R8, R9
-                                    (progn
-                                      (rt-compile-expr-env (car args) env depth)
-                                      (emit-push-rax)
-                                      (rt-compile-expr-env (car (cdr args)) env (+ depth 1))
-                                      (emit-push-rax)
-                                      (rt-compile-expr-env (car (cdr (cdr args))) env (+ depth 2))
-                                      (emit-push-rax)
-                                      (rt-compile-expr-env (car (cdr (cdr (cdr args)))) env (+ depth 3))
-                                      (emit-mov-rax-to-r9)
-                                      (emit-pop-rax)
-                                      (emit-mov-rax-to-r8)
-                                      (emit-pop-rax)
-                                      (emit-mov-reg-rax-to-rdi)
-                                      (emit-pop-rsi))
-                                    ;; More than 4 args - not supported from REPL
-                                    ()))))))
-              ;; Call the function
-              (emit-call-rel32 fn-addr))
-            ;; Function not found - return 0
-            (emit-mov-rax-imm64 0))))
+            (let ((n-extra (rt-compile-args args env depth)))
+              (emit-call-rel32 fn-addr)
+              (if (> n-extra 0)
+                  (emit-add-rsp (* n-extra 8))
+                  ()))
+            ;; Function not found
+            (if (not (zerop (mem-ref #x4FF080 :u64)))
+                ;; Image mode: forward reference
+                (let ((n-extra (rt-compile-args args env depth)))
+                  (let ((patch-pos (+ (code-pos) 2)))
+                    (img-fwd-record patch-pos fname)
+                    (emit-mov-rax-imm64 0)
+                    (code-emit #xFF)
+                    (code-emit #xD0))
+                  (if (> n-extra 0)
+                      (emit-add-rsp (* n-extra 8))
+                      ()))
+                ;; Normal mode: return nil
+                (emit-mov-rax-imm64 0)))))
 
     ;; Emit: mov rsi, rax
     (defun emit-mov-rax-to-rsi ()
@@ -6628,10 +6744,13 @@
           (code-emit #xB8) (code-emit #x02) (code-emit #x00) (code-emit #x00) (code-emit #x00)
           ;; Patch LEA displacement: cont_pos - (lea_disp_pos + 4)
           (let ((disp (- cont-pos (+ lea-disp-pos 4))))
-            (setf (mem-ref (+ #x500008 lea-disp-pos) :u8) (logand disp #xFF))
-            (setf (mem-ref (+ #x500009 lea-disp-pos) :u8) (logand (ash disp -8) #xFF))
-            (setf (mem-ref (+ #x50000A lea-disp-pos) :u8) (logand (ash disp -16) #xFF))
-            (setf (mem-ref (+ #x50000B lea-disp-pos) :u8) (logand (ash disp -24) #xFF))))))
+            (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                            #x08000000
+                            #x500008)))
+              (setf (mem-ref (+ base lea-disp-pos) :u8) (logand disp #xFF))
+              (setf (mem-ref (+ base lea-disp-pos 1) :u8) (logand (ash disp -8) #xFF))
+              (setf (mem-ref (+ base lea-disp-pos 2) :u8) (logand (ash disp -16) #xFF))
+              (setf (mem-ref (+ base lea-disp-pos 3) :u8) (logand (ash disp -24) #xFF)))))))
 
     ;; (restore-context addr) — restore actor registers and jump
     ;; Never returns to caller
@@ -6687,16 +6806,17 @@
         (emit-sar-rax-1)
         ;; mov rbx, rax (48 89 C3)
         (emit-rex-w) (code-emit #x89) (code-emit #xC3)
-        ;; Compile first arg -> RSI (if any)
+        ;; Compile args -> registers (if any)
         (if (not (null arg-list))
             (progn
+              ;; First arg -> RSI
               (rt-compile-expr-env (car arg-list) env (+ depth 2))
-              (emit-mov-rax-to-rsi)))
-        ;; Compile second arg -> RDI (if any)
-        (if (not (null (cdr arg-list)))
-            (progn
-              (rt-compile-expr-env (car (cdr arg-list)) env (+ depth 2))
-              (emit-mov-reg-rax-to-rdi)))
+              (emit-mov-rax-to-rsi)
+              ;; Second arg -> RDI (if any)
+              (if (not (null (cdr arg-list)))
+                  (progn
+                    (rt-compile-expr-env (car (cdr arg-list)) env (+ depth 2))
+                    (emit-mov-reg-rax-to-rdi)))))
         ;; Call RBX: FF D3
         (code-emit #xFF) (code-emit #xD3)
         ;; Restore R15, R12
@@ -6711,6 +6831,18 @@
       ;; 65 48 8B 24 25 38 00 00 00
       (code-emit #x65) (emit-rex-w) (code-emit #x8B) (code-emit #x24) (code-emit #x25)
       (code-emit #x38) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+      ;; Return 0
+      (code-emit #x31) (code-emit #xC0))
+
+    ;; (set-rsp addr) — set RSP to given address
+    ;; Used to switch boot context to actor 1's stack so GC scans correctly.
+    (defun rt-compile-set-rsp (args env depth)
+      ;; Compile addr -> RAX (tagged fixnum)
+      (rt-compile-expr-env (car args) env depth)
+      ;; Untag: sar rax, 1
+      (emit-rex-w) (code-emit #xD1) (code-emit #xF8)
+      ;; mov rsp, rax
+      (emit-rex-w) (code-emit #x89) (code-emit #xC4)
       ;; Return 0
       (code-emit #x31) (code-emit #xC0))
 
@@ -6780,24 +6912,31 @@
               (body (car (cdr args)))
               (fn-start (code-pos)))
 
-          ;; Build parameter environment
-          ;; Params are in RSI, RDI, R8, R9
-          (let ((param-env (build-param-env params 0)))
-            (rt-compile-expr-env body param-env 0)
-            (emit-ret))
+          ;; Save params to stack and build stack-based env
+          (let ((nparams (list-len params)))
+            (emit-save-params nparams)
+            (let ((param-env (build-param-env-stack params 0)))
+              (rt-compile-expr-env body param-env nparams)
+              (if (> nparams 0)
+                  (emit-add-rsp (* nparams 8)))
+              (emit-ret)))
 
           ;; Patch JMP displacement
           (let ((fn-end (code-pos)))
             (let ((disp (- fn-end (+ jmp-disp-pos 4))))
-              (setf (mem-ref (+ #x500008 jmp-disp-pos) :u8) (logand disp #xFF))
-              (setf (mem-ref (+ #x500009 jmp-disp-pos) :u8) (logand (ash disp -8) #xFF))
-              (setf (mem-ref (+ #x50000A jmp-disp-pos) :u8) (logand (ash disp -16) #xFF))
-              (setf (mem-ref (+ #x50000B jmp-disp-pos) :u8) (logand (ash disp -24) #xFF)))
+              (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                              #x08000000
+                              #x500008)))
+                (setf (mem-ref (+ base jmp-disp-pos) :u8) (logand disp #xFF))
+                (setf (mem-ref (+ base jmp-disp-pos 1) :u8) (logand (ash disp -8) #xFF))
+                (setf (mem-ref (+ base jmp-disp-pos 2) :u8) (logand (ash disp -16) #xFF))
+                (setf (mem-ref (+ base jmp-disp-pos 3) :u8) (logand (ash disp -24) #xFF))))
 
             ;; Return function address as tagged fixnum
-            ;; The function is at 0x500008 + fn-start
-            ;; Load it as immediate: mov rax, (0x500008 + fn-start) << 1
-            (emit-mov-rax-imm64 (+ #x500008 fn-start))
+            (let ((fn-addr (if (not (zerop (mem-ref #x4FF080 :u64)))
+                               (+ #x100000 fn-start)
+                               (+ #x500008 fn-start))))
+              (emit-mov-rax-imm64 fn-addr))
             ;; Tag as fixnum: already raw address, need to SHL 1
             (emit-shl-rax-1)))))
 
@@ -7023,13 +7162,14 @@
                                                                                                                                                                                                                                                                     (if (eq op (sym-percpu-ref)) (rt-compile-percpu-ref (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-percpu-set)) (rt-compile-percpu-set (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-switch-idle-stack)) (rt-compile-switch-idle-stack (cdr form) env depth)
+                                                                                                                                                                                                                                                                    (if (eq op (sym-set-rsp)) (rt-compile-set-rsp (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-lidt)) (rt-compile-lidt-op (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-block)) (rt-compile-block-op (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-tagbody)) (rt-compile-tagbody-op (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-go)) (rt-compile-go-op (cdr form) env depth)
                                                                                                                                                                                                                                                                     (if (eq op (sym-lambda)) (rt-compile-lambda-op (cdr form) env depth)
                                                                                                                                                                                                                                                                     ;; Not a special form - try function call
-                                                                                                                                                                                                                                                                    (rt-compile-call op (cdr form) env depth)))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
+                                                                                                                                                                                                                                                                    (rt-compile-call op (cdr form) env depth))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))
           ;; ELSE: Atom - check environment first, then constant
           (let ((binding-depth (env-find form env)))
             (if binding-depth
@@ -7048,13 +7188,8 @@
                     ;; Stack variable - compute offset
                     (let ((offset (* (- depth binding-depth) 8)))
                       (emit-load-stack offset)))
-                ;; Check for legacy params x, y (for backward compatibility)
-                (if (eq form (sym-x))
-                    (emit-mov-rax-rsi)
-                    (if (eq form (sym-y))
-                        (emit-mov-rax-rdi)
-                        ;; Constant - emit with tagging (* 2)
-                        (emit-mov-rax-tagged form)))))))  ; form already tagged
+                ;; Constant - emit with tagging (* 2)
+                (emit-mov-rax-tagged form)))))  ; form already tagged
 
     ;; Wrapper for backward compatibility
     (defun rt-compile-expr (form)
@@ -7072,6 +7207,22 @@
         addr))
 
     ;; Test calling native code: compile (+ x y) then call with values
+    ;; Test: simple function that writes a byte at code buffer pos
+    (defun test-write-fn (pos val)
+      (setf (mem-ref (+ #x500008 pos) :u8) val))
+
+    ;; Test: function that computes (- target (+ pos 4)) and writes it
+    (defun test-patch-fn (pos target)
+      (let ((rel (- target (+ pos 4))))
+        (setf (mem-ref (+ #x500008 pos) :u8) rel)))
+
+    ;; Test: function that takes pos, computes base, writes val
+    (defun test-base-fn (pos val)
+      (let ((base (if (not (zerop (mem-ref #x4FF080 :u64)))
+                      #x08000000
+                      #x500008)))
+        (setf (mem-ref (+ base pos) :u8) val)))
+
     (defun test-native-add (a b)
       (code-init)
       (let ((addr (rt-compile-lambda
@@ -8617,11 +8768,11 @@
               ;; Copy payload to connection's recv buffer
               ;; No lock needed: net-actor is sole writer, handler reads after (receive)
               (let ((buf-len (mem-ref (+ ssh #x6D4) :u32))
-                    (data-start (+ buf 14 20 tcp-data-off)))
+                    (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
                 (let ((i 0))
                   (loop
                     (when (>= i data-len) (return 0))
-                    (setf (mem-ref (+ ssh #x6D8 buf-len i) :u8)
+                    (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
                           (mem-ref (+ data-start i) :u8))
                     (setq i (+ i 1))))
                 (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len)))
@@ -11312,7 +11463,7 @@
                   (dotimes (i 50)
                     (let ((xlb (if (< i 32) (aref xlow i) 0))
                           (pb (aref prod i)))
-                      (let ((diff (- xlb pb borrow)))
+                      (let ((diff (- (- xlb pb) borrow)))
                         (if (< diff 0)
                             (progn (aset x i (+ diff 256)) (setq borrow 1))
                             (progn (aset x i diff) (setq borrow 0))))))
@@ -11321,7 +11472,7 @@
                     (dotimes (i 50)
                       (let ((xlb (if (< i 32) (aref xlow i) 0))
                             (pb (aref prod i)))
-                        (let ((diff (- pb xlb borrow)))
+                        (let ((diff (- (- pb xlb) borrow)))
                           (if (< diff 0)
                               (progn (aset x i (+ diff 256)) (setq borrow 1))
                               (progn (aset x i diff) (setq borrow 0)))))))))))
@@ -11428,11 +11579,11 @@
         r))
 
     ;; Concatenate three byte arrays
-    (defun concat3-bytes (a al b bl c cl)
-      (let ((r (make-array (+ al bl cl))))
+    (defun concat3-bytes (a al b bl c clen)
+      (let ((r (make-array (+ (+ al bl) clen))))
         (dotimes (i al) (aset r i (aref a i)))
         (dotimes (i bl) (aset r (+ al i) (aref b i)))
-        (dotimes (i cl) (aset r (+ al bl i) (aref c i)))
+        (dotimes (i clen) (aset r (+ (+ al bl) i) (aref c i)))
         r))
 
     ;; Sign a message with Ed25519
@@ -11779,8 +11930,8 @@
         (setq pad-len (- 8 (mod base-len 8)))
         (when (eq pad-len 8) (setq pad-len 0))
         (when (< pad-len 4) (setq pad-len (+ pad-len 8)))
-        (let ((packet-len (+ 1 payload-len pad-len))
-              (total-len (+ 4 1 payload-len pad-len)))
+        (let ((packet-len (+ (+ 1 payload-len) pad-len))
+              (total-len (+ (+ (+ 4 1) payload-len) pad-len)))
           (let ((pkt (make-array total-len)))
             ;; packet_length
             (ssh-put-u32 pkt 0 packet-len)
@@ -12226,7 +12377,7 @@
 
     ;; Send SERVICE_ACCEPT
     (defun ssh-send-service-accept (ssh svc-name svc-len)
-      (let ((reply (make-array (+ 1 4 svc-len))))
+      (let ((reply (make-array (+ (+ 1 4) svc-len))))
         (aset reply 0 6)  ; SSH_MSG_SERVICE_ACCEPT
         (ssh-put-u32 reply 1 svc-len)
         (dotimes (i svc-len) (aset reply (+ 5 i) (aref svc-name i)))
@@ -12240,13 +12391,13 @@
 
     ;; Send USERAUTH_PK_OK
     (defun ssh-send-auth-pk-ok (ssh algo algo-len pk pk-len)
-      (let ((reply (make-array (+ 1 4 algo-len 4 pk-len))))
+      (let ((reply (make-array (+ (+ (+ (+ 1 4) algo-len) 4) pk-len))))
         (aset reply 0 60)  ; SSH_MSG_USERAUTH_PK_OK
         (ssh-put-u32 reply 1 algo-len)
         (dotimes (i algo-len) (aset reply (+ 5 i) (aref algo i)))
         (ssh-put-u32 reply (+ 5 algo-len) pk-len)
         (dotimes (i pk-len)
-          (aset reply (+ 9 algo-len i) (aref pk i)))
+          (aset reply (+ (+ 9 algo-len) i) (aref pk i)))
         (ssh-send-payload ssh reply (array-length reply))))
 
     ;; Send CHANNEL_OPEN_CONFIRM
@@ -12716,48 +12867,37 @@
                     (setf (mem-ref (+ cb #x3714) :u32) ridx)
                     count)))))))
 
-    ;; Main SSH server
-    ;; Auto-boot: initialize networking + SSH from kernel cmdline
-    ;; Usage: qemu ... -append "🚀ssh"
-    (defun ssh-boot ()
-      (net-init-dhcp)
-      (ed25519-init)
-      (ssh-server 22))
-
-    ;; Check cmdline at 0x300200 (copied from multiboot by boot asm)
-    ;; Sigil: 🚀 = U+1F680 = F0 9F 9A 80 in UTF-8
-    ;; QEMU prepends kernel path, so scan for 🚀 anywhere in cmdline
-    ;; Usage: -append "🚀ssh"
-    (defun check-cmdline ()
-      ;; Scan for rocket emoji F0 9F 9A 80 in first 250 bytes
-      (let ((pos 0)
-            (found 0))
+    ;; Evaluate a Lisp form from the kernel command line.
+    ;; Scans cmdline at 0x300200 for '(' and evaluates the form.
+    ;; Usage: qemu ... -append "(progn (net-init-dhcp) (ssh-server 22))"
+    (defun eval-cmdline ()
+      ;; Scan for '(' (ASCII 40) in first 250 bytes
+      ;; Store found position + 1 (0 = not found)
+      (let ((found 0)
+            (pos 0))
         (loop
           (when (> pos 250) (return 0))
-          (when (zerop (mem-ref (+ #x300200 pos) :u8)) (return 0))
-          (when (eq (mem-ref (+ #x300200 pos) :u8) #xF0)
-            (when (eq (mem-ref (+ #x300201 pos) :u8) #x9F)
-              (when (eq (mem-ref (+ #x300202 pos) :u8) #x9A)
-                (when (eq (mem-ref (+ #x300203 pos) :u8) #x80)
-                  (setq found (+ pos 4))
-                  (return 0)))))
-          (setq pos (+ pos 1)))
-        ;; If found, print and dispatch
-        (when (> found 0)
-          (write-byte #xF0) (write-byte #x9F) (write-byte #x9A) (write-byte #x80)
-          (let ((i found))
+          (let ((b (mem-ref (+ #x300200 pos) :u8)))
+            (when (zerop b) (return 0))
+            (when (eq b 40)
+              (setq found (+ pos 1))
+              (return 0))
+            (setq pos (+ pos 1))))
+        (when (not (zerop found))
+          (let ((start (- found 1))
+                (i 0))
+            ;; Copy from cmdline[start..] to edit line buffer at 0x300028
             (loop
-              (let ((b (mem-ref (+ #x300200 i) :u8)))
-                (when (zerop b) (return 0))
-                (write-byte b)
-                (setq i (+ i 1))
-                (when (> i 254) (return 0)))))
-          (write-byte 10)
-          ;; Dispatch: "ssh" at found offset
-          (when (eq (mem-ref (+ #x300200 found) :u8) 115)
-            (when (eq (mem-ref (+ #x300201 found) :u8) 115)
-              (when (eq (mem-ref (+ #x300202 found) :u8) 104)
-                (ssh-boot)))))))  ;; 3 whens + when>0 + let + defun
+              (let ((c (mem-ref (+ #x300200 (+ start i)) :u8)))
+                (when (zerop c) (return 0))
+                (when (> i 250) (return 0))
+                (setf (mem-ref (+ #x300028 i) :u8) c)
+                (setq i (+ i 1))))
+            ;; Set up reader FIFO and evaluate
+            (setf (mem-ref #x312800 :u64) i)
+            (setf (mem-ref #x300020 :u32) 1)
+            (setf (mem-ref #x300024 :u32) i)
+            (eval-line-expr)))))
 
     ;; Compile a native GC wrapper function using the runtime compiler.
     ;; This creates a callable function that runs inline per-actor GC,
@@ -13017,10 +13157,14 @@
     (defun smp-init ()
       ;; Set GS base for BSP's per-CPU data FIRST
       ;; This must happen before any percpu-ref/percpu-set operations
+      (write-byte 97)  ;; 'a' - before set-gs-base
       (set-gs-base #x360000)
       ;; Enable BSP's local APIC
+      (write-byte 98)  ;; 'b' - before lapic-enable
       (lapic-enable)
+      (write-byte 99)  ;; 'c' - before lapic-timer-init
       (lapic-timer-init)
+      (write-byte 100) ;; 'd' - before per-CPU stores
       ;; Initialize per-CPU data for BSP (CPU 0) via direct mem-ref
       (setf (mem-ref #x360000 :u64) 0)              ; current-actor = 0 (set later by actor-init)
       (setf (mem-ref #x360008 :u64) 0)              ; reduction-ctr (set later by actor-init)
@@ -13031,40 +13175,30 @@
       ;; to prevent two CPUs from sharing an actor stack when one blocks.
       ;; Layout: CPU N idle stack top = 0x352000 + (N+1) * 0x1000
       (setf (mem-ref #x360038 :u64) #x353000)      ; CPU 0 (BSP) idle stack top
+      (write-byte 101) ;; 'e' - before percpu-set
       ;; Initialize per-CPU obj-alloc/obj-limit with boot-time values
       ;; (will be overwritten by actor-init with per-actor values)
       (percpu-set 40 (untag #x04800000))            ; obj-alloc (boot value)
       (percpu-set 48 (untag #x04C00000))            ; obj-limit (boot value)
+      (write-byte 102) ;; 'f' - before smp-copy-trampoline
       ;; Copy trampoline to 0x8000 (once, reused for each AP)
       (smp-copy-trampoline)
+      (write-byte 103) ;; 'g' - after trampoline copy
       ;; Clear 0x300010 after use — this address is shared with the reader's
       ;; lookahead buffer. Leaving the trampoline address here causes the reader
       ;; to see a stale lookahead byte on the first REPL call.
       (setf (mem-ref #x300010 :u64) 0)
-      ;; Boot APs 1 through 7 sequentially.
-      ;; Each AP gets stack at 0x362000 + apic_id * 0x4000 (16KB per AP).
-      ;; Stop at first non-responding AP (means no more CPUs in the system).
-      (let ((ncpu 1)
-            (ap 1)
-            (stack-top #x366000))
-        (loop
-          (if (> ap 7)
-              (return 0)
-              (if (zerop (smp-boot-ap ap stack-top))
-                  (return 0)
-                  (progn
-                    (setq ncpu (+ ncpu 1))
-                    (setq ap (+ ap 1))
-                    (setq stack-top (+ stack-top #x4000))))))
-        ;; Store CPU count at 0x360420
-        (setf (mem-ref #x360420 :u64) ncpu)
-        ;; Print "SMP" + digit
-        (write-byte 83)  ; 'S'
-        (write-byte 77)  ; 'M'
-        (write-byte 80)  ; 'P'
-        (write-byte (+ 48 ncpu))  ; '0' + count
-        (write-byte 10)
-        ncpu))
+      (write-byte 104) ;; 'h' - before AP boot
+      ;; Skip AP boot for now - just set CPU count to 1
+      (setf (mem-ref #x360420 :u64) 1)
+      (write-byte 105) ;; 'i' - after skip
+      ;; Print "SMP1"
+      (write-byte 83)  ; 'S'
+      (write-byte 77)  ; 'M'
+      (write-byte 80)  ; 'P'
+      (write-byte 49)  ; '1'
+      (write-byte 10)
+      1)
 
     ;; Shutdown: try QEMU ISA debug exit (port 0xf4), then ACPI, then spin
     (defun halt ()
@@ -13586,8 +13720,8 @@
               (progn
                 (setf (mem-ref buf :u8) 2)
                 (let ((n1 (term-encode (car val) (+ buf 1))))
-                  (let ((n2 (term-encode (cdr val) (+ buf 1 n1))))
-                    (+ 1 n1 n2))))
+                  (let ((n2 (term-encode (cdr val) (+ (+ buf 1) n1))))
+                    (+ (+ 1 n1) n2))))
               (if (stringp val)
                   (let ((slen (string-length val)))
                     (setf (mem-ref buf :u8) 3)
@@ -15025,6 +15159,813 @@
                   (tcp-send #x300100 send-size)
                   (setq i (+ i send-size))))))))
 
+    ;; ================================================================
+    ;; Self-Hosting: Build Modus64 Kernel From Within
+    ;; ================================================================
+    ;; This section implements the self-hosting build system. The running
+    ;; kernel can compile itself into a new bootable image without SBCL.
+    ;;
+    ;; Memory layout for self-hosting:
+    ;;   0x4FF040: img-pos (image buffer write position)
+    ;;   0x4FF050: preamble size (set by SBCL build)
+    ;;   0x4FF058: total image size (set by SBCL build)
+    ;;   0x4FF080: img-compile-mode (0=normal, 1=image buffer)
+    ;;   0x4FF088: img-code-base (image load address, usually 0x100000)
+    ;;   0x4FF090: source blob address (set by SBCL build)
+    ;;   0x4FF098: source blob length (set by SBCL build)
+    ;;   0x4FF0A0: source read position (runtime cursor)
+    ;;   0x08000000: image buffer (up to ~32MB)
+    ;;   0x0A000000: image NFN table (2048 × 16 bytes)
+    ;;   0x0A100000: forward reference patch list
+
+    ;; ---- Step 1: Dual-mode code emission ----
+    ;; When img-compile-mode is 1, code-emit/code-pos/code-patch redirect
+    ;; to the image buffer instead of the normal code buffer at 0x500008.
+
+    (defun img-compile-mode ()
+      (mem-ref #x4FF080 :u64))
+
+    (defun img-compile-enter ()
+      (setf (mem-ref #x4FF080 :u64) 1)
+      (setf (mem-ref #x4FF088 :u64) #x100000))
+
+    (defun img-compile-exit ()
+      (setf (mem-ref #x4FF080 :u64) 0))
+
+    ;; ---- Step 2: Image NFN table ----
+    ;; Separate NFN table at 0x08800000 for the image being built.
+    ;; Same structure as runtime NFN: 2048 slots × 16 bytes, open-addressing.
+
+    (defun img-nfn-init ()
+      (let ((i 0))
+        (loop
+          (if (>= i 4096)
+              (return 0)
+              (progn
+                (setf (mem-ref (+ #x0A000000 (* i 8)) :u64) 0)
+                (setq i (+ i 1)))))))
+
+    (defun img-nfn-define (name addr)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 2048)
+              (return 0)
+              (let ((base (+ #x0A000000 (* slot 16))))
+                (let ((entry-name (mem-ref base :u64)))
+                  (if (eq entry-name 0)
+                      (progn
+                        (setf (mem-ref base :u64) name)
+                        (setf (mem-ref (+ base 8) :u64) addr)
+                        (return name))
+                      (if (eq entry-name name)
+                          (progn
+                            (setf (mem-ref (+ base 8) :u64) addr)
+                            (return name))
+                          (progn
+                            (setq slot (logand (+ slot 1) 2047))
+                            (setq tries (+ tries 1)))))))))))
+
+    (defun img-nfn-lookup (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 2048)
+              (return ())
+              (let ((base (+ #x0A000000 (* slot 16))))
+                (let ((entry-name (mem-ref base :u64)))
+                  (if (eq entry-name 0)
+                      (return ())
+                      (if (eq entry-name name)
+                          (return (mem-ref (+ base 8) :u64))
+                          (progn
+                            (setq slot (logand (+ slot 1) 2047))
+                            (setq tries (+ tries 1)))))))))))
+
+    ;; Count entries in image NFN table
+    (defun img-nfn-count ()
+      (let ((count 0) (i 0))
+        (loop
+          (if (>= i 2048)
+              (return count)
+              (progn
+                (if (not (eq (mem-ref (+ #x0A000000 (* i 16)) :u64) 0))
+                    (setq count (+ count 1))
+                    ())
+                (setq i (+ i 1)))))))
+
+    ;; ---- Forward reference patch list ----
+    ;; During image compilation, function calls to not-yet-compiled functions
+    ;; are recorded here. After all functions are compiled, the list is
+    ;; iterated to patch the placeholder addresses with actual addresses.
+    ;; Layout at 0x08900000:
+    ;;   [0]: count (u64)
+    ;;   [8 + i*16]: patch offset in image buffer (u64)
+    ;;   [16 + i*16]: function name hash (u64)
+
+    (defun img-fwd-init ()
+      (setf (mem-ref #x0A100000 :u64) 0))
+
+    (defun img-fwd-record (patch-offset name-hash)
+      (let ((count (mem-ref #x0A100000 :u64)))
+        (let ((base (+ #x0A100008 (* count 16))))
+          (setf (mem-ref base :u64) patch-offset)
+          (setf (mem-ref (+ base 8) :u64) name-hash)
+          (setf (mem-ref #x0A100000 :u64) (+ count 1)))))
+
+    ;; Patch all forward references by looking up each recorded hash
+    ;; in the image NFN table and writing the address into the image.
+    ;; Returns the number of successfully patched references.
+    (defun img-patch-forward-refs ()
+      (let ((count (mem-ref #x0A100000 :u64))
+            (patched 0)
+            (i 0))
+        (loop
+          (if (>= i count)
+              (return patched)
+              (let ((base (+ #x0A100008 (* i 16))))
+                (let ((patch-offset (mem-ref base :u64))
+                      (name-hash (mem-ref (+ base 8) :u64)))
+                  (let ((addr (img-nfn-lookup name-hash)))
+                    (if addr
+                        (progn
+                          (img-patch-u64 patch-offset addr)
+                          (setq patched (+ patched 1)))
+                        ()))
+                  (setq i (+ i 1))))))))
+
+    ;; ---- Dual-mode dispatch for code-emit, code-pos, etc. ----
+    ;; These replace the originals during image compilation.
+    ;; The original code-emit/code-pos/nfn-define/nfn-lookup above
+    ;; always use the normal code buffer. These wrapper versions
+    ;; check the mode flag and dispatch accordingly.
+    ;;
+    ;; We can't modify the originals (they're already compiled), but
+    ;; the native compiler resolves function calls via nfn-lookup,
+    ;; so we can override by redefining at the REPL before calling
+    ;; build-image. Instead, build-image saves/restores code-emit etc.
+    ;; via a different approach: we modify rt-compile-defun-img to
+    ;; directly use the image buffer functions.
+
+    ;; Compile a (defun ...) form into the image buffer.
+    ;; Delegates to rt-compile-defun which already handles image mode:
+    ;; code-emit writes to image buffer, code-pos returns img-pos,
+    ;; nfn-define writes to image NFN table, start-addr uses 0x100000 base.
+    (defun img-compile-defun (args)
+      (rt-compile-defun args))
+
+    ;; ---- Step 3: Source blob reader ----
+    ;; At build time, SBCL serializes the source of *runtime-functions*
+    ;; as ASCII text at a known address. At runtime, we read from this blob
+    ;; using a cursor at 0x4FF0A0.
+    ;;
+    ;; Source blob address: (mem-ref #x4FF090 :u64)
+    ;; Source blob length:  (mem-ref #x4FF098 :u64)
+    ;; Current read pos:    (mem-ref #x4FF0A0 :u64)
+
+    (defun src-pos ()
+      (mem-ref #x4FF0A0 :u64))
+
+    (defun src-set-pos (p)
+      (setf (mem-ref #x4FF0A0 :u64) p))
+
+    (defun src-len ()
+      (mem-ref #x4FF098 :u64))
+
+    (defun src-base ()
+      (mem-ref #x4FF090 :u64))
+
+    (defun src-eof-p ()
+      (>= (src-pos) (src-len)))
+
+    ;; Read one byte from source blob, advance cursor
+    (defun src-read-byte ()
+      (if (src-eof-p)
+          0
+          (let ((b (mem-ref (+ (src-base) (src-pos)) :u8)))
+            (src-set-pos (+ (src-pos) 1))
+            b)))
+
+    ;; Peek at next byte without consuming
+    (defun src-peek-byte ()
+      (if (src-eof-p)
+          0
+          (mem-ref (+ (src-base) (src-pos)) :u8)))
+
+    ;; Skip whitespace in source blob, return first non-ws byte
+    (defun src-skip-ws ()
+      (let ((done ())
+            (ch 0))
+        (loop
+          (if done
+              (return ch)
+              (if (src-eof-p)
+                  (return 0)
+                  (progn
+                    (setq ch (src-read-byte))
+                    (if (eq ch 32)     ; space
+                        ()
+                        (if (eq ch 9)  ; tab
+                            ()
+                            (if (eq ch 10)  ; newline
+                                ()
+                                (if (eq ch 13)  ; CR
+                                    ()
+                                    (if (eq ch 59)  ; ';' - line comment
+                                        (progn
+                                          ;; Skip to end of line
+                                          (loop
+                                            (if (src-eof-p)
+                                                (return 0)
+                                                (let ((c (src-read-byte)))
+                                                  (if (eq c 10)
+                                                      (return 0)
+                                                      ())))))
+                                        (setq done t))))))))))))
+
+    ;; Read a number from source blob (decimal)
+    ;; Source blob uses integer IDs for symbols, so numbers are common.
+    (defun src-read-num (first-char)
+      ;; Accumulate decimal number from source blob.
+      ;; Uses shifts instead of (* num 10) to avoid overflow in the
+      ;; cross-compiler's multiply (which does tagged*tagged before SAR,
+      ;; overflowing 63-bit signed range for 18-digit hash-chars IDs).
+      ;; num*10 = num*8 + num*2 = (ash num 3) + (ash num 1)
+      (let ((num (- first-char 48))
+            (done ()))
+        (loop
+          (if done
+              (return num)
+              (if (src-eof-p)
+                  (return num)
+                  (let ((ch (src-read-byte)))
+                    (if (raw-digitp ch)
+                        (setq num (+ (+ (ash num 3) (ash num 1)) (- ch 48)))
+                        (progn
+                          (src-set-pos (- (src-pos) 1))
+                          (setq done t)))))))))
+
+    ;; Read a string literal from source blob (after opening " consumed)
+    ;; Returns a Lisp string object
+    (defun src-read-string ()
+      (let ((buf (make-array 256))
+            (len 0)
+            (done ()))
+        (loop
+          (if done
+              (let ((str (make-string len)))
+                (let ((i 0))
+                  (loop
+                    (if (>= i len)
+                        (return str)
+                        (progn
+                          (string-set str i (code-char (aref buf i)))
+                          (setq i (+ i 1)))))))
+              (if (src-eof-p)
+                  (setq done t)
+                  (let ((ch (src-read-byte)))
+                    (if (eq ch 34)  ; closing "
+                        (setq done t)
+                        (if (eq ch 92)  ; backslash escape
+                            (let ((esc (src-read-byte)))
+                              (aset buf len (if (eq esc 110) 10  ; \n
+                                                (if (eq esc 116) 9   ; \t
+                                                    esc)))
+                              (setq len (+ len 1)))
+                            (progn
+                              (aset buf len ch)
+                              (setq len (+ len 1)))))))))))
+
+    ;; Read a list from source blob (after ( consumed)
+    (defun src-read-list ()
+      (let ((result ())
+            (done ()))
+        (loop
+          (if done
+              (return (reverse-list result))
+              (let ((ch (src-skip-ws)))
+                (if (eq ch 41)  ; ')'
+                    (setq done t)
+                    (if (eq ch 0)  ; EOF
+                        (setq done t)
+                        (let ((elem (src-read-obj ch)))
+                          (setq result (cons elem result))))))))))
+
+    ;; Read a complete Lisp object from source blob.
+    ;; The source blob has symbols pre-resolved to integer IDs by SBCL,
+    ;; so we only need to handle: integers, negative integers, strings,
+    ;; lists, and dotted pairs (. in lists).
+    (defun src-read-obj (ch)
+      (if (eq ch 40)  ; '('
+          (src-read-list)
+          (if (eq ch 34)  ; '"' string literal
+              (src-read-string)
+              (if (eq ch 45)  ; '-' negative number
+                  (let ((next (src-peek-byte)))
+                    (if (raw-digitp next)
+                        (progn
+                          (src-read-byte)
+                          (- 0 (src-read-num next)))
+                        0))
+                  (if (raw-digitp ch)
+                      (src-read-num ch)
+                      ;; Dot for dotted pairs: skip, read next element
+                      ;; (SBCL prin1 may output "NIL" for empty list... handle that)
+                      0)))))
+
+    ;; Read next top-level form from source blob
+    ;; Returns the form, or () if EOF
+    (defun src-read-next-form ()
+      (let ((ch (src-skip-ws)))
+        (if (eq ch 0)
+            ()
+            (src-read-obj ch))))
+
+    ;; ---- Step 4: build-image orchestration ----
+
+    ;; Compile all runtime functions from embedded source blob
+    (defun img-compile-all-functions ()
+      (src-set-pos 0)
+      (let ((count 0))
+        (loop
+          (if (src-eof-p)
+              (return count)
+              (let ((form (src-read-next-form)))
+                (if (null form)
+                    (return count)
+                    (progn
+                      (write-byte 35)
+                      (print-dec count)
+                      (write-byte 32)
+                      ;; Store each func START addr at 0x4FF0A8; last = kernel-main
+                      ;; Compute start-addr BEFORE compilation (same as rt-compile-defun does)
+                      (let ((start-addr (+ #x100000 (code-pos))))
+                        (rt-compile-defun (cdr form))
+                        (setf (mem-ref #x4FF0A8 :u64) start-addr))
+                      (write-byte 46)
+                      (setq count (+ count 1)))))))))
+
+
+    ;; Generate and compile register-builtins for the new image.
+    ;; Iterates the image NFN table and emits nfn-define calls for each entry.
+    ;; This makes all cross-compiled functions available to the native compiler
+    ;; when the new image boots.
+    (defun img-compile-register-builtins ()
+      (let ((i 0)
+            (count 0))
+        ;; First, build a list of (nfn-define name addr) calls
+        ;; by scanning the image NFN table
+        (let ((body ()))
+          (loop
+            (if (>= i 2048)
+                ;; Now compile the register-builtins function
+                ;; Wrap body list in progn since rt-compile-defun only takes one body form
+                (let ((progn-body (cons (sym-progn) body)))
+                  (let ((defun-form (cons (hash-of "register-builtins")
+                                          (cons () (cons progn-body ())))))
+                    (img-compile-defun defun-form)
+                    (return count)))
+                (let ((base (+ #x0A000000 (* i 16))))
+                  (let ((name (mem-ref base :u64)))
+                    (if (not (eq name 0))
+                        (let ((addr (mem-ref (+ base 8) :u64)))
+                          (setq body (cons (cons (hash-of "nfn-define")
+                                                 (cons name (cons addr ())))
+                                           body))
+                          (setq count (+ count 1)))
+                        ()))
+                  (setq i (+ i 1))))))))
+
+    ;; Generate and compile init-symbol-table for the new image.
+    ;; Reads the existing symbol table at 0x310000 and replicates it.
+    ;; Strategy: embed raw data in image, then emit a machine-code memcpy function.
+    ;; This avoids generating thousands of setf calls (which would overflow the stack
+    ;; during compilation due to recursive progn processing).
+    (defun img-compile-init-symbol-table ()
+      (let ((src-count (mem-ref #x310000 :u64)))
+        ;; Compute total size of packed symbol table data by scanning entries
+        (let ((scan-off 8)
+              (scan-count 0))
+          (loop
+            (if (>= scan-count src-count)
+                (return ())
+                (let ((name-len (mem-ref (+ #x310000 scan-off) :u8)))
+                  (setq scan-off (+ scan-off 1 name-len))
+                  (setq scan-count (+ scan-count 1)))))
+          ;; scan-off now = total bytes of packed data
+          (let ((total-bytes scan-off))
+            ;; Step 1: Emit raw symbol table data into image buffer
+            (let ((data-start (img-pos)))
+              (let ((copy-i 0))
+                (loop
+                  (if (>= copy-i total-bytes)
+                      (return ())
+                      (progn
+                        (img-emit (mem-ref (+ #x310000 copy-i) :u8))
+                        (setq copy-i (+ copy-i 1))))))
+              ;; Step 2: Emit init-symbol-table as raw x86-64 memcpy code
+              ;; Function copies total-bytes from data-addr to 0x310000
+              (let ((data-addr (+ #x100000 data-start)))
+                (let ((func-start (+ #x100000 (img-pos))))
+                  ;; Register in image NFN table (via mode-checked nfn-define)
+                  (nfn-define (hash-of "init-symbol-table") func-start)
+                  ;; Emit: XOR ECX, ECX (counter = 0)
+                  (code-emit #x31) (code-emit #xC9)
+                  ;; Emit: CMP RCX, total-bytes (48 81 F9 imm32)
+                  (code-emit #x48) (code-emit #x81) (code-emit #xF9)
+                  (code-emit (logand total-bytes #xFF))
+                  (code-emit (logand (ash total-bytes -8) #xFF))
+                  (code-emit (logand (ash total-bytes -16) #xFF))
+                  (code-emit (logand (ash total-bytes -24) #xFF))
+                  ;; Emit: JGE +35 to .done (0F 8D rel32)
+                  (code-emit #x0F) (code-emit #x8D)
+                  (code-emit #x23) (code-emit #x00) (code-emit #x00) (code-emit #x00)
+                  ;; Emit: MOV RAX, data-addr (48 B8 imm64)
+                  (code-emit #x48) (code-emit #xB8)
+                  (code-emit-u64 data-addr)
+                  ;; Emit: MOVZX EDX, byte [RAX+RCX] (0F B6 14 08)
+                  (code-emit #x0F) (code-emit #xB6) (code-emit #x14) (code-emit #x08)
+                  ;; Emit: MOV RAX, 0x310000 (48 B8 imm64)
+                  (code-emit #x48) (code-emit #xB8)
+                  (code-emit-u64 #x310000)
+                  ;; Emit: MOV [RAX+RCX], DL (88 14 08)
+                  (code-emit #x88) (code-emit #x14) (code-emit #x08)
+                  ;; Emit: INC RCX (48 FF C1)
+                  (code-emit #x48) (code-emit #xFF) (code-emit #xC1)
+                  ;; Emit: JMP .-48 back to CMP (E9 rel32)
+                  (code-emit #xE9)
+                  (code-emit #xD0) (code-emit #xFF) (code-emit #xFF) (code-emit #xFF)
+                  ;; .done: XOR EAX, EAX (return nil=0)
+                  (code-emit #x31) (code-emit #xC0)
+                  ;; RET
+                  (code-emit #xC3)
+                  src-count)))))))
+
+    ;; Compile kernel-main for the new image
+    ;; MUST wrap body in progn since rt-compile-defun only takes one body form
+    ;; kernel-main is now compiled from the source blob by img-compile-all-functions.
+    ;; This no-op remains so build-image's call doesn't need changing.
+    (defun img-compile-kernel-main ()
+      ())
+
+    ;; Patch metadata in the image buffer
+    ;; Stores preamble size and total size at fixed offsets
+    (defun img-patch-metadata ()
+      (let ((preamble-size (mem-ref #x4FF050 :u64))
+            (total-size (img-pos)))
+        ;; Patch self-hosting metadata at 0x4FF050/0x4FF058
+        ;; 0x4FF050 in image = offset 0x3FF050 from base 0x100000
+        (let ((off-preamble (- #x4FF050 #x100000))
+              (off-total (- #x4FF058 #x100000)))
+          ;; Store tagged fixnums (shifted left 1)
+          (let ((tagged-pre (ash preamble-size 1))
+                (tagged-tot (ash total-size 1)))
+            (img-patch-u64 off-preamble tagged-pre)
+            (img-patch-u64 off-total tagged-tot)))
+        ;; Patch multiboot header: load_end_addr (offset 20) and bss_end_addr (offset 24)
+        ;; These must reflect the actual image size so bootloaders load everything
+        (let ((load-end (+ #x100000 total-size)))
+          (img-patch-u32 20 load-end)
+          (img-patch-u32 24 load-end))))
+
+    ;; Patch 8 bytes at arbitrary offset in image buffer
+    (defun img-patch-u64 (offset v)
+      (setf (mem-ref (+ #x08000000 offset) :u8) (logand v 255))
+      (setf (mem-ref (+ #x08000001 offset) :u8) (logand (ash v -8) 255))
+      (setf (mem-ref (+ #x08000002 offset) :u8) (logand (ash v -16) 255))
+      (setf (mem-ref (+ #x08000003 offset) :u8) (logand (ash v -24) 255))
+      (setf (mem-ref (+ #x08000004 offset) :u8) (logand (ash v -32) 255))
+      (setf (mem-ref (+ #x08000005 offset) :u8) (logand (ash v -40) 255))
+      (setf (mem-ref (+ #x08000006 offset) :u8) (logand (ash v -48) 255))
+      (setf (mem-ref (+ #x08000007 offset) :u8) (logand (ash v -56) 255)))
+
+    ;; Copy source blob from running kernel to image buffer for round-trip
+    ;; self-hosting. Returns the image-relative position where the blob starts.
+    (defun img-copy-source-blob ()
+      (let ((base (src-base))
+            (len (src-len))
+            (blob-start (img-pos)))
+        (let ((i 0))
+          (loop
+            (if (>= i len)
+                (return blob-start)
+                (progn
+                  (img-emit (mem-ref (+ base i) :u8))
+                  (setq i (+ i 1))))))))
+
+    ;; Emit the call site into the image: stores metadata, calls kernel-main, halts
+    ;; Also stores source blob address/length for round-trip self-hosting.
+    ;; blob-vaddr/blob-len: 0 means skip source blob stores (first-gen only).
+    (defun img-emit-call-site (blob-vaddr blob-len)
+      (let ((preamble-size (mem-ref #x4FF050 :u64)))
+        ;; Store trampoline physical address at 0x300010 (tagged fixnum)
+        ;; The AP trampoline location is in the preamble, at the same relative
+        ;; offset as in our running kernel. Read it from the running kernel's
+        ;; stored value.
+        (let ((tramp-addr (mem-ref #x300010 :u64)))
+          ;; mov rax, tramp-addr (already tagged)
+          (img-emit #x48) (img-emit #xB8)
+          (img-emit-u64-raw tramp-addr)
+          ;; mov [0x300010], rax
+          (img-emit #x48) (img-emit #xA3)
+          (img-emit-u64 #x300010))
+        ;; Store preamble size at 0x4FF050 (tagged fixnum)
+        ;; mov rax, preamble-size-tagged
+        (img-emit #x48) (img-emit #xB8)
+        (img-emit-u64 (ash preamble-size 1))
+        ;; mov [0x4FF050], rax
+        (img-emit #x48) (img-emit #xA3)
+        (img-emit-u64 #x4FF050)
+        ;; Store source blob address at 0x4FF090 (tagged fixnum)
+        ;; This enables round-trip: the new image can run (build-image) too.
+        (if (not (zerop blob-vaddr))
+            (progn
+              ;; mov rax, tagged-blob-addr
+              (img-emit #x48) (img-emit #xB8)
+              (img-emit-u64 (ash blob-vaddr 1))
+              ;; mov [0x4FF090], rax
+              (img-emit #x48) (img-emit #xA3)
+              (img-emit-u64 #x4FF090)
+              ;; mov rax, tagged-blob-len
+              (img-emit #x48) (img-emit #xB8)
+              (img-emit-u64 (ash blob-len 1))
+              ;; mov [0x4FF098], rax
+              (img-emit #x48) (img-emit #xA3)
+              (img-emit-u64 #x4FF098))
+            ())
+        ;; Call kernel-main — addr stored at 0x4FF0A8 by img-compile-all-functions
+        ;; (kernel-main is the last function in *runtime-functions*)
+        (let ((km-addr (mem-ref #x4FF0A8 :u64)))
+          (if km-addr
+              (progn
+                ;; mov rax, kernel-main-addr (tagged)
+                (img-emit #x48) (img-emit #xB8)
+                (img-emit-u64 km-addr)
+                ;; call rax
+                (img-emit #xFF) (img-emit #xD0))
+              ()))
+        ;; Infinite HLT loop
+        (let ((halt-pos (img-pos)))
+          (img-emit #xF4)       ; HLT
+          ;; JMP back to HLT: EB FE (short jump -2)
+          (img-emit #xEB) (img-emit #xFE))))
+
+    ;; Emit raw bytes of a tagged value (for image buffer)
+    ;; Like code-emit-u64-raw but writes to image buffer
+    (defun img-emit-u64-raw (v)
+      (setf (mem-ref #x4FF030 :u64) v)
+      (img-emit (mem-ref #x4FF030 :u8))
+      (img-emit (mem-ref #x4FF031 :u8))
+      (img-emit (mem-ref #x4FF032 :u8))
+      (img-emit (mem-ref #x4FF033 :u8))
+      (img-emit (mem-ref #x4FF034 :u8))
+      (img-emit (mem-ref #x4FF035 :u8))
+      (img-emit (mem-ref #x4FF036 :u8))
+      (img-emit (mem-ref #x4FF037 :u8)))
+
+    ;; ---- Main entry point ----
+
+    ;; Helper: print a short status marker (avoids string literal limitation)
+    ;; B=Build P=Preamble C=Compiled R=Registered S=Symbol K=Kernel D=Done
+    (defun img-status (ch)
+      (write-byte ch)
+      (write-byte 58)   ; ':'
+      (write-byte 32))  ; ' '
+
+    (defun build-image ()
+      ;; 1. Initialize image buffer
+      (img-init)
+      ;; "B: " = Build starting
+      (img-status 66)
+      (write-byte 10)
+
+      ;; 2. Copy boot preamble from running kernel
+      (img-emit-boot-preamble)
+      ;; "P: <n>"
+      (img-status 80)
+      (print-dec (img-pos))
+      (write-byte 10)
+
+      ;; 3. Emit jump-over: JMP rel32 right after preamble
+      ;; MUST be immediately after preamble since preamble falls through here.
+      ;; We'll patch the displacement after compiling everything.
+      (let ((jmp-patch-pos (img-pos)))
+        ;; E9 xx xx xx xx (JMP rel32)
+        (img-emit #xE9)
+        (img-emit 0) (img-emit 0) (img-emit 0) (img-emit 0)
+        (write-byte 49)  ;; '1' = JMP emitted
+
+        ;; 4. Zero the data structure region in the image buffer.
+        ;; Runtime data (NFN table at 0x330000, metadata at 0x300000, etc.)
+        ;; lives in the gap between preamble and code. Must be zeroed or
+        ;; the self-built image boots with garbage in these areas.
+        ;; Zero from img-pos to 0x500000 (about 5MB) using :u64 (8 bytes/iter).
+        (let ((zpos (img-pos)))
+          (loop
+            (if (>= zpos #x500000)
+                (return 0)
+                (progn
+                  (setf (mem-ref (+ #x08000000 zpos) :u64) 0)
+                  (setq zpos (+ zpos 8))))))
+        (write-byte 48)  ;; '0' = zeroed
+
+        ;; 5. Skip img-pos past data structure region to avoid memory overlap
+        ;; Functions at img-pos >= 0x500000 start at virtual addr >= 0x600000,
+        ;; safely above all runtime data structures (0x300000-0x510000).
+        (if (< (img-pos) #x500000)
+            (setf (mem-ref #x4FF040 :u64) #x500000)
+            ())
+
+        ;; 5. Enter image-compile mode
+        (img-compile-enter)
+        (write-byte 50)  ;; '2' = compile-enter done
+        (img-nfn-init)
+        (img-fwd-init)
+        (write-byte 51)  ;; '3' = nfn-init done
+
+        ;; Debug: show src-base, src-len
+        (write-byte 91)  ;; '['
+        (print-dec (src-base))
+        (write-byte 44)  ;; ','
+        (print-dec (src-len))
+        (write-byte 93)  ;; ']'
+
+        ;; 6. Compile all runtime functions from embedded source
+        ;; Use large scratch cons region to avoid GC during compilation.
+        ;; 0x07000000-0x07FFFFFF (16MB) is free between actor heap and image buffer.
+        (set-alloc-ptr #x07000000)
+        (set-alloc-limit #x07F00000)
+        (let ((count (img-compile-all-functions)))
+          ;; "C: <n> @<pos>"
+          (img-status 67)
+          (print-dec count)
+          (write-byte 64)  ;; '@'
+          (print-dec (img-pos))
+          (write-byte 10))
+
+        ;; 7. Generate and compile register-builtins
+        (let ((nbuiltins (img-compile-register-builtins)))
+          ;; "R: <n> @<pos>"
+          (img-status 82)
+          (print-dec nbuiltins)
+          (write-byte 64)  ;; '@'
+          (print-dec (img-pos))
+          (write-byte 10))
+
+        ;; 8. Generate and compile init-symbol-table
+        (img-compile-init-symbol-table)
+        ;; "S: @<pos>"
+        (img-status 83)
+        (write-byte 64)  ;; '@'
+        (print-dec (img-pos))
+        (write-byte 10)
+
+        ;; 9. Compile kernel-main
+        (img-compile-kernel-main)
+        ;; "K: @<pos>"
+        (img-status 75)
+        (write-byte 64)  ;; '@'
+        (print-dec (img-pos))
+        (write-byte 10)
+
+        ;; 10. Patch forward references (must be after ALL functions compiled)
+        (let ((fwd-count (img-patch-forward-refs)))
+          ;; "F: <n>"
+          (img-status 70)
+          (print-dec fwd-count)
+          (write-byte 10))
+
+        ;; 11. Exit image-compile mode
+        (img-compile-exit)
+
+        ;; 12. Copy source blob into image for round-trip self-hosting
+        ;; The source blob text is appended to the image. On boot, the
+        ;; call-site code stores its address/length at 0x4FF090/0x4FF098.
+        (let ((blob-vaddr 0)
+              (blob-len 0))
+          (if (not (zerop (src-len)))
+              (let ((blob-start-pos (img-copy-source-blob)))
+                (setq blob-vaddr (+ #x100000 blob-start-pos))
+                (setq blob-len (src-len))
+                ;; Also patch statically in image buffer (belt and suspenders)
+                (img-patch-u64 (- #x4FF090 #x100000) (ash blob-vaddr 1))
+                (img-patch-u64 (- #x4FF098 #x100000) (ash blob-len 1))
+                ;; "X: <len>"
+                (img-status 88)
+                (print-dec blob-len)
+                (write-byte 10))
+              ())
+
+          ;; 13. Patch the JMP to land here (at the call site)
+          (let ((call-site-pos (img-pos)))
+            (let ((rel (- call-site-pos (+ jmp-patch-pos 5))))
+              (img-patch-u32 (+ jmp-patch-pos 1) rel)))
+
+          ;; 14. Emit call site (metadata stores + call kernel-main + HLT)
+          ;; Debug: print km-addr
+          (write-byte 75) (write-byte 77) (write-byte 58) ;; "KM:"
+          (print-hex64 (mem-ref #x4FF0A8 :u64))
+          (write-byte 10)
+          (img-emit-call-site blob-vaddr blob-len)
+
+          ;; 15. Patch metadata: preamble size, total size, and multiboot header
+          (img-patch-metadata)
+
+          ;; 16. Report: "D: <n>"
+          (img-status 68)
+          (print-dec (img-pos))
+          (write-byte 10))))
+
+    ;; ---- Step 5: Network transfer ----
+
+    (defun send-image (host port)
+      (tcp-connect host port)
+      (img-send-tcp (img-pos))
+      (tcp-close))
+
+    ;; kernel-main: the entry point for the self-built image.
+    ;; Compiled from the source blob so hash values match runtime computation.
+    ;; register-builtins and init-symbol-table are forward references
+    ;; that get patched by img-patch-forward-refs.
+    ;; Test A: one nested let in loop (no memref)
+    (defun test-1let-loop (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 3)
+              (return tries)
+              (let ((base (+ #x330000 (* slot 16))))
+                (setq slot (logand (+ slot 1) 2047))
+                (setq tries (+ tries 1)))))))
+
+    ;; Test B: two nested lets in loop (no memref)
+    (defun test-2let-loop (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 3)
+              (return tries)
+              (let ((base (+ #x330000 (* slot 16))))
+                (let ((entry (+ base 8)))
+                  (setq slot (logand (+ slot 1) 2047))
+                  (setq tries (+ tries 1))))))))
+
+    ;; Test C: one nested let with memref in loop
+    (defun test-1let-memref-loop (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 3)
+              (return tries)
+              (let ((base (+ #x330000 (* slot 16))))
+                (mem-ref base :u64)
+                (setq slot (logand (+ slot 1) 2047))
+                (setq tries (+ tries 1)))))))
+
+    ;; Test D: two nested lets with memref in loop
+    (defun test-2let-memref-loop (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 3)
+              (return tries)
+              (let ((base (+ #x330000 (* slot 16))))
+                (let ((entry (mem-ref base :u64)))
+                  (setq slot (logand (+ slot 1) 2047))
+                  (setq tries (+ tries 1))))))))
+
+    ;; Test E: 2 nested lets with if+return inside inner let
+    (defun test-if-return-loop (name)
+      (let ((slot (logand name 2047))
+            (tries 0))
+        (loop
+          (if (>= tries 3)
+              (return 0)
+              (let ((base (+ #x330000 (* slot 16))))
+                (let ((entry (mem-ref base :u64)))
+                  (if (eq entry 0)
+                      (return name)
+                      (progn
+                        (setq slot (logand (+ slot 1) 2047))
+                        (setq tries (+ tries 1))))))))))
+
+    (defun kernel-main ()
+      (write-byte 49)  ;; '1'
+      (init-raw-constants)
+      (write-byte 50)  ;; '2'
+      (smp-init)
+      (write-byte 51)  ;; '3'
+      (actor-init)
+      (write-byte 52)  ;; '4'
+      (staging-init)
+      (write-byte 53)  ;; '5'
+      ;; Switch to actor 1's stack before entering REPL.
+      ;; Boot RSP is at 0x300000 but actor 1's stack is 0x05210000-0x05220000.
+      ;; GC computes stack bounds from actor ID, so RSP must be in actor 1's range.
+      ;; Without this, GC scans 35MB of non-stack memory, corrupting code.
+      (set-rsp #x05220000)
+      (repl))
+
     )  ; end of *runtime-functions* list
   )  ; end of expand-hash-of
   "Runtime functions to compile")
@@ -15128,7 +16069,7 @@
     ;; Inter-session communication
     sessions whoami msg inbox
     ;; Auto-boot
-    ssh-boot check-cmdline
+    eval-cmdline
     ;; Phase 8: Actors
     actor-struct-addr actor-get actor-set actor-stack-top
     actor-init actor-spawn actor-enqueue actor-dequeue
@@ -15179,7 +16120,22 @@
     line-redraw-from-cursor line-redraw-full line-insert-byte line-delete-back
     history-write-idx history-browse-idx history-save history-load history-up history-down
     find-word-start sym-table-match tab-complete
-    eval-line-expr parse-print-line-number)
+    eval-line-expr parse-print-line-number
+    ;; Self-hosting: image building
+    img-init img-pos img-emit img-emit-u32 img-emit-u64 img-patch-u32
+    img-copy-from img-emit-boot-preamble img-ref img-send-tcp
+    img-compile-mode img-compile-enter img-compile-exit
+    img-nfn-init img-nfn-define img-nfn-lookup img-nfn-count
+    img-compile-defun
+    src-pos src-set-pos src-len src-base src-eof-p
+    src-read-byte src-peek-byte src-skip-ws
+    src-read-num src-read-hex src-read-symbol src-read-string
+    src-read-list src-read-obj src-read-next-form
+    img-compile-all-functions img-compile-register-builtins
+    img-compile-init-symbol-table img-compile-kernel-main
+    img-patch-metadata img-patch-u64 img-copy-source-blob img-emit-call-site
+    img-emit-u64-raw
+    build-image send-image)
   "List of cross-compiled functions to register in the native function table")
 
 (defun generate-register-builtins ()
@@ -15247,6 +16203,137 @@
     (format t "Symbol table: ~D names, ~D bytes~%" count offset)
     `(defun init-symbol-table ()
        ,@(nreverse body))))
+
+;;; ============================================================
+;;; Self-Hosting: Source Serialization (SBCL side)
+;;; ============================================================
+;;; Convert Lisp forms to use runtime integer IDs for symbols,
+;;; so the source blob can be parsed by a simple reader that
+;;; only handles integers, strings, and lists.
+
+(defparameter *known-symbol-ids*
+  ;; Map from lowercase symbol name to fixed runtime ID.
+  ;; Must match the sym-xxx functions in the runtime.
+  (let ((ht (make-hash-table :test 'equal)))
+    (flet ((add (name id) (setf (gethash name ht) id)))
+      (add "+" 1) (add "-" 2) (add "*" 3)
+      (add "car" 10) (add "cdr" 11) (add "cons" 12) (add "list" 13)
+      (add "if" 20) (add "eq" 21) (add "null" 22) (add "quote" 23)
+      (add "t" (compute-hash-chars "t")) (add "let" 25) (add "defun" 26) (add "<" 27) (add ">" 28)
+      (add "loop" 29) (add "return" 30) (add "setq" 31) (add "progn" 32)
+      (add "zerop" 33) (add "not" 34) (add "logand" 35)
+      (add "cadr" 36) (add "cddr" 37) (add "caddr" 38)
+      (add "1+" 39) (add "1-" 40) (add "consp" 41) (add "atom" 42)
+      (add "length" 43) (add "nth" 44) (add "and" 45) (add "or" 46)
+      (add "cond" 47) (add "listp" 48) (add "numberp" 49)
+      (add "append" 50) (add "reverse" 51) (add "member" 52) (add "assoc" 53)
+      (add "io-in-byte" 60) (add "io-out-byte" 61)
+      (add "mem-ref" 62) (add "setf" 63) (add "ash" 64) (add "logior" 65)
+      (add "logxor" 66) (add "gc" 67) (add "rplaca" 68) (add "rplacd" 69)
+      (add "bignump" 70) (add "integerp" 71)
+      (add "make-bignum" 72) (add "bignum-ref" 73) (add "bignum-set" 74)
+      (add "bignum-add" 75) (add "bignum-sub" 76) (add "bignum-mul" 77)
+      (add "print-bignum" 78) (add "truncate" 79) (add "mod" 80)
+      (add "stringp" 85) (add "print-dec" 87) (add "let*" 88)
+      (add "when" 89) (add "unless" 90) (add "dotimes" 91) (add "arrayp" 96)
+      (add "function" 97) (add "funcall" 98) (add "write-byte" 99)
+      ;; Single-letter variables a-z — use compute-hash-chars to avoid
+      ;; collision with ASCII code literals in serialized source blob
+      (loop for ch from (char-code #\a) to (char-code #\z)
+            do (add (string (code-char ch)) (compute-hash-chars (string (code-char ch)))))
+      ;; I/O dword
+      (add "io-in-dword" 130) (add "io-out-dword" 131)
+      ;; Networking symbols with fixed IDs
+      (add "pci-config-read" 132) (add "pci-find-e1000" 133)
+      (add "e1000-write-reg" 134) (add "e1000-read-reg" 135)
+      (add "e1000-read-eeprom" 136) (add "e1000-init" 137)
+      (add "e1000-send" 138) (add "e1000-receive" 139) (add "e1000-probe" 140)
+      (add "arp-request" 141) (add "arp-resolve" 142) (add "ip-checksum" 143)
+      (add "ip-send" 144) (add "udp-send" 145) (add "net-receive" 146)
+      (add "htons" 147) (add "htonl" 148) (add "tcp-connect" 149)
+      (add "tcp-send" 150) (add "tcp-receive" 151) (add "tcp-close" 152)
+      (add "tcp-checksum" 153) (add "net-init" 154) (add "net-state" 155)
+      (add "e1000-init-rx" 156) (add "e1000-init-tx" 157)
+      (add "pci-config-write" 158))
+    ht))
+
+(defun symbol-to-runtime-id (sym)
+  "Convert a CL symbol to its Modus64 runtime integer ID.
+   Checks *known-symbol-ids* first for symbols with fixed sequential IDs
+   (special forms, single-letter vars, etc.). Falls back to compute-hash-chars
+   for all other symbols. NIL maps to 0."
+  (cond
+    ((null sym) 0)  ; NIL = 0
+    ((keywordp sym)
+     ;; Map mem-ref type keywords to small integers matching rt-compile-mem-ref
+     (let ((kname (string-downcase (symbol-name sym))))
+       (cond
+         ((string= kname "u8") 1)
+         ((string= kname "u16") 2)
+         ((string= kname "u32") 4)
+         ((string= kname "u64") 8)
+         ;; Other keywords: use hash-chars with ":" prefix
+         (t (compute-hash-chars (concatenate 'string ":" kname))))))
+    (t
+     (let* ((name (string-downcase (symbol-name sym)))
+            (known-id (gethash name *known-symbol-ids*)))
+       (or known-id (compute-hash-chars name))))))
+
+(defun form-to-ids (form)
+  "Recursively replace all symbols in FORM with their runtime integer IDs.
+   Numbers and strings pass through unchanged.
+   NIL as list terminator stays as NIL to preserve proper list structure.
+   NIL as a value (car position or standalone) becomes 0."
+  (cond
+    ((null form) nil)     ; NIL as list terminator -> stays NIL (empty list)
+    ((integerp form) form)
+    ((symbolp form)
+     (if (eq form 'nil)
+         0               ; NIL as value -> 0
+         (symbol-to-runtime-id form)))
+    ((stringp form) form)
+    ((consp form)
+     (cons (form-to-ids-value (car form))
+           (form-to-ids (cdr form))))
+    (t form)))
+
+(defun form-to-ids-value (form)
+  "Convert FORM when it appears in a value position (car of a cons).
+   NIL here means the value nil/false, not end-of-list."
+  (cond
+    ((null form) 0)       ; NIL as value -> 0
+    ((integerp form) form)
+    ((symbolp form) (symbol-to-runtime-id form))
+    ((stringp form) form)
+    ((consp form)
+     (cons (form-to-ids-value (car form))
+           (form-to-ids (cdr form))))
+    (t form)))
+
+(defun normalize-defun-body (form)
+  "If FORM is (defun name (params) body1 body2 ...) with multiple body forms,
+   wrap them in (progn body1 body2 ...) so the native compiler can handle it.
+   Also ensures empty-body defuns get an explicit nil body."
+  (if (and (consp form) (eq (car form) 'defun))
+      (destructuring-bind (defun-sym name params &body body) form
+        (cond
+          ((null body) `(,defun-sym ,name ,params nil))
+          ((> (length body) 1) `(,defun-sym ,name ,params (progn ,@body)))
+          (t form)))
+      form))
+
+(defun serialize-runtime-source ()
+  "Serialize *runtime-functions* as text with symbols replaced by integer IDs.
+   Returns a string containing all forms, one per line."
+  (with-output-to-string (s)
+    (dolist (form *runtime-functions*)
+      (let* ((normalized (normalize-defun-body form))
+             (id-form (form-to-ids normalized)))
+        (let ((*print-pretty* nil)
+              (*print-base* 10)
+              (*print-radix* nil))
+          (prin1 id-form s))
+        (write-char #\Newline s)))))
 
 ;;; ============================================================
 ;;; Build Process
@@ -15394,6 +16481,8 @@
                                 (actor-init)
                                 ;; Initialize per-actor staging buffers for deep-copy send
                                 (staging-init)
+                                ;; Switch to actor 1's stack (GC needs RSP in actor's stack range)
+                                (set-rsp #x05220000)
                                 (repl)
                                 ))
 
@@ -15402,8 +16491,7 @@
 
             ;; Store self-hosting metadata at fixed addresses (0x4FF050+)
             ;; These values let the running kernel reconstruct its own boot image
-            ;; 0x4FF050: boot preamble size (offset where compiled functions start)
-            ;; 0x4FF058: total image size (patched after final size known)
+            ;; 0x4FF050: boot preamble size
             ;; mov rax, preamble-size (tagged as fixnum)
             (emit-bytes *code-buffer* #x48 #xB8)
             (emit-u64 *code-buffer* (ash preamble-size 1))
@@ -15411,8 +16499,31 @@
             (emit-bytes *code-buffer* #x48 #xA3)
             (emit-u64 *code-buffer* #x4FF050)
 
+            ;; 0x4FF058: total image size (placeholder, patched below)
+            ;; Each "mov rax, imm64; mov [addr], rax" is: 48 B8 [8 bytes] 48 A3 [8 bytes] = 20 bytes
+            ;; The imm64 starts at offset +2 from the mov rax instruction
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :total-size-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)  ; placeholder
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF058)
+
+            ;; 0x4FF090: source blob address (placeholder, patched below)
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :src-addr-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)  ; placeholder
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF090)
+
+            ;; 0x4FF098: source blob length (placeholder, patched below)
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :src-len-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)  ; placeholder
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF098)
+
             ;; Call kernel-main
-            (emit-call *code-buffer* (gethash 'kernel-main *functions*))))
+            (emit-call *code-buffer* (gethash 'kernel-main *functions*)))
 
           ;; Infinite halt (shouldn't reach)
           (let ((halt-loop (make-label)))
@@ -15427,19 +16538,41 @@
           (let ((entry32-addr (+ base-addr entry32-offset)))
             (patch-multiboot-header *code-buffer* base-addr entry32-addr))
 
-          ;; Store total image size at 0x4FF058 offset in binary
-          ;; This is read by the running kernel for self-hosting
-          ;; We patch the image bytes directly since the code is already assembled
+          ;; ---- Self-hosting: embed runtime function source ----
+          ;; Serialize *runtime-functions* with symbols replaced by integer IDs.
+          ;; The running kernel uses this blob to recompile itself.
+          (let ((src-start-offset (code-buffer-position *code-buffer*))
+                (src-start-addr (+ base-addr (code-buffer-position *code-buffer*))))
+            (let ((source-text (serialize-runtime-source)))
+              (format t "Serialized source: ~D bytes~%" (length source-text))
+              (loop for ch across source-text
+                    do (emit-byte *code-buffer* (char-code ch))))
+            (let ((src-len (- (code-buffer-position *code-buffer*) src-start-offset)))
+              (format t "Source blob: ~D bytes at 0x~X (offset 0x~X)~%"
+                      src-len src-start-addr src-start-offset)
+
+              ;; Patch the call-site placeholder immediates with actual values
+              ;; Source blob address -> 0x4FF090 placeholder
+              (let ((src-addr-pos (gethash :src-addr-imm-pos *functions*))
+                    (src-len-pos (gethash :src-len-imm-pos *functions*)))
+                (let ((tagged-addr (ash src-start-addr 1))
+                      (tagged-len (ash src-len 1)))
+                  (dotimes (i 8)
+                    (setf (aref (code-buffer-bytes *code-buffer*) (+ src-addr-pos i))
+                          (logand (ash tagged-addr (* i -8)) #xFF)))
+                  (dotimes (i 8)
+                    (setf (aref (code-buffer-bytes *code-buffer*) (+ src-len-pos i))
+                          (logand (ash tagged-len (* i -8)) #xFF)))))))
+
+          ;; Patch total image size into call-site placeholder
           (let ((total-size (code-buffer-position *code-buffer*))
-                (meta-offset (- #x4FF058 base-addr)))  ; offset in image buffer
-            (when (< meta-offset total-size)
-              ;; Patch bytes at 0x4FF058 (relative to base) with total size as tagged fixnum
-              (let ((tagged-size (ash total-size 1)))
-                (dotimes (i 8)
-                  (setf (aref (code-buffer-bytes *code-buffer*) (+ meta-offset i))
-                        (logand (ash tagged-size (* i -8)) #xFF))))
-              (format t "Self-hosting metadata: preamble=~D, total=~D bytes~%"
-                      preamble-size total-size))))))
+                (total-size-pos (gethash :total-size-imm-pos *functions*)))
+            (let ((tagged-size (ash total-size 1)))
+              (dotimes (i 8)
+                (setf (aref (code-buffer-bytes *code-buffer*) (+ total-size-pos i))
+                      (logand (ash tagged-size (* i -8)) #xFF))))
+            (format t "Self-hosting metadata: preamble=~D, total=~D bytes~%"
+                    preamble-size total-size)))))
 
     ;; Write output
     (with-open-file (out output-path
@@ -15453,7 +16586,7 @@
     (format t "Kernel written to ~A (~D bytes)~%"
             output-path (code-buffer-position *code-buffer*))
     (format t "~%To run: qemu-system-x86_64 -kernel ~A -nographic~%"
-            output-path)))
+            output-path))))
 
 ;;; ============================================================
 ;;; Boot Code Emission

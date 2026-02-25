@@ -5,7 +5,7 @@ A bare-metal Lisp operating system. Boots directly on x86 hardware (or QEMU) int
 Modus has two runtime targets:
 
 - **Modus32** — a 32-bit system built on [Movitz](https://github.com/dym/movitz), with a working SSH server, TLS 1.3, TCP/IP stack, E1000 network driver, and a full crypto suite (X25519, Ed25519, ChaCha20, AES-GCM, secp256k1)
-- **Modus64** — a native 64-bit system cross-compiled from SBCL, with an Erlang-style actor model, SMP multicore support, per-actor garbage collection, and preemptive multitasking
+- **Modus64** — a self-hosting 64-bit system with an Erlang-style actor model, SMP multicore support, per-actor garbage collection, and preemptive multitasking
 
 ## What works
 
@@ -21,7 +21,8 @@ Modus has two runtime targets:
 
 ### Modus64
 
-- Cross-compiler (SBCL → x86-64 native code)
+- Self-hosting: the kernel compiles itself from embedded source via `(build-image)`
+- Cross-compiler bootstraps from SBCL; subsequent generations are self-compiled
 - Multiboot boot, 64-bit long mode, identity-mapped paging
 - Tagged object system (4-bit tags, 63-bit fixnums)
 - Cons cells, symbols, strings, arrays, bignums
@@ -57,6 +58,15 @@ Requires SBCL and QEMU.
 ./modus/scripts/run-modus64-ssh.sh   # boot with SSH networking
 ```
 
+### Self-hosted Modus64
+
+```bash
+./modus/scripts/run-modus64-self-hosted-ssh.sh        # Gen0→Gen1 pipeline, boot Gen1 with SSH
+./modus/scripts/run-modus64-self-hosted-ssh.sh --repl  # Gen1 REPL only
+```
+
+SBCL cross-compiles Gen0. Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source, and Gen1 is extracted via QMP. Gen1 can repeat the process. Build artifacts are cached by content hash.
+
 ## Project structure
 
 ```
@@ -84,6 +94,8 @@ docs/                    Design documents (Modus64, actors, calling conventions)
 ## Design
 
 Modus64 uses a 4-bit tag scheme with 63-bit fixnums — large enough for native 64-bit multiply, which makes 256-bit elliptic curve cryptography practical without bignums (4 limbs instead of 32). The actor model gives each actor its own heap, so garbage collection never stops the world. Preemption uses Erlang-style reduction counting with LAPIC timer backup, and SMP distributes actors across cores.
+
+The kernel is self-hosting: SBCL is only needed to bootstrap Gen0. The runtime carries its own source (~550KB, serialized with symbol names replaced by integer hashes) and includes a native compiler that can rebuild the entire kernel from it. Each generation copies the source blob into the next, so SBCL is not involved after the initial bootstrap.
 
 See `docs/` for detailed design documents.
 
