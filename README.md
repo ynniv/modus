@@ -1,11 +1,11 @@
 # Modus
 
-A bare-metal Lisp operating system. Boots directly on x86 hardware (or QEMU) into an interactive Common Lisp REPL with networking, SSH, and cryptography — no underlying OS.
+A bare-metal Lisp operating system. Boots directly on x86 hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
 
 Modus has two runtime targets:
 
-- **Modus32** — a 32-bit system built on [Movitz](https://github.com/dym/movitz), with a working SSH server, TLS 1.3, TCP/IP stack, E1000 network driver, and a full crypto suite (X25519, Ed25519, ChaCha20, AES-GCM, secp256k1)
-- **Modus64** — a self-hosting 64-bit system with an Erlang-style actor model, SMP multicore support, per-actor garbage collection, and preemptive multitasking
+- **Modus32** — a 32-bit system built on [Movitz](https://github.com/dym/movitz), with SSH, TLS 1.3, TCP/IP, E1000, and a full crypto suite
+- **Modus64** — a self-hosting 64-bit system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection
 
 ## What works
 
@@ -21,23 +21,33 @@ Modus has two runtime targets:
 
 ### Modus64
 
+**Compiler and self-hosting**
+- MVM (Modus Virtual Machine): portable bytecode ISA with ~50 opcodes
+- 9 architecture backends: x86-64, i386, AArch64, RISC-V 64, PPC64, PPC32, ARM32 (ARMv5), ARMv7, Motorola 68k
 - Self-hosting: the kernel compiles itself from embedded source via `(build-image)`
-- Cross-compiler bootstraps from SBCL; subsequent generations are self-compiled
-- Multiboot boot, 64-bit long mode, identity-mapped paging
+- SBCL bootstraps Gen0; Gen0 compiles Gen1 natively; Gen1 can repeat the process
+- Runtime native compiler (defun, let, lambda, if, closures, loops)
+- Closures, hash tables, structs, global variables
+
+**Runtime**
 - Tagged object system (4-bit tags, 63-bit fixnums)
 - Cons cells, symbols, strings, arrays, bignums
 - Lisp reader, printer, tree-walking evaluator
-- Runtime native compiler (defun, let, lambda, if, closures, loops)
-- Cheney copying GC with write barrier
-- Serial REPL with line editing
-- E1000 networking with TCP/IP, DHCP, DNS, ICMP
-- SSH server (multi-connection, inter-session messaging)
-- Erlang-style actor model: `spawn`, `send`, `receive`, `link`
+- Cheney copying GC with per-actor heaps
+- Serial REPL with line editing and tab completion
+- Real-time clock: `(print-time)`, `(unix-time)`
+
+**Networking and crypto**
+- E1000 driver with TCP/IP, UDP, DHCP, DNS, ICMP
+- SSH server (multi-connection, Ed25519, X25519, ChaCha20-Poly1305)
+- Crypto: SHA-256, X25519, Ed25519, ChaCha20, Poly1305
+
+**Concurrency**
+- Erlang-style actors: `spawn`, `send`, `receive`, `link`
 - Supervisors with automatic worker restart
-- Reduction-counting preemption and LAPIC timer preemption
-- SMP: multi-core boot, per-CPU scheduling, IPI wakeup (tested stable on 8 CPUs)
+- Reduction-counting preemption with LAPIC timer backup
+- SMP: multi-core boot, per-CPU scheduling, IPI wakeup (tested on 8 CPUs)
 - Per-actor heaps with independent garbage collection
-- Collision-free function dispatch via dual FNV-1a hashing
 
 ## Building and running
 
@@ -46,8 +56,8 @@ Requires SBCL and QEMU.
 ### Modus32
 
 ```bash
-./modus/scripts/build.sh        # build image
-./modus/scripts/run.sh           # boot to serial REPL
+./modus/scripts/build.sh           # build image
+./modus/scripts/run.sh             # boot to serial REPL
 ./modus/scripts/run-ssh-server.sh  # boot with SSH on port 2222
 ```
 
@@ -61,41 +71,60 @@ Requires SBCL and QEMU.
 ### Self-hosted Modus64
 
 ```bash
-./modus/scripts/run-modus64-self-hosted-ssh.sh        # Gen0→Gen1 pipeline, boot Gen1 with SSH
+./modus/scripts/run-modus64-self-hosted-ssh.sh        # Gen0 → Gen1, boot Gen1 with SSH
 ./modus/scripts/run-modus64-self-hosted-ssh.sh --repl  # Gen1 REPL only
 ```
 
-SBCL cross-compiles Gen0. Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source, and Gen1 is extracted via QMP. Gen1 can repeat the process. Build artifacts are cached by content hash.
+SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely. Build artifacts are cached by content hash.
 
 ## Project structure
 
 ```
-lib/
-  binary-types/          Binary data type library (Fjeld)
-  movitz/                Movitz bare-metal Lisp framework (Fjeld)
-  modus64/               64-bit cross-compiler, boot, and runtime
-    boot/                Multiboot entry, 32→64 transition, kernel init
-    cross/               Cross-compiler and x86-64 assembler
-    runtime/             Tags, cons, alloc, print
-  build-image.lisp       Movitz image builder
+lib/modus64/
+  cross/                 Cross-compiler, x64 assembler, runtime (build.lisp ~17K lines)
+  mvm/                   Modus Virtual Machine
+    mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
+    compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)
+    translate-x64.lisp   x86-64 native translator
+    translate-riscv.lisp RISC-V translator
+    translate-aarch64.lisp AArch64 translator
+    translate-ppc.lisp   PowerPC 64 translator
+    translate-i386.lisp  i386 translator
+    translate-68k.lisp   Motorola 68k translator
+    translate-arm32.lisp ARM32/ARMv7 translator
+    interp.lisp          MVM interpreter (bootstrapping)
+    target.lisp          Architecture descriptors (9 targets)
+  boot/                  Per-architecture boot sequences (9 targets)
+  runtime/               Tags, subtags
+lib/movitz/              Movitz bare-metal Lisp framework (Fjeld)
+lib/binary-types/        Binary data type library (Fjeld)
 modus/
-  build/                 ASDF system definition and build scripts
-  src/
-    crypto/              Crypto suite (shared by both targets)
-    drivers/             E1000 network driver
-    net/                 SSH, TLS 1.3, WebSocket, Nostr
-    movitz/              Movitz patches and Modus32 boot code
-    repl.lisp            REPL implementation
+  src/crypto/            Crypto suite (shared by both targets)
+  src/drivers/           E1000 network driver
+  src/net/               SSH, TLS 1.3, WebSocket, Nostr
   scripts/               Build, run, and test scripts
-  docs/                  Design documents (Modus32)
-docs/                    Design documents (Modus64, actors, calling conventions)
+docs/                    Design documents
 ```
 
 ## Design
 
-Modus64 uses a 4-bit tag scheme with 63-bit fixnums — large enough for native 64-bit multiply, which makes 256-bit elliptic curve cryptography practical without bignums (4 limbs instead of 32). The actor model gives each actor its own heap, so garbage collection never stops the world. Preemption uses Erlang-style reduction counting with LAPIC timer backup, and SMP distributes actors across cores.
+### MVM: the Modus Virtual Machine
 
-The kernel is self-hosting: SBCL is only needed to bootstrap Gen0. The runtime carries its own source (~550KB, serialized with symbol names replaced by integer hashes) and includes a native compiler that can rebuild the entire kernel from it. Each generation copies the source blob into the next, so SBCL is not involved after the initial bootstrap.
+MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
+
+All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). The other 8 targets boot and run serial output programs.
+
+### Tagged objects
+
+4-bit tag scheme with 63-bit fixnums. Large enough for native 64-bit multiply, which makes 256-bit elliptic curve cryptography practical without bignums (4 limbs instead of 32).
+
+### Self-hosting
+
+The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap.
+
+### Actors and SMP
+
+Erlang-style actor model with per-actor heaps, so garbage collection never stops the world. Preemption uses reduction counting with LAPIC timer backup. SMP distributes actors across cores with per-CPU run queues and IPI wakeup.
 
 See `docs/` for detailed design documents.
 

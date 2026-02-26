@@ -78,6 +78,78 @@
   "Name of function currently being compiled")
 
 ;;; ============================================================
+;;; Phase 0b: Macro System
+;;; ============================================================
+
+(defvar *macros* (make-hash-table :test 'equal)
+  "Map from macro name (string) to expander function.
+   During cross-compilation, macros are normal CL functions.")
+
+(defun register-macro (name expander)
+  "Register a compile-time macro expander"
+  (setf (gethash (string name) *macros*) expander))
+
+(defun macroexpand-1-modus (form)
+  "Expand one level of macro application. Returns (VALUES expanded-form expanded-p)"
+  (if (and (consp form) (symbolp (car form)))
+      (let ((expander (gethash (string (car form)) *macros*)))
+        (if expander
+            (values (apply expander (cdr form)) t)
+            (values form nil)))
+      (values form nil)))
+
+(defun macroexpand-modus (form)
+  "Fully expand macros in FORM"
+  (loop (multiple-value-bind (expanded expanded-p)
+            (macroexpand-1-modus form)
+          (unless expanded-p (return form))
+          (setf form expanded))))
+
+;;; Bootstrap macros - when, unless, cond, and, or
+;;; These replace the special-form versions with macro-expanded equivalents
+
+(register-macro 'WHEN
+  (lambda (test &rest body)
+    `(if ,test (progn ,@body) nil)))
+
+(register-macro 'UNLESS
+  (lambda (test &rest body)
+    `(if ,test nil (progn ,@body))))
+
+(register-macro 'COND
+  (lambda (&rest clauses)
+    (if (null clauses)
+        nil
+        (let ((clause (car clauses)))
+          (if (eq (car clause) t)
+              `(progn ,@(cdr clause))
+              `(if ,(car clause)
+                   (progn ,@(cdr clause))
+                   (cond ,@(cdr clauses))))))))
+
+(register-macro 'AND
+  (lambda (&rest forms)
+    (cond ((null forms) t)
+          ((null (cdr forms)) (car forms))
+          (t `(if ,(car forms) (and ,@(cdr forms)) nil)))))
+
+(register-macro 'OR
+  (lambda (&rest forms)
+    (cond ((null forms) nil)
+          ((null (cdr forms)) (car forms))
+          (t (let ((tmp (gensym "OR")))
+               `(let ((,tmp ,(car forms)))
+                  (if ,tmp ,tmp (or ,@(cdr forms)))))))))
+
+;;; ============================================================
+;;; Phase 0e: Global Variables (defvar)
+;;; ============================================================
+
+(defvar *global-vars* (make-hash-table :test 'equal)
+  "Map from global variable name (string) to initial value form.
+   Used during cross-compilation; runtime uses a global table.")
+
+;;; ============================================================
 ;;; Compilation Environment
 ;;; ============================================================
 ;;;
@@ -172,6 +244,8 @@
 
 (defun compile-form (form env)
   "Compile FORM in environment ENV. Result goes to RAX."
+  ;; Phase 0b: Macro expansion before compilation
+  (setf form (macroexpand-modus form))
   (cond
     ;; Self-evaluating
     ((null form)
@@ -300,6 +374,19 @@
          ((string-equal op-name "SWITCH-IDLE-STACK") (compile-switch-idle-stack))
          ((string-equal op-name "SET-RSP")   (compile-set-rsp (cadr form) env))
          ((string-equal op-name "LIDT")      (compile-lidt (cadr form) env))
+         ;; Phase 0b: defmacro at expression level (for local macros)
+         ((string-equal op-name "DEFMACRO")
+          (let ((macro-name (cadr form))
+                (macro-params (caddr form))
+                (macro-body (cdddr form)))
+            (register-macro macro-name (eval `(lambda ,macro-params ,@macro-body)))
+            (emit-load-nil *code-buffer* 'rax)))
+         ;; Phase 0f: error - print message and halt
+         ((string-equal op-name "ERROR")
+          (compile-error (cdr form) env))
+         ;; Phase 0f: unwind-protect
+         ((string-equal op-name "UNWIND-PROTECT")
+          (compile-unwind-protect (cadr form) (cddr form) env))
          ;; Function call
          (t (compile-call op (cdr form) env)))))
 
@@ -439,38 +526,123 @@
 ;;; Lambda (creates closure)
 ;;; ============================================================
 
+(defun find-free-variables (form params env)
+  "Find variables in FORM that are free (not in PARAMS or bound in ENV above current scope)"
+  (let ((free nil))
+    (labels ((walk (f bound)
+               (cond
+                 ((null f) nil)
+                 ((symbolp f)
+                  (when (and (not (member f bound))
+                             (not (member f '(t nil)))
+                             (not (keywordp f))
+                             (env-lookup env f)
+                             (not (member f free)))
+                    (push f free)))
+                 ((atom f) nil)
+                 ((eq (car f) 'quote) nil)
+                 ((eq (car f) 'lambda)
+                  (walk (cddr f) (append (cadr f) bound)))
+                 ((member (car f) '(let let*))
+                  (let ((new-bound bound))
+                    (dolist (b (cadr f))
+                      (walk (cadr b) new-bound)
+                      (push (car b) new-bound))
+                    (walk (cddr f) new-bound)))
+                 (t (walk (car f) bound)
+                    (walk (cdr f) bound)))))
+      (walk `(progn ,@body) params))
+    (nreverse free)))
+
 (defun compile-lambda (params body env)
-  "Compile (lambda (args) body*) - creates a closure"
-  (declare (ignore env))  ; TODO: Use env for captured variables
-  ;; For now, just compile as a nested function
-  ;; Full closures need heap allocation
-  (let ((fn-label (make-label)))
+  "Compile (lambda (args) body*) - creates a flat closure.
+   Phase 0a: Real closures that capture free variables.
+   A closure object is: [header | code-ptr | captured-val-0 | captured-val-1 | ...]
+   Subtag +subtag-closure+ = #x52."
+  (let* ((free-vars (find-free-variables `(progn ,@body) params env))
+         (fn-label (make-label))
+         (after-label (make-label)))
     ;; Jump over the function body
-    (let ((after-label (make-label)))
-      (emit-jmp *code-buffer* after-label)
-      ;; Function entry point
-      (emit-label *code-buffer* fn-label)
-      ;; Set up stack frame
-      (emit-push *code-buffer* 'rbp)
-      (emit-mov-reg-reg *code-buffer* 'rbp 'rsp)
-      ;; Build environment with parameters in registers
-      (let ((fn-env (make-empty-env)))
-        (loop for param in params
-              for reg in +arg-regs+
-              for i from 0
-              while (< i +nargregs+)
-              do (setf fn-env (env-extend fn-env param :reg :reg reg)))
-        ;; Compile body
-        (compile-progn body fn-env))
-      ;; Clean up and return
-      (emit-mov-reg-reg *code-buffer* 'rsp 'rbp)
-      (emit-pop *code-buffer* 'rbp)
-      (emit-ret *code-buffer*)
-      ;; After the lambda
-      (emit-label *code-buffer* after-label))
-    ;; Load function address (as closure object - for now just raw address)
-    ;; TODO: Proper closure allocation
-    (emit-lea *code-buffer* 'rax fn-label)))
+    (emit-jmp *code-buffer* after-label)
+    ;; Function entry point
+    (emit-label *code-buffer* fn-label)
+    ;; Set up stack frame
+    (emit-push *code-buffer* 'rbp)
+    (emit-mov-reg-reg *code-buffer* 'rbp 'rsp)
+    ;; Build environment: params in registers, free vars loaded from closure
+    ;; R13 holds the closure object pointer at call time
+    (let* ((nreg-params (min (length params) +nargregs+))
+           (fn-env (make-compile-env :stack-depth nreg-params :bindings nil :parent nil)))
+      ;; Allocate stack space for register parameters
+      (when (> nreg-params 0)
+        (emit-sub-reg-imm *code-buffer* 'rsp (* nreg-params 8)))
+      ;; Save register params to stack
+      (loop for param in params
+            for reg in +arg-regs+
+            for i from 0
+            while (< i +nargregs+)
+            do (let ((offset (* 8 (1+ i))))
+                 (emit-mov-mem-reg *code-buffer* 'rbp reg (- offset))
+                 (push (make-binding :name param :location :stack :stack-offset offset)
+                       (compile-env-bindings fn-env))))
+      ;; Load captured variables from closure object (R13 = closure pointer)
+      ;; Closure layout: [header:8 | code-ptr:8 | captured-0:8 | captured-1:8 | ...]
+      ;; Untagged object ptr = R13 - 9 (remove object tag)
+      ;; captured-i at offset (+ 16 (* i 8)) from untagged pointer
+      (loop for var in free-vars
+            for i from 0
+            do (let ((depth (compile-env-stack-depth fn-env)))
+                 ;; Load from closure: mov rax, [r13 + 16 + i*8 - 9]
+                 (emit-mov-reg-mem *code-buffer* 'rax 'r13 (+ 7 (* i 8)))
+                 ;; Push to stack
+                 (emit-push *code-buffer* 'rax)
+                 (let ((new-depth (1+ depth)))
+                   (push (make-binding :name var :location :stack
+                                       :stack-offset (* new-depth 8))
+                         (compile-env-bindings fn-env))
+                   (setf (compile-env-stack-depth fn-env) new-depth))))
+      ;; Compile body
+      (compile-progn body fn-env))
+    ;; Clean up and return
+    (emit-mov-reg-reg *code-buffer* 'rsp 'rbp)
+    (emit-pop *code-buffer* 'rbp)
+    (emit-ret *code-buffer*)
+    ;; After the lambda
+    (emit-label *code-buffer* after-label)
+    ;; Now create the closure object
+    (if (null free-vars)
+        ;; No captures: just load code pointer as tagged fixnum
+        (emit-lea *code-buffer* 'rax fn-label)
+        ;; Has captures: allocate closure object on heap
+        (let ((n-captured (length free-vars))
+              (obj-size (+ 16 (* (length free-vars) 8))))  ; header + code-ptr + captures
+          ;; Allocate from R12
+          (emit-mov-reg-reg *code-buffer* 'rax +alloc-reg+)
+          ;; Write header: subtag=0x52, element-count=n-captured+1
+          (let ((header (logior #x52 (ash (1+ n-captured) 16))))
+            (emit-mov-reg-imm *code-buffer* 'rdx header)
+            (emit-mov-mem-reg *code-buffer* 'rax 'rdx 0))
+          ;; Write code pointer
+          (emit-push *code-buffer* 'rax)  ; save obj base
+          (emit-lea *code-buffer* 'rdx fn-label)
+          (emit-pop *code-buffer* 'rax)
+          (emit-mov-mem-reg *code-buffer* 'rax 'rdx 8)
+          ;; Write captured values
+          (loop for var in free-vars
+                for i from 0
+                do (emit-push *code-buffer* 'rax)  ; save obj base
+                   (let ((binding (env-lookup env var)))
+                     (when binding
+                       (ecase (binding-location binding)
+                         (:reg (emit-mov-reg-reg *code-buffer* 'rdx (binding-reg binding)))
+                         (:stack (emit-mov-reg-mem *code-buffer* 'rdx 'rbp
+                                                   (- (binding-stack-offset binding)))))))
+                   (emit-pop *code-buffer* 'rax)
+                   (emit-mov-mem-reg *code-buffer* 'rax 'rdx (+ 16 (* i 8))))
+          ;; Advance alloc pointer
+          (emit-add-reg-imm *code-buffer* +alloc-reg+ obj-size)
+          ;; Tag as object
+          (emit-add-reg-imm *code-buffer* 'rax #x9)))))
 
 ;;; ============================================================
 ;;; Arithmetic Operations
@@ -1574,19 +1746,110 @@
 
 (defun compile-toplevel (form)
   "Compile a top-level form"
+  ;; Phase 0b: Macro expansion at top level
+  (setf form (macroexpand-modus form))
   (cond
     ((and (consp form) (eq (car form) 'defun))
      (destructuring-bind (name params &body body) (cdr form)
        (compile-function name params body)))
+    ;; Phase 0b: defmacro - register macro expander
+    ((and (consp form) (symbolp (car form))
+          (string-equal (symbol-name (car form)) "DEFMACRO"))
+     (destructuring-bind (name params &body body) (cdr form)
+       (let ((expander (eval `(lambda ,params ,@body))))
+         (register-macro name expander))
+       nil))
+    ;; Phase 0e: defvar - register global variable
     ((and (consp form) (eq (car form) 'defvar))
-     ;; TODO: Handle defvar
+     (let ((name (cadr form))
+           (init-form (caddr form)))
+       (setf (gethash (string name) *global-vars*) init-form)
+       ;; Compile initializer as a thunk that stores into global table
+       (when init-form
+         (compile-function (intern (format nil "INIT-~A" name)) nil
+                           (list `(set-global-var ',name ,init-form)))))
      nil)
+    ;; Phase 0d: defstruct - expand to constructor and accessor defuns
+    ((and (consp form) (symbolp (car form))
+          (string-equal (symbol-name (car form)) "DEFSTRUCT"))
+     (let* ((name (cadr form))
+            (slots (cddr form))
+            (name-str (string name)))
+       ;; Generate constructor: (defun make-NAME (&key slot1 slot2 ...) ...)
+       ;; Generate accessors: (defun NAME-slot (obj) ...)
+       ;; Generate predicate: (defun NAME-p (obj) ...)
+       ;; These are compiled as normal functions
+       (dolist (generated-form (expand-defstruct name slots))
+         (compile-toplevel generated-form))
+       nil))
     ((and (consp form) (eq (car form) 'defconstant))
-     ;; TODO: Handle defconstant
+     ;; Constants are handled at SBCL level during cross-compilation
      nil)
+    ;; Phase 0f: error form
+    ((and (consp form) (symbolp (car form))
+          (string-equal (symbol-name (car form)) "ERROR"))
+     ;; Compile error as a call to the error handler
+     (compile-function (gensym "ERROR") nil (list form)))
     (t
      ;; Other top-level forms get wrapped in a thunk
      (compile-function (gensym "TOPLEVEL") nil (list form)))))
+
+;;; ============================================================
+;;; Phase 0d: Defstruct Expansion
+;;; ============================================================
+
+(defun expand-defstruct (name slots)
+  "Expand a defstruct into constructor, accessor, and predicate defun forms.
+   Structs are tagged objects with subtag #x40.
+   Layout: [header:8 | struct-type-hash:8 | slot-0:8 | slot-1:8 | ...]"
+  (let* ((name-str (string name))
+         (make-name (intern (format nil "MAKE-~A" name-str)))
+         (pred-name (intern (format nil "~A-P" name-str)))
+         (slot-names (mapcar (lambda (s) (if (consp s) (car s) s)) slots))
+         (slot-defaults (mapcar (lambda (s) (if (consp s) (cadr s) nil)) slots))
+         (n-slots (length slot-names))
+         (type-hash (sxhash name))
+         (result nil))
+    ;; Predicate: (defun NAME-p (obj) ...)
+    (push `(defun ,pred-name (obj)
+             (if (eq (logand obj #xF) #x9)  ; object tag
+                 (if (eq (mem-ref (- obj 9) :u8) #x40)  ; struct subtag
+                     (if (eq (mem-ref (+ (- obj 9) 8) :u64) ,type-hash)
+                         t nil)
+                     nil)
+                 nil))
+          result)
+    ;; Constructor: (defun make-NAME (slot1 slot2 ...) ...)
+    (push `(defun ,make-name ,slot-names
+             (let ((obj (get-alloc-ptr)))
+               ;; Write header: subtag=0x40, element-count=n-slots+1
+               (setf (mem-ref obj :u64) ,(logior #x40 (ash (1+ n-slots) 16)))
+               ;; Write type hash
+               (setf (mem-ref (+ obj 8) :u64) ,type-hash)
+               ;; Write slots
+               ,@(loop for s in slot-names
+                       for i from 0
+                       collect `(setf (mem-ref (+ obj ,(+ 16 (* i 8))) :u64) ,s))
+               ;; Advance alloc pointer
+               (set-alloc-ptr (+ (get-alloc-ptr) ,(+ 16 (* n-slots 8))))
+               ;; Return tagged object
+               (+ obj 9)))
+          result)
+    ;; Accessors: (defun NAME-slot (obj) ...)
+    (loop for s in slot-names
+          for i from 0
+          do (let ((acc-name (intern (format nil "~A-~A" name-str (string s)))))
+               (push `(defun ,acc-name (obj)
+                        (mem-ref (+ (- obj 9) ,(+ 16 (* i 8))) :u64))
+                     result)))
+    ;; Setters: (defun set-NAME-slot (obj val) ...)
+    (loop for s in slot-names
+          for i from 0
+          do (let ((set-name (intern (format nil "SET-~A-~A" name-str (string s)))))
+               (push `(defun ,set-name (obj val)
+                        (setf (mem-ref (+ (- obj 9) ,(+ 16 (* i 8))) :u64) val))
+                     result)))
+    (nreverse result)))
 
 ;;; ============================================================
 ;;; When / Unless / Dotimes (Phase 5.9)
@@ -1806,6 +2069,42 @@
   ;; MOV GS:[RDX], RAX  — 65 48 89 02
   (emit-bytes *code-buffer* #x65 #x48 #x89 #x02))
   ;; Return value stays in RAX
+
+;;; ============================================================
+;;; Phase 0f: Error Handling
+;;; ============================================================
+
+(defun compile-error (args env)
+  "Compile (error message-or-format &rest format-args).
+   In the kernel, this prints the message and halts."
+  ;; Compile the message argument
+  (if args
+      (compile-form (car args) env)
+      (emit-load-nil *code-buffer* 'rax))
+  ;; For now, just emit a HLT instruction after moving the message to RSI
+  ;; A real implementation would call a kernel panic function
+  (emit-mov-reg-reg *code-buffer* 'rsi 'rax)
+  ;; Try to call a 'kernel-panic' function if it exists
+  (let ((panic-addr (gethash 'kernel-panic *functions*)))
+    (if panic-addr
+        (progn
+          (emit-mov-reg-imm *code-buffer* 'rcx (ash 1 +fixnum-shift+))
+          (emit-call *code-buffer* panic-addr))
+        ;; Fallback: just HLT
+        (emit-byte *code-buffer* #xF4))))  ; HLT
+
+(defun compile-unwind-protect (protected-form cleanup-forms env)
+  "Compile (unwind-protect protected cleanup*).
+   Executes protected form, then always executes cleanup forms,
+   then returns the value of the protected form."
+  ;; Compile protected form
+  (compile-form protected-form env)
+  ;; Save result
+  (emit-push *code-buffer* 'rax)
+  ;; Compile cleanup forms
+  (compile-progn cleanup-forms env)
+  ;; Restore result
+  (emit-pop *code-buffer* 'rax))
 
 ;;; ============================================================
 ;;; Testing

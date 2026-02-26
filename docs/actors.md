@@ -358,14 +358,17 @@ R12/R14 were global. Phase 8.4 made them per-actor with independent heaps.
 - `(alloc-test N)`: allocate N live cells, GC runs but can't reclaim → OOM
 - `(ring-test)`: 10000 messages through 5-actor ring via shared pool
 
-### Phase 8.6: SMP (Future)
+### Phase 8.6: SMP -- DONE
 
-**What to build:**
-- AP startup: send INIT IPI + SIPI to bring up other cores
-- Per-core GDT/IDT/TSS, per-core stack, per-core scheduler state
-- Per-core run queue + work stealing (check other cores' queues when idle)
-- Lock-free mailbox (Michael-Scott queue with CMPXCHG16B)
-- Shared kernel state: spinlocks for network, I/O, actor table
+**Implemented:**
+- AP startup: INIT IPI + SIPI to bring up application processors
+- Per-core GDT, IDT, TSS, stack, scheduler state (via GS segment for per-CPU data)
+- Per-core run queue with per-CPU actor scheduling
+- IPI wakeup: idle cores are woken when actors become runnable
+- LAPIC timer preemption as backup to reduction counting
+- Tested stable on up to 8 CPUs in QEMU
+- AP trampoline copied to 0x8000 (real-mode entry point for secondary cores)
+- `smp-copy-trampoline`: copies trampoline from kernel image with null-source guard
 
 ---
 
@@ -382,18 +385,17 @@ Copying is simple, correct, and fast for small messages. For large data,
 we'll add an explicit shared-immutable region later. The common case
 (small messages between actors) should be optimized for simplicity.
 
-### Why Reduction Counting (Not Timer Preemption)?
+### Why Reduction Counting + Timer Preemption?
 
-Timer preemption requires:
-- Setting up APIC/PIT timer interrupts
-- Interrupt handler that saves full actor state
-- Careful interaction with GC (can't preempt mid-GC)
-
-Reduction counting is:
-- Simple: decrement a counter, check at function entry
+Both are implemented. Reduction counting is the primary mechanism:
+- Simple: decrement a counter, check at loop back-edges
 - Deterministic: same program behaves the same way
 - Safe: only yields at known-good points (between Lisp forms)
-- Sufficient for Phase 1 (add timer preemption later for robustness)
+
+LAPIC timer preemption is the backup for actors that loop without
+function calls or Lisp-level loops (e.g., tight assembly-level
+loops in crypto code). The timer sets a flag; the next safe point
+checks it and yields.
 
 ### Why Not Green Threads + Shared Memory?
 
@@ -404,10 +406,3 @@ you can't share memory, you can't have data races.
 
 For ASI workloads specifically: agents that communicate by message are
 naturally distributable across machines. Shared-memory agents are not.
-
-### Why Start With Single-Core?
-
-Get the abstractions right first. Actors, messages, mailboxes, supervisors --
-all of these work identically on one core or many. Adding SMP later is a
-matter of making the scheduler and mailboxes concurrent, not redesigning
-the programming model.

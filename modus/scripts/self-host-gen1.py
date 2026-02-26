@@ -13,9 +13,11 @@ except Exception:
 gen0 = sys.argv[1] if len(sys.argv) > 1 else "/tmp/modus64-gen0.elf"
 gen1 = sys.argv[2] if len(sys.argv) > 2 else "/tmp/modus64-gen1.elf"
 qmp_port = int(sys.argv[3]) if len(sys.argv) > 3 else 4444
+script_dir = os.path.dirname(os.path.abspath(__file__))
+no_thp = os.path.join(script_dir, 'no-thp-exec')
 
 proc = subprocess.Popen(
-    ['qemu-system-x86_64', '-kernel', gen0, '-nographic', '-m', '512',
+    [no_thp, 'qemu-system-x86_64', '-kernel', gen0, '-nographic', '-m', '512',
      '-qmp', f'tcp:localhost:{qmp_port},server,nowait'],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
 

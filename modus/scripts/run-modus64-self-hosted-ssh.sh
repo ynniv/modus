@@ -53,6 +53,9 @@ source_hash() {
         lib/modus64/cross/x64-asm.lisp \
         lib/modus64/cross/cross-compile.lisp \
         lib/modus64/cross/build.lisp \
+        lib/modus64/mvm/mvm.lisp \
+        lib/modus64/mvm/compiler.lisp \
+        lib/modus64/mvm/translate-x64.lisp \
     | sha256sum | cut -d' ' -f1
 }
 
@@ -63,15 +66,11 @@ if [ "$FORCE" -eq 0 ] && [ -f "$GEN0" ] && [ -f "$GEN0_HASH" ] && [ "$(cat "$GEN
     echo "Step 1/3: Gen0 cached ($(stat -c%s "$GEN0") bytes)"
 else
     echo "Step 1/3: Cross-compiling Gen0..."
-    cd lib/modus64
     sbcl --control-stack-size 64 \
-         --load cross/packages.lisp \
-         --load cross/x64-asm.lisp \
-         --load cross/cross-compile.lisp \
-         --load cross/build.lisp \
-         --eval "(modus64.build:build-kernel \"$GEN0\")" \
+         --eval '(push (truename "lib/modus64/") asdf:*central-registry*)' \
+         --eval '(asdf:load-system :modus64)' \
+         --eval "(modus64.build:build-kernel-mvm \"$GEN0\")" \
          --eval '(quit)' > /dev/null 2>&1
-    cd ../..
     echo "$SRCHASH" > "$GEN0_HASH"
     # Invalidate Gen1 cache since Gen0 changed
     rm -f "$GEN1_HASH"

@@ -1,5 +1,7 @@
 # Calling Convention Design: CCL vs Genera
 
+**Note**: The 4-register calling convention (RSI, RDI, R8, R9) described here is implemented as designed, now abstracted through MVM virtual registers (V0-V3).
+
 ## CCL x86-64 Calling Convention
 
 ### Register Allocation

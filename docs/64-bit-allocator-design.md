@@ -1,5 +1,7 @@
 # 64-bit Lisp Allocator Design
 
+**Note**: The bump allocator and Cheney copying GC described here are implemented. Per-actor heaps with independent GC were added later (see `actors.md`).
+
 ## Overview
 
 The allocator is the foundation of the runtime. Every `cons`, `make-array`,

@@ -10,6 +10,7 @@
 (defpackage :modus64.build
   (:use :cl :modus64.asm :modus64.cross)
   (:export #:build-kernel
+           #:build-kernel-mvm
            #:test-build))
 
 (in-package :modus64.build)
@@ -2566,12 +2567,12 @@
       (init-nfntable)
       ;; Clear reader state
       (set-lookahead 0)
-      ;; Register cross-compiled builtin functions for REPL access
-      (register-builtins)
-      ;; Note: wait-for-input now calls (yield) directly; forward refs
-      ;; are handled by cross-compiler and image-mode forward ref patching.
+      ;; Register cross-compiled builtin functions for REPL access.
+      ;; Uses call-native via fixed address because register-builtins is
+      ;; compiled by the old cross-compiler (not MVM), so MVM cannot
+      ;; resolve it as a direct call.
+      (call-native (mem-ref #x4FF0B0 :u64))
       ;; Initialize GC helper early so make-byte-array can trigger GC from any actor
-      ;; (previously only called from ssh-server, causing OOM crashes in REPL)
       (init-gc-helper)
       ;; Initialize symbol name table for tab completion
       (init-symbol-table)
@@ -4475,10 +4476,10 @@
 
     ;; Patch a jmp rel32 at position to jump to target
     (defun patch-jmp32-at (pos target)
-      ;; The jump offset is calculated from after the 4-byte offset
-      (let ((offset (- target (+ pos 4))))
-        ;; Write 32-bit offset at pos (in code buffer)
-        (code-patch-u32 pos offset)))
+      ;; Delegate to patch-jump which is known to work correctly.
+      ;; Both have identical semantics: patch 4 bytes at pos with
+      ;; the relative offset from pos+4 to target.
+      (patch-jump pos target))
 
     ;; Patch a u32 value at position in code buffer
     (defun code-patch-u32 (pos val)
@@ -5991,11 +5992,11 @@
             (body-forms (cdr args)))
         ;; Compile each binding and push
         (let ((new-env (rt-compile-bindings bindings env depth)))
-          (let ((new-depth (+ depth (list-len bindings))))
-            ;; Compile body forms with implicit progn
-            (rt-compile-progn-list body-forms new-env new-depth)
-            ;; Clean up stack - pop all bindings
-            (let ((n-bindings (list-len bindings)))
+          (let ((n-bindings (list-len bindings)))
+            (let ((new-depth (+ depth n-bindings)))
+              ;; Compile body forms with implicit progn
+              (rt-compile-progn-list body-forms new-env new-depth)
+              ;; Clean up stack - pop all bindings
               (if (> n-bindings 0)
                   (emit-add-rsp (* n-bindings 8))))))))
 
@@ -13001,19 +13002,122 @@
               (return 0)
               (progn (io-in-byte #x80) (setq i (+ i 1)))))))
 
+    ;; ---- Real-Time Clock (CMOS RTC) ----
+    ;; Standard PC CMOS RTC at I/O ports 0x70 (index) and 0x71 (data).
+    ;; Registers: 0=sec, 2=min, 4=hr, 7=day, 8=month, 9=year, 0x32=century.
+    ;; Values are BCD; convert via truncate/16 for high digit, logand/15 for low.
+    ;; Each function inlines the port I/O with constant register numbers to
+    ;; avoid MVM compiler limitations with variable io-out-byte arguments.
+
+    (defun rtc-seconds ()
+      (io-out-byte #x70 0)
+      (let ((b (io-in-byte #x71)))
+        (+ (* (truncate b 16) 10) (logand b 15))))
+
+    (defun rtc-minutes ()
+      (io-out-byte #x70 2)
+      (let ((b (io-in-byte #x71)))
+        (+ (* (truncate b 16) 10) (logand b 15))))
+
+    (defun rtc-hours ()
+      (io-out-byte #x70 4)
+      (let ((b (io-in-byte #x71)))
+        (+ (* (truncate b 16) 10) (logand b 15))))
+
+    (defun rtc-day ()
+      (io-out-byte #x70 7)
+      (let ((b (io-in-byte #x71)))
+        (+ (* (truncate b 16) 10) (logand b 15))))
+
+    (defun rtc-month ()
+      (io-out-byte #x70 8)
+      (let ((b (io-in-byte #x71)))
+        (+ (* (truncate b 16) 10) (logand b 15))))
+
+    (defun rtc-year ()
+      (io-out-byte #x70 #x32)
+      (let ((century (io-in-byte #x71)))
+        (io-out-byte #x70 9)
+        (let ((yr (io-in-byte #x71)))
+          (+ (* (+ (* (truncate century 16) 10) (logand century 15)) 100)
+             (+ (* (truncate yr 16) 10) (logand yr 15))))))
+
+    ;; Print 2-digit number with leading zero
+    (defun print-2digit (n)
+      (write-byte (+ (truncate n 10) 48))
+      (write-byte (+ (mod n 10) 48)))
+
+    ;; Print "YYYY-MM-DD HH:MM:SS"
+    (defun print-time ()
+      (print-dec (rtc-year))
+      (write-byte 45)
+      (print-2digit (rtc-month))
+      (write-byte 45)
+      (print-2digit (rtc-day))
+      (write-byte 32)
+      (print-2digit (rtc-hours))
+      (write-byte 58)
+      (print-2digit (rtc-minutes))
+      (write-byte 58)
+      (print-2digit (rtc-seconds)))
+
+    ;; Leap year check (works for 1970-2099; 2000 is leap)
+    (defun is-leap-year (y)
+      (zerop (logand y 3)))
+
+    ;; Days in month (1-12)
+    (defun days-in-month (m y)
+      (if (eq m 2) (if (is-leap-year y) 29 28)
+      (if (eq m 4) 30
+      (if (eq m 6) 30
+      (if (eq m 9) 30
+      (if (eq m 11) 30
+      31))))))
+
+    ;; Unix timestamp: seconds since 1970-01-01 00:00:00 UTC
+    (defun unix-time ()
+      (let ((sec (rtc-seconds))
+            (min (rtc-minutes))
+            (hr  (rtc-hours))
+            (day (rtc-day))
+            (mon (rtc-month))
+            (yr  (rtc-year)))
+        ;; Accumulate days from epoch
+        (let ((days 0)
+              (y 1970))
+          (loop
+            (if (>= y yr) (return 0)
+                (progn
+                  (setq days (+ days (if (is-leap-year y) 366 365)))
+                  (setq y (+ y 1)))))
+          ;; Add days for completed months this year
+          (let ((m 1))
+            (loop
+              (if (>= m mon) (return 0)
+                  (progn
+                    (setq days (+ days (days-in-month m yr)))
+                    (setq m (+ m 1))))))
+          ;; Total seconds
+          (let ((total (* (+ days (- day 1)) 86400)))
+            (setq total (+ total (* hr 3600)))
+            (setq total (+ total (* min 60)))
+            (+ total sec)))))
+
     ;; Copy AP trampoline from kernel image to 0x8000
     ;; The trampoline is embedded at a fixed offset in the kernel image.
     ;; Kernel is loaded at 0x100000, trampoline offset stored at 0x300010.
     (defun smp-copy-trampoline ()
       (let ((src (mem-ref #x300010 :u64))
             (i 0))
-        (loop
-          (if (>= i 256)
-              (return 0)
-              (progn
-                (setf (mem-ref (+ #x8000 i) :u8)
-                      (mem-ref (+ src i) :u8))
-                (setq i (+ i 1)))))))
+        (if (zerop src)
+            0  ;; No trampoline source — skip copy
+            (loop
+              (if (>= i 256)
+                  (return 0)
+                  (progn
+                    (setf (mem-ref (+ #x8000 i) :u8)
+                          (mem-ref (+ src i) :u8))
+                    (setq i (+ i 1))))))))
 
     ;; Fill trampoline parameters at 0x8000
     ;; Values are stored RAW (not tagged) because the trampoline reads them
@@ -15693,6 +15797,20 @@
               (img-emit #x48) (img-emit #xA3)
               (img-emit-u64 #x4FF098))
             ())
+        ;; Store register-builtins address at 0x4FF0B0 (tagged fixnum).
+        ;; repl() calls (call-native (mem-ref #x4FF0B0 :u64)) to register
+        ;; cross-compiled functions in the runtime NFN table.
+        ;; Address was saved at 0x4FF0B0 by step 8b during image compilation.
+        (let ((rb-addr (mem-ref #x4FF0B0 :u64)))
+          (if rb-addr
+              (progn
+                ;; mov rax, rb-addr (tagged fixnum, preserved raw)
+                (img-emit #x48) (img-emit #xB8)
+                (img-emit-u64-raw rb-addr)
+                ;; mov [0x4FF0B0], rax
+                (img-emit #x48) (img-emit #xA3)
+                (img-emit-u64 #x4FF0B0))
+              ()))
         ;; Call kernel-main — addr stored at 0x4FF0A8 by img-compile-all-functions
         ;; (kernel-main is the last function in *runtime-functions*)
         (let ((km-addr (mem-ref #x4FF0A8 :u64)))
@@ -15753,7 +15871,6 @@
         ;; E9 xx xx xx xx (JMP rel32)
         (img-emit #xE9)
         (img-emit 0) (img-emit 0) (img-emit 0) (img-emit 0)
-        (write-byte 49)  ;; '1' = JMP emitted
 
         ;; 4. Zero the data structure region in the image buffer.
         ;; Runtime data (NFN table at 0x330000, metadata at 0x300000, etc.)
@@ -15767,7 +15884,6 @@
                 (progn
                   (setf (mem-ref (+ #x08000000 zpos) :u64) 0)
                   (setq zpos (+ zpos 8))))))
-        (write-byte 48)  ;; '0' = zeroed
 
         ;; 5. Skip img-pos past data structure region to avoid memory overlap
         ;; Functions at img-pos >= 0x500000 start at virtual addr >= 0x600000,
@@ -15776,25 +15892,16 @@
             (setf (mem-ref #x4FF040 :u64) #x500000)
             ())
 
-        ;; 5. Enter image-compile mode
+        ;; 6. Enter image-compile mode
         (img-compile-enter)
-        (write-byte 50)  ;; '2' = compile-enter done
         (img-nfn-init)
         (img-fwd-init)
-        (write-byte 51)  ;; '3' = nfn-init done
 
-        ;; Debug: show src-base, src-len
-        (write-byte 91)  ;; '['
-        (print-dec (src-base))
-        (write-byte 44)  ;; ','
-        (print-dec (src-len))
-        (write-byte 93)  ;; ']'
-
-        ;; 6. Compile all runtime functions from embedded source
+        ;; 7. Compile all runtime functions from embedded source
         ;; Use large scratch cons region to avoid GC during compilation.
-        ;; 0x07000000-0x07FFFFFF (16MB) is free between actor heap and image buffer.
-        (set-alloc-ptr #x07000000)
-        (set-alloc-limit #x07F00000)
+        ;; Region at 0x10000000 (256MB), well above image buffer at 0x08000000.
+        (set-alloc-ptr #x10000000)
+        (set-alloc-limit #x1E000000)
         (let ((count (img-compile-all-functions)))
           ;; "C: <n> @<pos>"
           (img-status 67)
@@ -15803,7 +15910,7 @@
           (print-dec (img-pos))
           (write-byte 10))
 
-        ;; 7. Generate and compile register-builtins
+        ;; 8. Generate and compile register-builtins
         (let ((nbuiltins (img-compile-register-builtins)))
           ;; "R: <n> @<pos>"
           (img-status 82)
@@ -15812,7 +15919,15 @@
           (print-dec (img-pos))
           (write-byte 10))
 
-        ;; 8. Generate and compile init-symbol-table
+        ;; 8b. Save register-builtins address at 0x4FF0B0 for call-site emission.
+        ;; Must be done while still in image-compile mode so nfn-lookup uses
+        ;; the image table (0x0A000000).
+        (let ((rb-addr (nfn-lookup (hash-of "register-builtins"))))
+          (if rb-addr
+              (setf (mem-ref #x4FF0B0 :u64) rb-addr)
+              ()))
+
+        ;; 9. Generate and compile init-symbol-table
         (img-compile-init-symbol-table)
         ;; "S: @<pos>"
         (img-status 83)
@@ -15820,7 +15935,7 @@
         (print-dec (img-pos))
         (write-byte 10)
 
-        ;; 9. Compile kernel-main
+        ;; 10. Compile kernel-main
         (img-compile-kernel-main)
         ;; "K: @<pos>"
         (img-status 75)
@@ -15828,17 +15943,17 @@
         (print-dec (img-pos))
         (write-byte 10)
 
-        ;; 10. Patch forward references (must be after ALL functions compiled)
+        ;; 11. Patch forward references (must be after ALL functions compiled)
         (let ((fwd-count (img-patch-forward-refs)))
           ;; "F: <n>"
           (img-status 70)
           (print-dec fwd-count)
           (write-byte 10))
 
-        ;; 11. Exit image-compile mode
+        ;; 12. Exit image-compile mode
         (img-compile-exit)
 
-        ;; 12. Copy source blob into image for round-trip self-hosting
+        ;; 13. Copy source blob into image for round-trip self-hosting
         ;; The source blob text is appended to the image. On boot, the
         ;; call-site code stores its address/length at 0x4FF090/0x4FF098.
         (let ((blob-vaddr 0)
@@ -15856,22 +15971,18 @@
                 (write-byte 10))
               ())
 
-          ;; 13. Patch the JMP to land here (at the call site)
+          ;; 14. Patch the JMP to land here (at the call site)
           (let ((call-site-pos (img-pos)))
             (let ((rel (- call-site-pos (+ jmp-patch-pos 5))))
               (img-patch-u32 (+ jmp-patch-pos 1) rel)))
 
-          ;; 14. Emit call site (metadata stores + call kernel-main + HLT)
-          ;; Debug: print km-addr
-          (write-byte 75) (write-byte 77) (write-byte 58) ;; "KM:"
-          (print-hex64 (mem-ref #x4FF0A8 :u64))
-          (write-byte 10)
+          ;; 15. Emit call site (metadata stores + call kernel-main + HLT)
           (img-emit-call-site blob-vaddr blob-len)
 
-          ;; 15. Patch metadata: preamble size, total size, and multiboot header
+          ;; 16. Patch metadata: preamble size, total size, and multiboot header
           (img-patch-metadata)
 
-          ;; 16. Report: "D: <n>"
+          ;; 17. Report: "D: <n>"
           (img-status 68)
           (print-dec (img-pos))
           (write-byte 10))))
@@ -15948,6 +16059,196 @@
                       (progn
                         (setq slot (logand (+ slot 1) 2047))
                         (setq tries (+ tries 1))))))))))
+
+    ;;; ==========================================================
+    ;;; Phase 0c: Hash Table Operations
+    ;;; ==========================================================
+    ;;;
+    ;;; Hash tables stored as object with subtag #x41:
+    ;;; Layout: [header:8 | capacity:8 | count:8 | entries...]
+    ;;; Each entry is 2 words: [key:8 | value:8]
+    ;;; Uses open addressing with linear probing.
+    ;;; Keys are compared by eq. Hash on tagged pointer value.
+    ;;; Empty slots have key = 0 (different from NIL which is a valid key).
+    ;;; Deleted slots have key = 1 (sentinel, not a valid tagged pointer).
+
+    (defun ht-hash-key (key capacity)
+      ;; Hash a tagged key to a slot index
+      ;; Use the key value itself as hash (fixnums are already shifted)
+      ;; Multiply by a prime and mask to capacity
+      (logand (ash (* key 2654435761) -8) (- capacity 1)))
+
+    (defun make-hash-table ()
+      ;; Create a new hash table with initial capacity 64
+      (let ((capacity 64)
+            (obj-size (+ 24 (* 128 8))))  ; header + cap + count + 64 pairs * 2 words
+        ;; Allocate from general object space (GS:[0x28] = obj-alloc)
+        (let ((base (percpu-ref 40)))  ; GS:[0x28]
+          ;; Write header: subtag=#x41, element-count=(capacity * 2 + 2)
+          (setf (mem-ref base :u64)
+                (+ #x41 (ash (+ (* capacity 2) 2) 16)))
+          ;; Write capacity
+          (setf (mem-ref (+ base 8) :u64) (ash capacity 1))  ; tagged
+          ;; Write count = 0
+          (setf (mem-ref (+ base 16) :u64) 0)
+          ;; Zero all entries (key=0 means empty)
+          (let ((i 0))
+            (loop
+              (if (>= i (* capacity 2))
+                  (return nil)
+                  (progn
+                    (setf (mem-ref (+ base 24 (* i 8)) :u64) 0)
+                    (setq i (+ i 1))))))
+          ;; Advance obj-alloc
+          (percpu-set 40 (+ base obj-size))
+          ;; Return tagged object pointer
+          (+ base 9))))
+
+    (defun gethash (key table)
+      ;; Look up KEY in hash TABLE. Returns value or NIL.
+      (let ((base (- table 9))  ; untag object
+            (capacity (ash (mem-ref (+ (- table 9) 8) :u64) -1))  ; untagged
+            (slot (ht-hash-key key 64))  ; initial slot
+            (tries 0))
+        (loop
+          (if (>= tries capacity)
+              (return nil)  ; table full, key not found
+              (let ((entry-base (+ base 24 (* slot 16))))
+                (let ((entry-key (mem-ref entry-base :u64)))
+                  (if (eq entry-key 0)
+                      (return nil)  ; empty slot, key not found
+                      (if (eq entry-key key)
+                          (return (mem-ref (+ entry-base 8) :u64))  ; found!
+                          (progn
+                            (setq slot (logand (+ slot 1) (- capacity 1)))
+                            (setq tries (+ tries 1)))))))))))
+
+    (defun sethash (key table value)
+      ;; Set KEY to VALUE in hash TABLE. Returns VALUE.
+      (let ((base (- table 9))  ; untag
+            (capacity (ash (mem-ref (+ (- table 9) 8) :u64) -1))
+            (slot (ht-hash-key key 64))
+            (tries 0))
+        (loop
+          (if (>= tries capacity)
+              (return value)  ; table full (should grow, but punt for now)
+              (let ((entry-base (+ base 24 (* slot 16))))
+                (let ((entry-key (mem-ref entry-base :u64)))
+                  (if (eq entry-key 0)
+                      ;; Empty slot: insert here
+                      (progn
+                        (setf (mem-ref entry-base :u64) key)
+                        (setf (mem-ref (+ entry-base 8) :u64) value)
+                        ;; Increment count
+                        (setf (mem-ref (+ base 16) :u64)
+                              (+ (mem-ref (+ base 16) :u64) 2))
+                        (return value))
+                      (if (eq entry-key key)
+                          ;; Key exists: update value
+                          (progn
+                            (setf (mem-ref (+ entry-base 8) :u64) value)
+                            (return value))
+                          (progn
+                            (setq slot (logand (+ slot 1) (- capacity 1)))
+                            (setq tries (+ tries 1)))))))))))
+
+    (defun remhash (key table)
+      ;; Remove KEY from hash TABLE. Returns T if found, NIL otherwise.
+      (let ((base (- table 9))
+            (capacity (ash (mem-ref (+ (- table 9) 8) :u64) -1))
+            (slot (ht-hash-key key 64))
+            (tries 0))
+        (loop
+          (if (>= tries capacity)
+              (return nil)
+              (let ((entry-base (+ base 24 (* slot 16))))
+                (let ((entry-key (mem-ref entry-base :u64)))
+                  (if (eq entry-key 0)
+                      (return nil)  ; empty slot, not found
+                      (if (eq entry-key key)
+                          ;; Found: mark as deleted (sentinel = 1)
+                          (progn
+                            (setf (mem-ref entry-base :u64) 1)  ; deleted sentinel
+                            (setf (mem-ref (+ entry-base 8) :u64) 0)
+                            ;; Decrement count
+                            (setf (mem-ref (+ base 16) :u64)
+                                  (- (mem-ref (+ base 16) :u64) 2))
+                            (return t))
+                          (progn
+                            (setq slot (logand (+ slot 1) (- capacity 1)))
+                            (setq tries (+ tries 1)))))))))))
+
+    ;;; ==========================================================
+    ;;; Phase 0e: Global Variable Table
+    ;;; ==========================================================
+    ;;;
+    ;;; Global variables stored in a hash table at address 0x380000.
+    ;;; Maps symbol hash (tagged fixnum) → tagged value.
+    ;;; 0x380000-0x380008: pointer to global var hash table
+
+    (defun init-global-vars ()
+      ;; Initialize the global variable table
+      (let ((ht (make-hash-table)))
+        (setf (mem-ref #x380000 :u64) ht)))
+
+    (defun symbol-value (name-hash)
+      ;; Look up a global variable by its name hash
+      (let ((ht (mem-ref #x380000 :u64)))
+        (gethash name-hash ht)))
+
+    (defun set-symbol-value (name-hash value)
+      ;; Set a global variable by its name hash
+      (let ((ht (mem-ref #x380000 :u64)))
+        (sethash name-hash ht value)))
+
+    ;;; ==========================================================
+    ;;; Phase 0f: Error Handling
+    ;;; ==========================================================
+
+    (defun modus-error (code)
+      ;; Signal an error. CODE is a tagged fixnum error code.
+      ;; Prints error prefix and code, then halts.
+      (write-byte 69)  ; 'E'
+      (write-byte 82)  ; 'R'
+      (write-byte 82)  ; 'R'
+      (write-byte 58)  ; ':'
+      (print-hex32 code)
+      (write-byte 10)  ; newline
+      (hlt))
+
+    ;;; ==========================================================
+    ;;; Phase 1d: Writer (print Lisp objects as text)
+    ;;; ==========================================================
+
+    (defun write-fixnum (n)
+      ;; Print a fixnum as decimal text
+      (if (< n 0)
+          (progn
+            (write-byte 45)  ; '-'
+            (write-fixnum (- 0 n)))
+          (if (< n 10)
+              (write-byte (+ n 48))  ; '0' + n
+              (progn
+                (write-fixnum (truncate n 10))
+                (write-byte (+ (mod n 10) 48))))))
+
+    (defun write-string-contents (str)
+      ;; Print the characters of a string object
+      (let ((base (- str 9))   ; untag object
+            (len (ash (logand (ash (mem-ref (- str 9) :u64) -16) #xFFFFFFFF) 0))
+            (i 0))
+        (loop
+          (if (>= i len)
+              (return nil)
+              (progn
+                (write-byte (mem-ref (+ base 8 i) :u8))
+                (setq i (+ i 1)))))))
+
+    (defun write-char-literal (c)
+      ;; Print a character literal (#\x)
+      (write-byte 35)   ; '#'
+      (write-byte 92)   ; '\\'
+      (write-byte (ash c -8)))  ; extract char code from immediate
 
     (defun kernel-main ()
       (write-byte 49)  ;; '1'
@@ -16135,7 +16436,10 @@
     img-compile-init-symbol-table img-compile-kernel-main
     img-patch-metadata img-patch-u64 img-copy-source-blob img-emit-call-site
     img-emit-u64-raw
-    build-image send-image)
+    build-image send-image
+    ;; Real-time clock
+    rtc-seconds rtc-minutes rtc-hours rtc-day rtc-month rtc-year
+    print-2digit print-time is-leap-year days-in-month unix-time)
   "List of cross-compiled functions to register in the native function table")
 
 (defun generate-register-builtins ()
@@ -16144,14 +16448,16 @@
    has the correct buffer positions. Adds base-addr (0x100000) to get
    absolute addresses since the kernel is loaded at that address."
   (let ((body nil)
-        (base-addr #x100000))
+        (base-addr #x100000)
+        (count 0))
     (dolist (fn-name *builtin-functions-to-register*)
       (let* ((name-str (string-downcase (symbol-name fn-name)))
              (hash-id (compute-hash-chars name-str))
              (buf-pos (gethash fn-name *functions*)))
         (when buf-pos
           (let ((abs-addr (+ buf-pos base-addr)))
-            (push `(nfn-define ,hash-id ,abs-addr) body)))))
+            (push `(nfn-define ,hash-id ,abs-addr) body)
+            (incf count)))))
     `(defun register-builtins ()
        ,@(nreverse body))))
 
@@ -16334,6 +16640,54 @@
               (*print-radix* nil))
           (prin1 id-form s))
         (write-char #\Newline s)))))
+
+;;; ============================================================
+;;; Phase 1: Plain Source Serialization (MVM path)
+;;; ============================================================
+;;; Instead of tokenizing symbols to integer IDs, serialize the
+;;; source as plain readable Lisp text. This enables the self-hosting
+;;; kernel to read, modify, and re-serialize its own source.
+
+(defun serialize-runtime-source-plain ()
+  "Serialize *runtime-functions* as plain readable Lisp source text.
+   Phase 1c: the source blob becomes ASCII Lisp source rather than
+   pre-tokenized data. Used for MVM-based cross-compilation."
+  (with-output-to-string (s)
+    (dolist (form *runtime-functions*)
+      (let* ((normalized (normalize-defun-body form))
+             (*print-pretty* nil)
+             (*print-case* :downcase)
+             (*print-base* 10)
+             (*print-radix* nil)
+             (*print-escape* t)
+             (*print-readably* t))
+        (prin1 normalized s))
+      (write-char #\Newline s))))
+
+(defun verify-source-roundtrip ()
+  "Phase 1 verification: read source → write source → read again → identical.
+   Returns T if round-trip preserves all forms."
+  (let* ((source-text (serialize-runtime-source-plain))
+         (re-read (with-input-from-string (s source-text)
+                    (loop for form = (read s nil :eof)
+                          until (eq form :eof)
+                          collect form))))
+    ;; Compare each form
+    (let ((original *runtime-functions*)
+          (roundtrip re-read)
+          (mismatches 0))
+      (loop for o in original
+            for r in roundtrip
+            for i from 0
+            do (let ((norm-o (normalize-defun-body o))
+                     (norm-r (normalize-defun-body r)))
+                 (unless (equal norm-o norm-r)
+                   (format t "Mismatch at form ~D:~%  Original: ~S~%  Roundtrip: ~S~%"
+                           i norm-o norm-r)
+                   (incf mismatches))))
+      (format t "Round-trip check: ~D forms, ~D mismatches~%"
+              (length original) mismatches)
+      (zerop mismatches))))
 
 ;;; ============================================================
 ;;; Build Process
@@ -16565,6 +16919,281 @@
                           (logand (ash tagged-len (* i -8)) #xFF)))))))
 
           ;; Patch total image size into call-site placeholder
+          (let ((total-size (code-buffer-position *code-buffer*))
+                (total-size-pos (gethash :total-size-imm-pos *functions*)))
+            (let ((tagged-size (ash total-size 1)))
+              (dotimes (i 8)
+                (setf (aref (code-buffer-bytes *code-buffer*) (+ total-size-pos i))
+                      (logand (ash tagged-size (* i -8)) #xFF))))
+            (format t "Self-hosting metadata: preamble=~D, total=~D bytes~%"
+                    preamble-size total-size)))))
+
+    ;; Write output
+    (with-open-file (out output-path
+                         :direction :output
+                         :element-type '(unsigned-byte 8)
+                         :if-exists :supersede)
+      (write-sequence (subseq (code-buffer-bytes *code-buffer*) 0
+                             (code-buffer-position *code-buffer*))
+                      out))
+
+    (format t "Kernel written to ~A (~D bytes)~%"
+            output-path (code-buffer-position *code-buffer*))
+    (format t "~%To run: qemu-system-x86_64 -kernel ~A -nographic~%"
+            output-path))))
+
+;;; ============================================================
+;;; MVM Build Pipeline
+;;; ============================================================
+
+(defun build-kernel-mvm (output-path)
+  "Build kernel image using MVM compilation pipeline.
+   Identical to build-kernel except runtime functions are compiled through
+   MVM (compiler.lisp → translate-x64.lisp) instead of cross-compile.lisp."
+  (format t "Building Modus64 kernel (MVM pipeline)...~%")
+
+  (let ((*code-buffer* (make-code-buffer))
+        (*functions* (make-hash-table :test 'eq))
+        (*constants* nil))
+
+    (let* ((base-addr #x100000)
+           (header-size 48))
+
+      ;; === BOOT PREAMBLE (identical to build-kernel) ===
+
+      ;; Reserve space for multiboot header
+      (dotimes (i header-size)
+        (emit-byte *code-buffer* 0))
+
+      ;; Emit 32-bit boot code
+      (let ((entry32-offset (emit-boot32-code *code-buffer* base-addr)))
+
+        ;; Align to 16 bytes
+        (loop while (not (zerop (mod (code-buffer-position *code-buffer*) 16)))
+              do (emit-byte *code-buffer* #x90))
+
+        ;; Mark 64-bit entry point
+        (let ((entry64-offset (code-buffer-position *code-buffer*))
+              (entry64-addr (+ base-addr (code-buffer-position *code-buffer*))))
+
+          ;; Patch boot32 to jump here
+          (patch-boot32-target *code-buffer* 0 entry64-addr)
+
+          ;; Emit 64-bit initialization
+          (emit-64bit-init *code-buffer*)
+
+          ;; Emit AP trampoline data
+          (let ((past-trampoline (make-label)))
+            (emit-jmp *code-buffer* past-trampoline)
+            (let ((trampoline-info (emit-ap-trampoline *code-buffer*)))
+              (emit-label *code-buffer* past-trampoline)
+              (let ((trampoline-phys-addr (+ base-addr (car trampoline-info))))
+                (setf (gethash :trampoline-offset *functions*) (car trampoline-info))
+                (format t "AP trampoline at physical 0x~X (kernel offset 0x~X, ~D bytes)~%"
+                        trampoline-phys-addr (car trampoline-info) (cdr trampoline-info))
+                ;; Store trampoline physical address at 0x300010
+                (emit-bytes *code-buffer* #x48 #xB8)
+                (emit-u64 *code-buffer* (ash trampoline-phys-addr 1))
+                (emit-bytes *code-buffer* #x48 #xA3)
+                (emit-u64 *code-buffer* #x300010))))
+
+          ;; Record boot preamble size
+          (let ((preamble-size (code-buffer-position *code-buffer*)))
+            (format t "Boot preamble size: ~D bytes (0x~X)~%" preamble-size preamble-size)
+
+            ;; Jump over compiled functions to call site
+            (let ((call-site-label (make-label)))
+            (emit-jmp *code-buffer* call-site-label)
+
+            ;; === MVM COMPILATION ===
+            (format t "Compiling runtime functions (MVM pipeline)...~%")
+
+            ;; 1. Register bootstrap macros (cond, and, or)
+            (modus64.mvm:register-mvm-bootstrap-macros)
+
+            ;; 2. Build form list: *runtime-functions* + generated forms
+            (let* ((sym-form (generate-init-symbol-table))
+                   (main-form '(defun kernel-main ()
+                                 (init-raw-constants)
+                                 (smp-init)
+                                 (actor-init)
+                                 (staging-init)
+                                 (set-rsp #x05220000)
+                                 (repl)))
+                   (all-forms (append *runtime-functions*
+                                      (list sym-form main-form))))
+
+              (format t "Compiling ~D forms via MVM...~%" (length all-forms))
+
+              ;; 3. Compile to MVM bytecode
+              (let ((module (modus64.mvm:mvm-compile-all all-forms)))
+                (format t "MVM bytecode: ~D bytes, ~D functions~%"
+                        (length (modus64.mvm:compiled-module-bytecode module))
+                        (length (modus64.mvm:compiled-module-function-table module)))
+
+                ;; 4. Extract function table for translator
+                (let ((fn-table
+                       (mapcar (lambda (fi)
+                                 (list (modus64.mvm:function-info-name fi)
+                                       (modus64.mvm:function-info-bytecode-offset fi)
+                                       (modus64.mvm:function-info-bytecode-length fi)))
+                               (modus64.mvm:compiled-module-function-table module))))
+
+                  ;; 5. Translate MVM bytecode → x86-64 native code
+                  (format t "Translating to x86-64 native code...~%")
+                  (multiple-value-bind (native-buf fn-map)
+                      (modus64.mvm.x64:translate-mvm-to-x64
+                       (modus64.mvm:compiled-module-bytecode module) fn-table)
+
+                    (format t "Native code: ~D bytes~%"
+                            (code-buffer-position native-buf))
+
+                    ;; 6. Copy native code into *code-buffer*
+                    (let ((code-start (code-buffer-position *code-buffer*)))
+                      (dotimes (i (code-buffer-position native-buf))
+                        (emit-byte *code-buffer*
+                                   (aref (code-buffer-bytes native-buf) i)))
+
+                      ;; 7. Build *functions* hash from fn-map
+                      ;; fn-map: string-name → label; label-position → byte offset in native-buf
+                      (maphash (lambda (name label)
+                                 (setf (gethash (intern (string-upcase name)
+                                                        (find-package :modus64.build))
+                                                *functions*)
+                                       (+ code-start (label-position label))))
+                               fn-map)
+                      (format t "Registered ~D MVM-compiled functions~%"
+                              (hash-table-count fn-map)))))))
+
+            ;; === REGISTER-BUILTINS (old cross-compiler, one function) ===
+            ;; generate-register-builtins reads *functions* → absolute addrs
+            (let ((reg-form (generate-register-builtins)))
+              (format t "Registering ~D builtin functions~%"
+                      (length *builtin-functions-to-register*))
+              (compile-toplevel reg-form))
+
+            ;; === FORWARD REFERENCE PATCHING ===
+            ;; Only needed for register-builtins (compiled with old cross-compiler).
+            ;; MVM functions have all calls resolved internally.
+            (dolist (fixup *constants*)
+              (when (and (listp fixup) (= (length fixup) 2))
+                (let ((call-offset (first fixup))
+                      (fn-name (second fixup)))
+                  (when (symbolp fn-name)
+                    (let ((fn-addr (gethash fn-name *functions*)))
+                      (when fn-addr
+                        (let* ((patch-pos (1+ call-offset))
+                               (next-ip (+ call-offset 5))
+                               (rel-offset (- fn-addr next-ip)))
+                          (setf (aref (code-buffer-bytes *code-buffer*) patch-pos)
+                                (logand rel-offset #xFF))
+                          (setf (aref (code-buffer-bytes *code-buffer*) (+ patch-pos 1))
+                                (logand (ash rel-offset -8) #xFF))
+                          (setf (aref (code-buffer-bytes *code-buffer*) (+ patch-pos 2))
+                                (logand (ash rel-offset -16) #xFF))
+                          (setf (aref (code-buffer-bytes *code-buffer*) (+ patch-pos 3))
+                                (logand (ash rel-offset -24) #xFF)))))))))
+
+            ;; Print function addresses
+            (maphash (lambda (name addr)
+                       (format t "  ~A: ~X~%" name addr))
+                     *functions*)
+
+            ;; Patch AP trampoline entry address at build time
+            (let ((trampoline-buf-offset (gethash :trampoline-offset *functions*))
+                  (ap-entry-buf-offset (gethash 'ap-entry *functions*)))
+              (when (and trampoline-buf-offset ap-entry-buf-offset)
+                (let ((ap-entry-abs (+ ap-entry-buf-offset base-addr))
+                      (param-offset (+ trampoline-buf-offset #xF0)))
+                  (format t "Patching AP trampoline entry addr: 0x~X at buf offset 0x~X~%"
+                          ap-entry-abs param-offset)
+                  (dotimes (i 8)
+                    (setf (aref (code-buffer-bytes *code-buffer*) (+ param-offset i))
+                          (logand (ash ap-entry-abs (* i -8)) #xFF))))))
+
+            ;; Compile kernel init
+            (format t "Compiling kernel-main call site...~%")
+
+            ;; Call site - jump lands here
+            (emit-label *code-buffer* call-site-label)
+
+            ;; Store self-hosting metadata at fixed addresses (0x4FF050+)
+            ;; 0x4FF050: boot preamble size
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (emit-u64 *code-buffer* (ash preamble-size 1))
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF050)
+
+            ;; 0x4FF058: total image size (placeholder, patched below)
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :total-size-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF058)
+
+            ;; 0x4FF090: source blob address (placeholder, patched below)
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :src-addr-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF090)
+
+            ;; 0x4FF098: source blob length (placeholder, patched below)
+            (emit-bytes *code-buffer* #x48 #xB8)
+            (setf (gethash :src-len-imm-pos *functions*) (code-buffer-position *code-buffer*))
+            (emit-u64 *code-buffer* 0)
+            (emit-bytes *code-buffer* #x48 #xA3)
+            (emit-u64 *code-buffer* #x4FF098)
+
+            ;; 0x4FF0B0: register-builtins address (tagged fixnum).
+            ;; register-builtins is compiled by the old cross-compiler, not MVM,
+            ;; so MVM-compiled repl() calls it indirectly via call-native.
+            (let ((reg-builtins-addr (+ base-addr (gethash 'register-builtins *functions*))))
+              (emit-bytes *code-buffer* #x48 #xB8)          ; mov rax, imm64
+              (emit-u64 *code-buffer* (ash reg-builtins-addr 1))  ; tagged
+              (emit-bytes *code-buffer* #x48 #xA3)          ; mov [imm64], rax
+              (emit-u64 *code-buffer* #x4FF0B0))
+
+            ;; Call kernel-main
+            (emit-call *code-buffer* (gethash 'kernel-main *functions*)))
+
+          ;; Infinite halt (shouldn't reach)
+          (let ((halt-loop (make-label)))
+            (emit-label *code-buffer* halt-loop)
+            (emit-byte *code-buffer* #xF4)
+            (emit-jmp *code-buffer* halt-loop))
+
+          ;; Fix up labels
+          (fixup-labels *code-buffer*)
+
+          ;; Patch multiboot header
+          (let ((entry32-addr (+ base-addr entry32-offset)))
+            (patch-multiboot-header *code-buffer* base-addr entry32-addr))
+
+          ;; Embed runtime function source (integer IDs, matches runtime reader)
+          (let ((src-start-offset (code-buffer-position *code-buffer*))
+                (src-start-addr (+ base-addr (code-buffer-position *code-buffer*))))
+            (let ((source-text (serialize-runtime-source)))
+              (format t "Serialized source: ~D bytes~%" (length source-text))
+              (loop for ch across source-text
+                    do (emit-byte *code-buffer* (char-code ch))))
+            (let ((src-len (- (code-buffer-position *code-buffer*) src-start-offset)))
+              (format t "Source blob: ~D bytes at 0x~X (offset 0x~X)~%"
+                      src-len src-start-addr src-start-offset)
+
+              ;; Patch source blob address/length placeholders
+              (let ((src-addr-pos (gethash :src-addr-imm-pos *functions*))
+                    (src-len-pos (gethash :src-len-imm-pos *functions*)))
+                (let ((tagged-addr (ash src-start-addr 1))
+                      (tagged-len (ash src-len 1)))
+                  (dotimes (i 8)
+                    (setf (aref (code-buffer-bytes *code-buffer*) (+ src-addr-pos i))
+                          (logand (ash tagged-addr (* i -8)) #xFF)))
+                  (dotimes (i 8)
+                    (setf (aref (code-buffer-bytes *code-buffer*) (+ src-len-pos i))
+                          (logand (ash tagged-len (* i -8)) #xFF)))))))
+
+          ;; Patch total image size
           (let ((total-size (code-buffer-position *code-buffer*))
                 (total-size-pos (gethash :total-size-imm-pos *functions*)))
             (let ((tagged-size (ash total-size 1)))

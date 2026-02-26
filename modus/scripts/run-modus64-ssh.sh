@@ -22,15 +22,11 @@ trap cleanup INT TERM
 
 # Build kernel
 echo "Building kernel..."
-cd lib/modus64
 sbcl --control-stack-size 64 \
-     --load cross/packages.lisp \
-     --load cross/x64-asm.lisp \
-     --load cross/cross-compile.lisp \
-     --load cross/build.lisp \
-     --eval '(modus64.build:build-kernel "/tmp/modus64.elf")' \
+     --eval '(push (truename "lib/modus64/") asdf:*central-registry*)' \
+     --eval '(asdf:load-system :modus64)' \
+     --eval '(modus64.build:build-kernel-mvm "/tmp/modus64.elf")' \
      --eval '(quit)' > /dev/null 2>&1
-cd ../..
 echo "Build complete."
 
 pkill -9 -f 'qemu.*modus64.elf' 2>/dev/null || true

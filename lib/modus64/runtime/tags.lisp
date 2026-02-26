@@ -31,14 +31,23 @@
 (defconstant +imm-float+ 1)          ; Single-float
 
 ;;; Object subtags (in header byte)
-(defconstant +subtag-symbol+ #x50)
-(defconstant +subtag-function+ #x51)
-(defconstant +subtag-closure+ #x52)
+;;; 0x00-0x3F: Vector-like objects
 (defconstant +subtag-simple-vector+ #x01)
 (defconstant +subtag-string+ #x10)
 (defconstant +subtag-u8-vector+ #x11)
 (defconstant +subtag-u64-vector+ #x14)
+(defconstant +subtag-bignum+ #x30)
+(defconstant +subtag-array+ #x32)
+;;; 0x40-0x4F: Structured objects
 (defconstant +subtag-struct+ #x40)
+(defconstant +subtag-hash-table+ #x41)
+;;; 0x50-0x5F: Callable/symbol objects
+(defconstant +subtag-symbol+ #x50)
+(defconstant +subtag-function+ #x51)
+(defconstant +subtag-closure+ #x52)
+;;; 0x60-0x6F: MVM objects
+(defconstant +subtag-mvm-bytecode+ #x60)
+(defconstant +subtag-mvm-module+ #x61)
 
 ;;; ============================================================
 ;;; Tag Extraction
@@ -153,3 +162,18 @@
   "Is X a string?"
   (and (objectp x)
        (= (object-subtag x) +subtag-string+)))
+
+(defun closurep (x)
+  "Is X a closure?"
+  (and (objectp x)
+       (= (object-subtag x) +subtag-closure+)))
+
+(defun hash-table-p (x)
+  "Is X a hash table?"
+  (and (objectp x)
+       (= (object-subtag x) +subtag-hash-table+)))
+
+(defun structp (x)
+  "Is X a struct?"
+  (and (objectp x)
+       (= (object-subtag x) +subtag-struct+)))

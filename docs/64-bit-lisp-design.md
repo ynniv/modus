@@ -1,5 +1,7 @@
 # The One True 64-bit Lisp OS: Design Document
 
+**Note**: This is the original design document. The architecture described here is implemented and working. See `mvm.md` for the portable virtual machine (added later) and `actors.md` for the actor/SMP system.
+
 ## Executive Summary
 
 This document outlines the design for a 64-bit native Lisp OS for Modus,

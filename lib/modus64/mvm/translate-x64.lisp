@@ -1,0 +1,1660 @@
+;;;; translate-x64.lisp - MVM Bytecode to x86-64 Native Code Translator
+;;;;
+;;;; Translates MVM (Modus Virtual Machine) bytecode into x86-64 machine
+;;;; code using the x64-asm.lisp instruction encoder.  Each MVM virtual
+;;;; instruction maps to 1-5 native x86-64 instructions.
+;;;;
+;;;; Virtual registers are resolved to physical x86-64 registers according
+;;;; to the mapping in target.lisp.  Registers V9-V15 that have no physical
+;;;; home are spilled to the stack frame at [RBP - offset].
+;;;;
+;;;; Branch targets in MVM bytecode are 16-bit signed offsets from the end
+;;;; of the branch instruction.  During translation we build a map from MVM
+;;;; bytecode positions to native code positions and use label-based fixups
+;;;; provided by the assembler for forward references.
+
+(in-package :cl-user)
+
+(defpackage :modus64.mvm.x64
+  (:use :cl :modus64.mvm :modus64.asm)
+  (:export
+   #:translate-mvm-to-x64
+   #:translate-function
+   #:install-x64-translator))
+
+(in-package :modus64.mvm.x64)
+
+;;; ============================================================
+;;; Physical Register Mapping
+;;; ============================================================
+;;;
+;;; Maps each MVM virtual register number to an x86-64 physical register
+;;; symbol recognised by x64-asm.lisp, or NIL for spilled registers.
+;;;
+;;;   V0  → RSI   V1  → RDI   V2  → R8    V3  → R9     (args)
+;;;   V4  → RBX   V5  → RCX   V6  → RDX   V7  → R10    (general)
+;;;   V8  → R11   V9..V15 → spill
+;;;   VR  → RAX   VA  → R12   VL  → R14   VN  → R15
+;;;   VSP → RSP   VFP → RBP
+
+(defparameter *vreg-to-x64*
+  (vector 'rsi  ; V0   0
+          'rdi  ; V1   1
+          'r8   ; V2   2
+          'r9   ; V3   3
+          'rbx  ; V4   4
+          'rcx  ; V5   5
+          'rdx  ; V6   6
+          'r10  ; V7   7
+          'r11  ; V8   8
+          nil   ; V9   9   spill
+          nil   ; V10  10  spill
+          nil   ; V11  11  spill
+          nil   ; V12  12  spill
+          nil   ; V13  13  spill
+          nil   ; V14  14  spill
+          nil   ; V15  15  spill
+          'rax  ; VR   16
+          'r12  ; VA   17
+          'r14  ; VL   18
+          'r15  ; VN   19
+          'rsp  ; VSP  20
+          'rbp  ; VFP  21
+          nil)) ; VPC  22  (not mapped)
+
+(defconstant +max-inline-vreg+ 8
+  "Virtual registers above this index spill to the stack frame.")
+
+(defconstant +spill-slot-size+ 8
+  "Each spill slot is 8 bytes (one 64-bit word).")
+
+(defun vreg-phys (vreg)
+  "Return the physical register symbol for VREG, or NIL if spilled."
+  (when (< vreg (length *vreg-to-x64*))
+    (aref *vreg-to-x64* vreg)))
+
+(defun vreg-spills-p (vreg)
+  "Does VREG spill to the stack on x86-64?"
+  (and (>= vreg 9) (<= vreg 15)))
+
+;;; Callee-saved register save area (top of frame, just below RBP):
+;;;   RBP-8:  saved RBX
+;;;   RBP-16: saved R12
+;;;   RBP-24: saved R14
+;;;   RBP-32: saved R15
+(defconstant +callee-save-size+ 32
+  "Bytes reserved for callee-saved registers (RBX, R12, R14, R15).")
+
+(defun spill-offset (vreg)
+  "Return the frame offset (negative from RBP) for a spilled register.
+   V9 → [RBP-40], V10 → [RBP-48], ..., V15 → [RBP-88].
+   Shifted down by 32 bytes to make room for callee-saved register saves."
+  (- (+ (* (- vreg +max-inline-vreg+) +spill-slot-size+)
+        +callee-save-size+)))
+
+(defconstant +n-spill-slots+ 7
+  "Number of spill slots needed (V9..V15).")
+
+(defconstant +spill-frame-size+ (* +n-spill-slots+ +spill-slot-size+)
+  "Total bytes reserved in the stack frame for spill slots.")
+
+(defconstant +frame-slot-base+ -96
+  "RBP-relative offset for frame slot 0 (local variables via obj-ref VFP).
+   Frame slots grow downward: slot N is at RBP + frame-slot-base - N*8.
+   Above this: callee-saved saves (32 bytes) + spill slots (56 bytes) = 88.")
+
+(defconstant +frame-total-size+ 352
+  "Total frame reservation in bytes. Callee-saved saves (32) + spill slots (56)
+   + 32 frame slots for local variables (256) = 344, rounded to 352.")
+
+;;; ============================================================
+;;; Scratch Register for Spill Mediation
+;;; ============================================================
+;;;
+;;; When a source or destination operand is a spilled register we load
+;;; from / store to the spill slot via RAX as a scratch register.
+;;; Care must be taken when RAX is also the VR mapping; in translate-
+;;; instruction the ordering ensures correctness.
+
+(defconstant +scratch-reg+ 'rax
+  "Temporary register used when mediating spilled virtual registers.")
+
+;;; ============================================================
+;;; Register Materialisation Helpers
+;;; ============================================================
+
+(defun emit-load-vreg (buf vreg phys-dest)
+  "Load virtual register VREG into physical register PHYS-DEST.
+   If VREG maps to a physical register, emit MOV if different.
+   If VREG is spilled, load from the frame."
+  (let ((phys (vreg-phys vreg)))
+    (cond
+      (phys
+       (unless (eq phys phys-dest)
+         (emit-mov-reg-reg buf phys-dest phys)))
+      ((vreg-spills-p vreg)
+       (emit-mov-reg-mem buf phys-dest 'rbp (spill-offset vreg)))
+      (t
+       (error "MVM x64: cannot load vreg ~D" vreg)))))
+
+(defun emit-store-vreg (buf vreg phys-src)
+  "Store physical register PHYS-SRC into virtual register VREG.
+   If VREG maps to a physical register, emit MOV if different.
+   If VREG is spilled, store to the frame."
+  (let ((phys (vreg-phys vreg)))
+    (cond
+      (phys
+       (unless (eq phys phys-src)
+         (emit-mov-reg-reg buf phys phys-src)))
+      ((vreg-spills-p vreg)
+       (emit-mov-mem-reg buf 'rbp phys-src (spill-offset vreg)))
+      (t
+       (error "MVM x64: cannot store vreg ~D" vreg)))))
+
+(defun emit-vreg-to-vreg (buf dst src)
+  "Move value from virtual register SRC to virtual register DST.
+   Handles all combinations of physical and spilled registers."
+  (let ((phys-dst (vreg-phys dst))
+        (phys-src (vreg-phys src)))
+    (cond
+      ;; Both physical
+      ((and phys-dst phys-src)
+       (unless (eq phys-dst phys-src)
+         (emit-mov-reg-reg buf phys-dst phys-src)))
+      ;; Src physical, dst spilled
+      ((and (null phys-dst) phys-src)
+       (emit-store-vreg buf dst phys-src))
+      ;; Src spilled, dst physical
+      ((and phys-dst (null phys-src))
+       (emit-load-vreg buf src phys-dst))
+      ;; Both spilled — route through scratch
+      (t
+       (emit-load-vreg buf src +scratch-reg+)
+       (emit-store-vreg buf dst +scratch-reg+)))))
+
+;;; ============================================================
+;;; Destination Register Resolution
+;;; ============================================================
+;;;
+;;; Many MVM instructions write a result.  If the destination virtual
+;;; register has a physical mapping we compute directly into it.
+;;; Otherwise we compute into +scratch-reg+ and store afterwards.
+
+(defun dest-phys-or-scratch (vreg)
+  "Return the physical register to compute the result into for VREG.
+   If VREG has a physical register, return it; else return +scratch-reg+."
+  (or (vreg-phys vreg) +scratch-reg+))
+
+(defun maybe-store-scratch (buf vreg)
+  "If VREG is spilled, store +scratch-reg+ into its spill slot."
+  (when (vreg-spills-p vreg)
+    (emit-store-vreg buf vreg +scratch-reg+)))
+
+;;; ============================================================
+;;; Translation State
+;;; ============================================================
+
+(defstruct translate-state
+  (buf nil)                    ; code-buffer from x64-asm
+  (mvm-bytes nil)              ; raw MVM bytecode vector
+  (mvm-length 0)               ; length of bytecode region
+  (mvm-offset 0)               ; start offset into mvm-bytes
+  ;; Maps from MVM bytecode position → native code label.
+  ;; Populated on the first pass (scan) or lazily on demand.
+  (position-labels (make-hash-table :test 'eql))
+  ;; Function table: function-index → native code label
+  (function-table nil)
+  ;; GC helper label (one per translated unit)
+  (gc-label nil))
+
+(defun ensure-label-at (state mvm-pos)
+  "Ensure a label exists for MVM bytecode position MVM-POS.
+   Returns the label."
+  (let ((ht (translate-state-position-labels state)))
+    (or (gethash mvm-pos ht)
+        (setf (gethash mvm-pos ht) (make-label)))))
+
+;;; ============================================================
+;;; Two-Operand ALU Pattern
+;;; ============================================================
+;;;
+;;; Many MVM instructions are three-address: (op Vd, Va, Vb).
+;;; On x86-64 most ALU ops are two-address: dst = dst OP src.
+;;; The pattern is:
+;;;   1. Load Va into dest register (or compute into scratch)
+;;;   2. Apply ALU op with Vb as source
+;;;   3. Store result if dest was scratch
+
+(defun emit-alu-rrr (buf emitter vd va vb)
+  "Emit a two-operand ALU pattern for (op Vd, Va, Vb).
+   EMITTER is (lambda (buf dst-phys src-phys)) that emits the ALU op."
+  (let* ((d (dest-phys-or-scratch vd))
+         (pa (vreg-phys va))
+         (pb (vreg-phys vb)))
+    ;; Step 1: get Va into d
+    (cond
+      (pa (unless (eq pa d) (emit-mov-reg-reg buf d pa)))
+      (t  (emit-load-vreg buf va d)))
+    ;; Step 2: apply op.  Need Vb in a physical register.
+    (cond
+      (pb (funcall emitter buf d pb))
+      (t
+       ;; Vb is spilled.  Load into a temp.  We need a temp that is not
+       ;; the same as d.  Use R13 (currently unused by MVM mapping) as
+       ;; a second scratch when d is RAX, otherwise use RAX.
+       (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+         (emit-push buf tmp)               ; save tmp
+         (emit-load-vreg buf vb tmp)
+         (funcall emitter buf d tmp)
+         (emit-pop buf tmp))))             ; restore tmp
+    ;; Step 3: store if spilled
+    (maybe-store-scratch buf vd)))
+
+;;; ============================================================
+;;; Instruction Translation
+;;; ============================================================
+
+(defun translate-instruction (state opcode operands mvm-next-pos)
+  "Translate a single MVM instruction into x86-64 code.
+   OPCODE is the numeric MVM opcode.
+   OPERANDS is the list of decoded operands.
+   MVM-NEXT-POS is the bytecode position after this instruction.
+   Returns no useful value; side-effects the code-buffer in STATE."
+  (let ((buf (translate-state-buf state)))
+    (macrolet ((op= (sym) `(= opcode ,sym)))
+      (cond
+        ;; ============================================
+        ;; NOP / BREAK / TRAP
+        ;; ============================================
+        ((op= +op-nop+)
+         (emit-nop buf))
+
+        ((op= +op-break+)
+         (emit-int buf 3))            ; INT 3 — debug breakpoint
+
+        ((op= +op-trap+)
+         (let ((code (first operands)))
+           (cond
+             ((< code #x100)
+              ;; Frame-enter: code = param count.
+              ;; Prologue is emitted at function boundaries.
+              ;; If > 4 params, copy overflow args from caller's stack
+              ;; to local frame slots so stack-load can find them.
+              (when (> code 4)
+                (loop for i from 4 below code
+                      for src-offset = (+ 16 (* (- i 4) 8))  ; [RBP + 16 + k*8]
+                      for dst-offset = (+ +frame-slot-base+ (* i -8))  ; frame slot i
+                      do (emit-mov-reg-mem buf 'rax 'rbp src-offset)
+                         (emit-mov-mem-reg buf 'rbp 'rax dst-offset))))
+             ((< code #x0300)
+              ;; Frame-alloc and frame-free: NOP
+              ;; Frame slots are pre-allocated in the 352-byte frame.
+              nil)
+             ((= code #x0300)
+              ;; Serial write: V0 (RSI) contains tagged fixnum char code
+              ;; mov eax, esi
+              (emit-bytes buf #x89 #xF0)
+              ;; sar eax, 1 (untag fixnum)
+              (emit-bytes buf #xD1 #xF8)
+              ;; mov dx, 0x3F8 (COM1 data port)
+              (emit-bytes buf #x66 #xBA #xF8 #x03)
+              ;; out dx, al
+              (emit-bytes buf #xEE))
+             (t
+              ;; Real CPU trap
+              (emit-mov-reg-imm buf 'rax code)
+              (emit-int buf #x30)))))
+
+        ;; ============================================
+        ;; Data Movement
+        ;; ============================================
+        ((op= +op-mov+)
+         ;; (mov Vd Vs)
+         (let ((vd (first operands))
+               (vs (second operands)))
+           (emit-vreg-to-vreg buf vd vs)))
+
+        ((op= +op-li+)
+         ;; (li Vd imm64)
+         (let ((vd (first operands))
+               (imm (second operands)))
+           (let ((d (dest-phys-or-scratch vd)))
+             (emit-mov-reg-imm buf d imm)
+             (maybe-store-scratch buf vd))))
+
+        ((op= +op-push+)
+         ;; (push Vs)
+         (let* ((vs (first operands))
+                (phys (vreg-phys vs)))
+           (if phys
+               (emit-push buf phys)
+               (progn
+                 (emit-load-vreg buf vs +scratch-reg+)
+                 (emit-push buf +scratch-reg+)))))
+
+        ((op= +op-pop+)
+         ;; (pop Vd)
+         (let* ((vd (first operands))
+                (phys (vreg-phys vd)))
+           (if phys
+               (emit-pop buf phys)
+               (progn
+                 (emit-pop buf +scratch-reg+)
+                 (emit-store-vreg buf vd +scratch-reg+)))))
+
+        ;; ============================================
+        ;; Arithmetic (tagged fixnum)
+        ;; ============================================
+        ((op= +op-add+)
+         ;; (add Vd Va Vb) — tagged fixnums add directly
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-add-reg-reg vd va vb)))
+
+        ((op= +op-sub+)
+         ;; (sub Vd Va Vb) — tagged fixnums subtract directly
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-sub-reg-reg vd va vb)))
+
+        ((op= +op-mul+)
+         ;; (mul Vd Va Vb) — tagged: result = (Va * Vb) >> 1
+         ;; Since both inputs carry the <<1 fixnum tag, the product
+         ;; has a factor of 4 where we need 2, so SAR 1 corrects.
+         ;;
+         ;; x86-64 IMUL r64, r/m64 (two-operand form):
+         ;;   REX.W 0F AF /r
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; Load Va into d
+           (emit-load-vreg buf va d)
+           ;; IMUL d, Vb-phys
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 (emit-imul-reg-reg buf d pb)
+                 (progn
+                   ;; Vb spilled — load into temp
+                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                     (emit-push buf tmp)
+                     (emit-load-vreg buf vb tmp)
+                     (emit-imul-reg-reg buf d tmp)
+                     (emit-pop buf tmp)))))
+           ;; Fix tagging: SAR d, 1
+           (emit-sar-reg-imm buf d 1)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-div+)
+         ;; (div Vd Va Vb) — tagged fixnum division
+         ;; IDIV divides RDX:RAX by operand; quotient in RAX.
+         ;; Must save both operands to stack first since IDIV clobbers
+         ;; RAX and RDX, and CQO clobbers RDX — any of which may hold
+         ;; Va or Vb (V5=RCX, V6=RDX, VR=RAX).
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           ;; Save both operands to stack (safe regardless of physical mapping)
+           (emit-load-vreg buf va 'rax)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'rax)
+           (emit-push buf 'rax)
+           ;; Pop divisor → RCX, untag
+           (emit-pop buf 'rcx)
+           (emit-sar-reg-imm buf 'rcx 1)
+           ;; Pop dividend → RAX, untag
+           (emit-pop buf 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           ;; CQO: sign-extend RAX → RDX:RAX (safe: Vb is in RCX)
+           (emit-bytes buf #x48 #x99)
+           ;; IDIV RCX: RAX = quotient, RDX = remainder
+           (emit-bytes buf #x48 #xF7 #xF9)
+           ;; Re-tag quotient: SHL RAX, 1
+           (emit-shl-reg-imm buf 'rax 1)
+           (emit-store-vreg buf vd 'rax)))
+
+        ((op= +op-mod+)
+         ;; (mod Vd Va Vb) — tagged fixnum modulus
+         ;; Same stack-save approach as div to avoid register clobbering.
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-load-vreg buf va 'rax)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vb 'rax)
+           (emit-push buf 'rax)
+           (emit-pop buf 'rcx)
+           (emit-sar-reg-imm buf 'rcx 1)
+           (emit-pop buf 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           (emit-bytes buf #x48 #x99)         ; CQO
+           (emit-bytes buf #x48 #xF7 #xF9)    ; IDIV RCX
+           ;; Remainder in RDX → re-tag
+           (emit-shl-reg-imm buf 'rdx 1)
+           (emit-store-vreg buf vd 'rdx)))
+
+        ((op= +op-neg+)
+         ;; (neg Vd Vs) — negate tagged fixnum
+         ;; NEG preserves the tag for fixnums: -(n<<1) = (-n)<<1
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf vs d)
+           ;; NEG r64: REX.W F7 /3
+           (emit-neg-reg buf d)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-inc+)
+         ;; (inc Vd) — add tagged fixnum 1 (= raw 2)
+         (let* ((vd (first operands))
+                (phys (vreg-phys vd)))
+           (if phys
+               (emit-add-reg-imm buf phys 2)
+               (progn
+                 (emit-load-vreg buf vd +scratch-reg+)
+                 (emit-add-reg-imm buf +scratch-reg+ 2)
+                 (emit-store-vreg buf vd +scratch-reg+)))))
+
+        ((op= +op-dec+)
+         ;; (dec Vd) — subtract tagged fixnum 1 (= raw 2)
+         (let* ((vd (first operands))
+                (phys (vreg-phys vd)))
+           (if phys
+               (emit-sub-reg-imm buf phys 2)
+               (progn
+                 (emit-load-vreg buf vd +scratch-reg+)
+                 (emit-sub-reg-imm buf +scratch-reg+ 2)
+                 (emit-store-vreg buf vd +scratch-reg+)))))
+
+        ;; ============================================
+        ;; Bitwise Operations
+        ;; ============================================
+        ((op= +op-and+)
+         ;; (and Vd Va Vb) — bitwise AND (tag-preserving for fixnums)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-and-reg-reg vd va vb)))
+
+        ((op= +op-or+)
+         ;; (or Vd Va Vb)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-or-reg-reg vd va vb)))
+
+        ((op= +op-xor+)
+         ;; (xor Vd Va Vb)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (emit-alu-rrr buf #'emit-xor-reg-reg vd va vb)))
+
+        ((op= +op-shl+)
+         ;; (shl Vd Vs imm8) — shift left by immediate
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (count (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf vs d)
+           (emit-shl-reg-imm buf d count)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-shr+)
+         ;; (shr Vd Vs imm8) — logical shift right
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (count (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf vs d)
+           (emit-shr-reg-imm buf d count)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sar+)
+         ;; (sar Vd Vs imm8) — arithmetic shift right
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (count (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf vs d)
+           (emit-sar-reg-imm buf d count)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-ldb+)
+         ;; (ldb Vd Vs pos:imm8 size:imm8) — bit field extract
+         ;; Shift right by pos, mask to size bits
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (pos (third operands))
+                (size (fourth operands))
+                (d (dest-phys-or-scratch vd))
+                (mask (1- (ash 1 size))))
+           (emit-load-vreg buf vs d)
+           (when (> pos 0)
+             (emit-shr-reg-imm buf d pos))
+           (emit-and-reg-imm buf d mask)
+           (maybe-store-scratch buf vd)))
+
+        ;; ============================================
+        ;; Comparison
+        ;; ============================================
+        ((op= +op-cmp+)
+         ;; (cmp Va Vb) — sets CPU flags
+         (let ((va (first operands))
+               (vb (second operands)))
+           (let ((pa (vreg-phys va))
+                 (pb (vreg-phys vb)))
+             (cond
+               ;; Both physical
+               ((and pa pb)
+                (emit-cmp-reg-reg buf pa pb))
+               ;; Va physical, Vb spilled
+               ((and pa (null pb))
+                (emit-push buf 'rax)
+                (emit-load-vreg buf vb 'rax)
+                (emit-cmp-reg-reg buf pa 'rax)
+                (emit-pop buf 'rax))
+               ;; Va spilled, Vb physical
+               ((and (null pa) pb)
+                (emit-push buf 'rax)
+                (emit-load-vreg buf va 'rax)
+                (emit-cmp-reg-reg buf 'rax pb)
+                (emit-pop buf 'rax))
+               ;; Both spilled
+               (t
+                (emit-push buf 'rax)
+                (emit-push buf 'r13)
+                (emit-load-vreg buf va 'rax)
+                (emit-load-vreg buf vb 'r13)
+                (emit-cmp-reg-reg buf 'rax 'r13)
+                (emit-pop buf 'r13)
+                (emit-pop buf 'rax))))))
+
+        ((op= +op-test+)
+         ;; (test Va Vb) — AND, sets flags, discards result
+         (let ((va (first operands))
+               (vb (second operands)))
+           (let ((pa (vreg-phys va))
+                 (pb (vreg-phys vb)))
+             (cond
+               ((and pa pb)
+                (emit-test-reg-reg buf pa pb))
+               ((and pa (null pb))
+                (emit-push buf 'rax)
+                (emit-load-vreg buf vb 'rax)
+                (emit-test-reg-reg buf pa 'rax)
+                (emit-pop buf 'rax))
+               ((and (null pa) pb)
+                (emit-push buf 'rax)
+                (emit-load-vreg buf va 'rax)
+                (emit-test-reg-reg buf 'rax pb)
+                (emit-pop buf 'rax))
+               (t
+                (emit-push buf 'rax)
+                (emit-push buf 'r13)
+                (emit-load-vreg buf va 'rax)
+                (emit-load-vreg buf vb 'r13)
+                (emit-test-reg-reg buf 'rax 'r13)
+                (emit-pop buf 'r13)
+                (emit-pop buf 'rax))))))
+
+        ;; ============================================
+        ;; Branches
+        ;; ============================================
+        ;;
+        ;; MVM branch offsets are 16-bit signed, relative to the end
+        ;; of the branch instruction in the MVM bytecode stream.
+        ;; We compute the absolute MVM target position and emit a
+        ;; Jcc/JMP to the corresponding native label.
+
+        ((op= +op-br+)
+         ;; (br off16) — unconditional branch
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jmp buf label)))
+
+        ((op= +op-beq+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :e label)))
+
+        ((op= +op-bne+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :ne label)))
+
+        ((op= +op-blt+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :l label)))
+
+        ((op= +op-bge+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :ge label)))
+
+        ((op= +op-ble+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :le label)))
+
+        ((op= +op-bgt+)
+         (let* ((off (first operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos)))
+           (emit-jcc buf :g label)))
+
+        ((op= +op-bnull+)
+         ;; (bnull Vs off16) — compare Vs against R15 (NIL), branch if equal
+         (let* ((vs (first operands))
+                (off (second operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-cmp-reg-reg buf ps 'r15)
+               (progn
+                 (emit-push buf 'rax)
+                 (emit-load-vreg buf vs 'rax)
+                 (emit-cmp-reg-reg buf 'rax 'r15)
+                 (emit-pop buf 'rax)))
+           (emit-jcc buf :e label)))
+
+        ((op= +op-bnnull+)
+         ;; (bnnull Vs off16) — branch if Vs is not NIL
+         (let* ((vs (first operands))
+                (off (second operands))
+                (target-pos (+ mvm-next-pos off))
+                (label (ensure-label-at state target-pos))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-cmp-reg-reg buf ps 'r15)
+               (progn
+                 (emit-push buf 'rax)
+                 (emit-load-vreg buf vs 'rax)
+                 (emit-cmp-reg-reg buf 'rax 'r15)
+                 (emit-pop buf 'rax)))
+           (emit-jcc buf :ne label)))
+
+        ;; ============================================
+        ;; List Operations
+        ;; ============================================
+        ((op= +op-car+)
+         ;; (car Vd Vs) — load car: [Vs - 1] (untag cons ptr)
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-mov-reg-mem buf d ps -1)
+               (progn
+                 ;; Load Vs into temp, then deref
+                 (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                   (emit-push buf tmp)
+                   (emit-load-vreg buf vs tmp)
+                   (emit-mov-reg-mem buf d tmp -1)
+                   (emit-pop buf tmp))))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-cdr+)
+         ;; (cdr Vd Vs) — load cdr: [Vs + 7] (-1 + 8)
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-mov-reg-mem buf d ps 7)
+               (progn
+                 (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                   (emit-push buf tmp)
+                   (emit-load-vreg buf vs tmp)
+                   (emit-mov-reg-mem buf d tmp 7)
+                   (emit-pop buf tmp))))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-cons+)
+         ;; (cons Vd Va Vb) — allocate cons cell via bump allocator
+         ;; [R12+0] = car (Va), [R12+8] = cdr (Vb)
+         ;; result = R12 | 1 (cons tag), R12 += 16
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; Store car
+           (let ((pa (vreg-phys va)))
+             (if pa
+                 (emit-mov-mem-reg buf 'r12 pa 0)
+                 (progn
+                   (emit-load-vreg buf va +scratch-reg+)
+                   (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0))))
+           ;; Store cdr
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 (emit-mov-mem-reg buf 'r12 pb 8)
+                 (progn
+                   (emit-load-vreg buf vb +scratch-reg+)
+                   (emit-mov-mem-reg buf 'r12 +scratch-reg+ 8))))
+           ;; Result = R12 + 1 (cons tag)
+           (emit-lea buf d 'r12 1)
+           ;; Advance alloc pointer
+           (emit-add-reg-imm buf 'r12 16)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-setcar+)
+         ;; (setcar Vd Vs) — [Vd - 1] = Vs (write through cons tag)
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (pd (vreg-phys vd))
+                (ps (vreg-phys vs)))
+           (cond
+             ((and pd ps)
+              (emit-mov-mem-reg buf pd ps -1))
+             ((and pd (null ps))
+              (emit-push buf 'rax)
+              (emit-load-vreg buf vs 'rax)
+              (emit-mov-mem-reg buf pd 'rax -1)
+              (emit-pop buf 'rax))
+             ((and (null pd) ps)
+              (emit-push buf 'rax)
+              (emit-load-vreg buf vd 'rax)
+              (emit-mov-mem-reg buf 'rax ps -1)
+              (emit-pop buf 'rax))
+             (t
+              (emit-push buf 'rax)
+              (emit-push buf 'r13)
+              (emit-load-vreg buf vd 'rax)
+              (emit-load-vreg buf vs 'r13)
+              (emit-mov-mem-reg buf 'rax 'r13 -1)
+              (emit-pop buf 'r13)
+              (emit-pop buf 'rax)))))
+
+        ((op= +op-setcdr+)
+         ;; (setcdr Vd Vs) — [Vd + 7] = Vs
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (pd (vreg-phys vd))
+                (ps (vreg-phys vs)))
+           (cond
+             ((and pd ps)
+              (emit-mov-mem-reg buf pd ps 7))
+             ((and pd (null ps))
+              (emit-push buf 'rax)
+              (emit-load-vreg buf vs 'rax)
+              (emit-mov-mem-reg buf pd 'rax 7)
+              (emit-pop buf 'rax))
+             ((and (null pd) ps)
+              (emit-push buf 'rax)
+              (emit-load-vreg buf vd 'rax)
+              (emit-mov-mem-reg buf 'rax ps 7)
+              (emit-pop buf 'rax))
+             (t
+              (emit-push buf 'rax)
+              (emit-push buf 'r13)
+              (emit-load-vreg buf vd 'rax)
+              (emit-load-vreg buf vs 'r13)
+              (emit-mov-mem-reg buf 'rax 'r13 7)
+              (emit-pop buf 'r13)
+              (emit-pop buf 'rax)))))
+
+        ((op= +op-consp+)
+         ;; (consp Vd Vs) — test low bit for cons tag (0x01)
+         ;; Result: T or NIL in Vd
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd))
+                (true-label (make-label))
+                (end-label (make-label)))
+           (emit-load-vreg buf vs d)
+           ;; Test low 4 bits: AND with 0x0F, compare to 0x01
+           (emit-and-reg-imm buf d #x0F)
+           (emit-cmp-reg-imm buf d 1)
+           (emit-jcc buf :e true-label)
+           ;; Not a cons: load NIL
+           (emit-mov-reg-reg buf d 'r15)
+           (emit-jmp buf end-label)
+           ;; Is a cons: load T placeholder
+           (emit-label buf true-label)
+           ;; T is typically at a known address; for now use a tagged marker
+           ;; that the runtime will recognise.  We use ~NIL (all bits set
+           ;; except low 4 = object tag 0x09) as a portable T indicator.
+           (emit-mov-reg-imm buf d #xDEAD1009)
+           (emit-label buf end-label)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-atom+)
+         ;; (atom Vd Vs) — opposite of consp
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd))
+                (true-label (make-label))
+                (end-label (make-label)))
+           (emit-load-vreg buf vs d)
+           (emit-and-reg-imm buf d #x0F)
+           (emit-cmp-reg-imm buf d 1)
+           (emit-jcc buf :ne true-label)
+           ;; Is a cons → atom returns NIL
+           (emit-mov-reg-reg buf d 'r15)
+           (emit-jmp buf end-label)
+           ;; Not a cons → atom returns T
+           (emit-label buf true-label)
+           (emit-mov-reg-imm buf d #xDEAD1009)
+           (emit-label buf end-label)
+           (maybe-store-scratch buf vd)))
+
+        ;; ============================================
+        ;; Object Operations
+        ;; ============================================
+        ((op= +op-alloc-obj+)
+         ;; (alloc-obj Vd size:imm16 subtag:imm8)
+         ;; Allocate SIZE bytes from bump allocator.
+         ;; Write header word at [R12]: (size << 8) | subtag
+         ;; Result = R12 | 0x09 (object tag), advance R12 by size.
+         (let* ((vd (first operands))
+                (size (second operands))
+                (subtag (third operands))
+                (d (dest-phys-or-scratch vd))
+                (header (logior (ash size 8) subtag)))
+           ;; Write header
+           (emit-mov-reg-imm buf +scratch-reg+ header)
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; Result = R12 | object-tag
+           (emit-lea buf d 'r12 #x09)
+           ;; Advance alloc pointer by size (aligned to 16)
+           (let ((aligned-size (logand (+ size 15) (lognot 15))))
+             (emit-add-reg-imm buf 'r12 aligned-size))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-obj-ref+)
+         ;; (obj-ref Vd Vobj idx:imm8) — load slot at offset
+         (let* ((vd (first operands))
+                (vobj (second operands))
+                (idx (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (if (= vobj +vreg-vfp+)
+               ;; Frame slot access: use safe RBP-relative offset below spill area
+               (emit-mov-reg-mem buf d 'rbp (+ +frame-slot-base+ (* idx -8)))
+               ;; Normal object slot access
+               ;; Slot address = (Vobj - 9) + 8 + idx*8 = Vobj + (idx*8 - 1)
+               (let ((offset (+ (* idx 8) -1 8))
+                     (po (vreg-phys vobj)))
+                 (if po
+                     (emit-mov-reg-mem buf d po offset)
+                     (progn
+                       (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                         (emit-push buf tmp)
+                         (emit-load-vreg buf vobj tmp)
+                         (emit-mov-reg-mem buf d tmp offset)
+                         (emit-pop buf tmp))))))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-obj-set+)
+         ;; (obj-set Vobj idx:imm8 Vs) — store slot
+         (let* ((vobj (first operands))
+                (idx (second operands))
+                (vs (third operands)))
+           (if (= vobj +vreg-vfp+)
+               ;; Frame slot store: use safe RBP-relative offset below spill area
+               (let ((ps (vreg-phys vs)))
+                 (if ps
+                     (emit-mov-mem-reg buf 'rbp ps (+ +frame-slot-base+ (* idx -8)))
+                     (progn
+                       (emit-push buf 'rax)
+                       (emit-load-vreg buf vs 'rax)
+                       (emit-mov-mem-reg buf 'rbp 'rax (+ +frame-slot-base+ (* idx -8)))
+                       (emit-pop buf 'rax))))
+               ;; Normal object slot store
+               (let ((offset (+ (* idx 8) -1 8))
+                     (po (vreg-phys vobj))
+                     (ps (vreg-phys vs)))
+                 (cond
+                   ((and po ps)
+                    (emit-mov-mem-reg buf po ps offset))
+                   ((and po (null ps))
+                    (emit-push buf 'rax)
+                    (emit-load-vreg buf vs 'rax)
+                    (emit-mov-mem-reg buf po 'rax offset)
+                    (emit-pop buf 'rax))
+                   ((and (null po) ps)
+                    (emit-push buf 'rax)
+                    (emit-load-vreg buf vobj 'rax)
+                    (emit-mov-mem-reg buf 'rax ps offset)
+                    (emit-pop buf 'rax))
+                   (t
+                    (emit-push buf 'rax)
+                    (emit-push buf 'r13)
+                    (emit-load-vreg buf vobj 'rax)
+                    (emit-load-vreg buf vs 'r13)
+                    (emit-mov-mem-reg buf 'rax 'r13 offset)
+                    (emit-pop buf 'r13)
+                    (emit-pop buf 'rax)))))))
+
+        ((op= +op-obj-tag+)
+         ;; (obj-tag Vd Vs) — extract low 4 bits
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf vs d)
+           (emit-and-reg-imm buf d #x0F)
+           ;; Tag result as fixnum: SHL 1
+           (emit-shl-reg-imm buf d 1)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-obj-subtag+)
+         ;; (obj-subtag Vd Vs) — extract subtag from header word
+         ;; Header is at [Vs - 9] (untag object pointer)
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (d (dest-phys-or-scratch vd)))
+           (let ((ps (vreg-phys vs)))
+             (if ps
+                 (emit-mov-reg-mem buf d ps -9)
+                 (progn
+                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                     (emit-push buf tmp)
+                     (emit-load-vreg buf vs tmp)
+                     (emit-mov-reg-mem buf d tmp -9)
+                     (emit-pop buf tmp)))))
+           ;; Extract low 8 bits of header as subtag
+           (emit-and-reg-imm buf d #xFF)
+           ;; Tag as fixnum
+           (emit-shl-reg-imm buf d 1)
+           (maybe-store-scratch buf vd)))
+
+        ;; ============================================
+        ;; Raw Memory Operations
+        ;; ============================================
+        ((op= +op-load+)
+         ;; (load Vd Vaddr width:imm8) — raw memory read
+         ;; Width: 0=u8, 1=u16, 2=u32, 3=u64
+         (let* ((vd (first operands))
+                (vaddr (second operands))
+                (width (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; Get address into a temp
+           (let ((pa (vreg-phys vaddr)))
+             (unless pa
+               (emit-load-vreg buf vaddr 'rax)
+               (setf pa 'rax))
+             (ecase width
+               (0 ;; u8: MOVZX r64, byte [addr]
+                ;; REX.W 0F B6 /r (ModRM: [reg])
+                (emit-movzx-byte buf d pa))
+               (1 ;; u16: MOVZX r64, word [addr]
+                (emit-movzx-word buf d pa))
+               (2 ;; u32: MOV r32, [addr] (zero-extends to 64)
+                (emit-mov-reg32-mem buf d pa))
+               (3 ;; u64: MOV r64, [addr]
+                (emit-mov-reg-mem buf d pa 0))))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-store+)
+         ;; (store Vaddr Vs width:imm8) — raw memory write
+         (let* ((vaddr (first operands))
+                (vs (second operands))
+                (width (third operands))
+                (pa (vreg-phys vaddr))
+                (ps (vreg-phys vs)))
+           ;; Need address in one register, value in another
+           (unless pa
+             (emit-push buf 'rax)
+             (emit-load-vreg buf vaddr 'rax)
+             (setf pa 'rax))
+           (unless ps
+             (emit-push buf 'r13)
+             (emit-load-vreg buf vs 'r13)
+             (setf ps 'r13))
+           (ecase width
+             (0 (emit-mov-mem-byte buf pa ps))
+             (1 (emit-mov-mem-word buf pa ps))
+             (2 (emit-mov-mem-dword buf pa ps))
+             (3 (emit-mov-mem-reg buf pa ps 0)))
+           ;; Restore temps if we pushed them
+           (when (vreg-spills-p vs) (emit-pop buf 'r13))
+           (when (vreg-spills-p vaddr) (emit-pop buf 'rax))))
+
+        ((op= +op-fence+)
+         ;; MFENCE: 0F AE F0
+         (emit-bytes buf #x0F #xAE #xF0))
+
+        ;; ============================================
+        ;; Function Calling
+        ;; ============================================
+        ((op= +op-call+)
+         ;; (call target:imm32)
+         ;; Target operand is the bytecode offset of the called function.
+         (let* ((target-offset (first operands))
+                (fn-table (translate-state-function-table state))
+                (label (when fn-table (gethash target-offset fn-table))))
+           (if label
+               (emit-call buf label)
+               ;; Unknown target — emit CALL rel32 with placeholder
+               (emit-call buf (make-label)))))
+
+        ((op= +op-call-ind+)
+         ;; (call-ind Vs) — indirect call through register
+         (let* ((vs (first operands))
+                (ps (vreg-phys vs)))
+           (if ps
+               (emit-call-reg buf ps)
+               (progn
+                 (emit-load-vreg buf vs +scratch-reg+)
+                 (emit-call-reg buf +scratch-reg+)))))
+
+        ((op= +op-ret+)
+         ;; Return: restore RBX, tear down frame and return
+         (emit-mov-reg-mem buf 'rbx 'rbp -8)
+         (emit-mov-reg-reg buf 'rsp 'rbp)
+         (emit-pop buf 'rbp)
+         (emit-ret buf))
+
+        ((op= +op-tailcall+)
+         ;; (tailcall target:imm32) — tear down frame and jump
+         ;; Target operand is the bytecode offset of the called function.
+         (let* ((target-offset (first operands))
+                (fn-table (translate-state-function-table state))
+                (label (when fn-table (gethash target-offset fn-table))))
+           ;; Restore RBX, tear down frame
+           (emit-mov-reg-mem buf 'rbx 'rbp -8)
+           (emit-mov-reg-reg buf 'rsp 'rbp)
+           (emit-pop buf 'rbp)
+           ;; Jump instead of call
+           (if label
+               (emit-jmp buf label)
+               (emit-jmp buf (make-label)))))
+
+        ;; ============================================
+        ;; GC and Allocation
+        ;; ============================================
+        ((op= +op-alloc-cons+)
+         ;; (alloc-cons Vd) — bump-allocate cons cell, tag as cons
+         ;; Result = R12 | 1, R12 += 16
+         (let* ((vd (first operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-mov-reg-reg buf d 'r12)
+           (emit-or-reg-imm buf d 1)      ; tag as cons
+           (emit-add-reg-imm buf 'r12 16)  ; advance alloc pointer
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-gc-check+)
+         ;; Check R12 (alloc ptr) against R14 (alloc limit)
+         ;; If R12 >= R14, call GC
+         (let ((skip-label (make-label)))
+           (emit-cmp-reg-reg buf 'r12 'r14)
+           (emit-jcc buf :l skip-label)    ; if alloc < limit, skip
+           ;; Call GC routine.  The GC label is set up once per
+           ;; translation unit; if not available, emit INT 0x31.
+           (let ((gc-lbl (translate-state-gc-label state)))
+             (if gc-lbl
+                 (emit-call buf gc-lbl)
+                 (emit-int buf #x31)))     ; trap to GC handler
+           (emit-label buf skip-label)))
+
+        ((op= +op-write-barrier+)
+         ;; (write-barrier Vobj) — mark card table dirty
+         ;; For now emit a stub: the card table is addressed by
+         ;; shifting the object address right by page bits and
+         ;; writing a dirty byte.  This is a placeholder that the
+         ;; runtime GC will configure.
+         (let* ((vobj (first operands))
+                (po (vreg-phys vobj)))
+           (unless po
+             (emit-load-vreg buf vobj 'rax)
+             (setf po 'rax))
+           ;; SHR po, 12 (page bits); then write 1 to card table
+           ;; This is a stub — actual implementation depends on the
+           ;; GC card table base address.
+           (emit-nop buf)))
+
+        ;; ============================================
+        ;; Actor / Concurrency
+        ;; ============================================
+        ((op= +op-save-ctx+)
+         ;; Save all callee-saved registers to the stack
+         ;; Used when suspending an actor
+         (emit-push buf 'rbx)
+         (emit-push buf 'r12)
+         (emit-push buf 'r13)
+         (emit-push buf 'r14)
+         (emit-push buf 'r15))
+
+        ((op= +op-restore-ctx+)
+         ;; Restore callee-saved registers
+         (emit-pop buf 'r15)
+         (emit-pop buf 'r14)
+         (emit-pop buf 'r13)
+         (emit-pop buf 'r12)
+         (emit-pop buf 'rbx))
+
+        ((op= +op-yield+)
+         ;; Preemption check: decrement a yield counter and call the
+         ;; scheduler if it reaches zero.  Stub: emit NOP for now.
+         (emit-nop buf))
+
+        ((op= +op-atomic-xchg+)
+         ;; (atomic-xchg Vd Vaddr Vs) — LOCK XCHG [Vaddr], Vs → Vd
+         ;; x86 XCHG with memory is implicitly locked.
+         (let* ((vd (first operands))
+                (vaddr (second operands))
+                (vs (third operands)))
+           ;; Load Vs into RAX
+           (emit-load-vreg buf vs 'rax)
+           ;; Get address into a temp
+           (let ((pa (vreg-phys vaddr)))
+             (unless pa
+               (emit-push buf 'r13)
+               (emit-load-vreg buf vaddr 'r13)
+               (setf pa 'r13))
+             ;; XCHG [pa], RAX
+             ;; REX.W 87 /r (ModRM mod=00 for [reg])
+             (emit-xchg-mem-reg buf pa 'rax)
+             (when (vreg-spills-p vaddr)
+               (emit-pop buf 'r13)))
+           ;; Result (old value) is in RAX
+           (emit-store-vreg buf vd 'rax)))
+
+        ;; ============================================
+        ;; I/O Port Operations
+        ;; ============================================
+        ((op= +op-io-read+)
+         ;; (io-read Vd port:imm16 width:imm8)
+         ;; IN AL/AX/EAX, DX
+         (let* ((vd (first operands))
+                (port (second operands))
+                (width (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; Load port number into DX
+           (emit-mov-reg-imm buf 'edx port)
+           ;; IN instruction
+           (ecase width
+             (0 ;; byte: IN AL, DX
+              (emit-bytes buf #xEC)
+              ;; Zero-extend AL to RAX
+              (emit-bytes buf #x48 #x0F #xB6 #xC0)) ; movzx rax, al
+             (1 ;; word: IN AX, DX
+              (emit-bytes buf #x66 #xED)
+              ;; Zero-extend AX to RAX
+              (emit-bytes buf #x48 #x0F #xB7 #xC0)) ; movzx rax, ax
+             (2 ;; dword: IN EAX, DX (auto zero-extends to RAX)
+              (emit-bytes buf #xED)))
+           ;; Tag as fixnum: SHL RAX, 1
+           (emit-shl-reg-imm buf 'rax 1)
+           ;; Move result to destination
+           (unless (eq d 'rax)
+             (emit-mov-reg-reg buf d 'rax))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-io-write+)
+         ;; (io-write port:imm16 Vs width:imm8)
+         ;; OUT DX, AL/AX/EAX
+         (let* ((port (first operands))
+                (vs (second operands))
+                (width (third operands)))
+           ;; Load port into DX
+           (emit-mov-reg-imm buf 'edx port)
+           ;; Load value into RAX, untag
+           (emit-load-vreg buf vs 'rax)
+           (emit-sar-reg-imm buf 'rax 1)
+           ;; OUT instruction
+           (ecase width
+             (0 (emit-bytes buf #xEE))       ; OUT DX, AL
+             (1 (emit-bytes buf #x66 #xEF))  ; OUT DX, AX
+             (2 (emit-bytes buf #xEF)))))     ; OUT DX, EAX
+
+        ((op= +op-halt+)
+         ;; HLT: F4
+         (emit-bytes buf #xF4))
+
+        ((op= +op-cli+)
+         ;; CLI: FA
+         (emit-bytes buf #xFA))
+
+        ((op= +op-sti+)
+         ;; STI: FB
+         (emit-bytes buf #xFB))
+
+        ;; ============================================
+        ;; Per-CPU Data
+        ;; ============================================
+        ((op= +op-percpu-ref+)
+         ;; (percpu-ref Vd offset:imm16)
+         ;; Read from GS segment: MOV reg, GS:[offset]
+         ;; Prefix 65, REX.W 8B /05 disp32
+         (let* ((vd (first operands))
+                (offset (second operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; GS prefix + MOV r64, [disp32]
+           ;; 65 REX.W 8B /05 disp32  (RIP-relative, but we use absolute)
+           ;; Actually for GS:[disp32] with no base: 65 REX.W 8B 04 25 disp32
+           (emit-byte buf #x65)                   ; GS prefix
+           (emit-byte buf (rex-prefix t (reg-extended-p d) nil nil))
+           (emit-byte buf #x8B)                    ; MOV r64, r/m64
+           ;; ModRM: mod=00 r/m=100 (SIB follows), reg=d
+           (emit-byte buf (modrm #b00 (reg-code d) 4))
+           ;; SIB: scale=00 index=100(none) base=101(disp32)
+           (emit-byte buf #x25)
+           (emit-u32 buf offset)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-percpu-set+)
+         ;; (percpu-set offset:imm16 Vs)
+         ;; Write to GS segment: MOV GS:[offset], reg
+         (let* ((offset (first operands))
+                (vs (second operands))
+                (ps (vreg-phys vs)))
+           (unless ps
+             (emit-load-vreg buf vs 'rax)
+             (setf ps 'rax))
+           ;; GS prefix + MOV [disp32], r64
+           (emit-byte buf #x65)                    ; GS prefix
+           (emit-byte buf (rex-prefix t (reg-extended-p ps) nil nil))
+           (emit-byte buf #x89)                    ; MOV r/m64, r64
+           (emit-byte buf (modrm #b00 (reg-code ps) 4))
+           (emit-byte buf #x25)                    ; SIB for disp32
+           (emit-u32 buf offset)))
+
+        ;; ============================================
+        ;; Unknown Opcode
+        ;; ============================================
+        (t
+         ;; Emit a trap for unrecognised MVM instructions
+         (emit-int buf #x30)
+         (emit-byte buf opcode))))))
+
+;;; ============================================================
+;;; x86-64 Encoding Helpers
+;;; ============================================================
+
+(defun rex-prefix (w r x b)
+  "Build a REX prefix byte.  W=64-bit operand, R=ModRM reg ext,
+   X=SIB index ext, B=ModRM r/m or SIB base ext.
+   Each argument is a generalized boolean."
+  (logior #x40
+          (if w 8 0)
+          (if r 4 0)
+          (if x 2 0)
+          (if b 1 0)))
+
+(defun modrm (mod reg rm)
+  "Build a ModR/M byte.  MOD=2-bit, REG=3-bit, RM=3-bit.
+   REG and RM should already be masked to low 3 bits."
+  (logior (ash (logand mod #b11) 6)
+          (ash (logand reg #b111) 3)
+          (logand rm #b111)))
+
+;;; ============================================================
+;;; Additional x86-64 Instruction Emitters
+;;; ============================================================
+;;;
+;;; These instructions are not in x64-asm.lisp but are needed by
+;;; the translator.  They emit raw machine code bytes.
+
+(defun emit-imul-reg-reg (buf dst src)
+  "IMUL dst, src (two-operand signed multiply).
+   REX.W + 0F AF /r"
+  (let ((w t)
+        (r (reg-extended-p dst))
+        (b (reg-extended-p src)))
+    (emit-byte buf (rex-prefix w r nil b))
+    (emit-bytes buf #x0F #xAF)
+    (emit-byte buf (modrm #b11 (reg-code dst) (reg-code src)))))
+
+(defun emit-neg-reg (buf reg)
+  "NEG reg (two's complement negate).
+   REX.W + F7 /3"
+  (emit-byte buf (rex-prefix t nil nil (reg-extended-p reg)))
+  (emit-byte buf #xF7)
+  (emit-byte buf (modrm #b11 3 (reg-code reg))))
+
+(defun emit-movzx-byte (buf dst base)
+  "MOVZX dst, BYTE [base] — zero-extend byte to 64 bits.
+   REX.W + 0F B6 /r (ModRM for [base])"
+  (let ((r (reg-extended-p dst))
+        (b (reg-extended-p base)))
+    (emit-byte buf (rex-prefix t r nil b))
+    (emit-bytes buf #x0F #xB6)
+    ;; ModRM: mod=00, reg=dst, r/m=base
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5) ; RBP/R13 need disp8
+         (emit-byte buf (modrm #b01 (reg-code dst) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code dst) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code dst) (reg-code base))))))))
+
+(defun emit-movzx-word (buf dst base)
+  "MOVZX dst, WORD [base] — zero-extend word to 64 bits.
+   REX.W + 0F B7 /r"
+  (let ((r (reg-extended-p dst))
+        (b (reg-extended-p base)))
+    (emit-byte buf (rex-prefix t r nil b))
+    (emit-bytes buf #x0F #xB7)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code dst) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code dst) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code dst) (reg-code base))))))))
+
+(defun emit-mov-reg32-mem (buf dst base)
+  "MOV dst32, [base] — 32-bit load (zero-extends to 64).
+   No REX.W prefix (use 32-bit operand size).
+   8B /r"
+  (let ((r (reg-extended-p dst))
+        (b (reg-extended-p base)))
+    ;; REX needed only for extended registers, no W bit
+    (when (or r b)
+      (emit-byte buf (rex-prefix nil r nil b)))
+    (emit-byte buf #x8B)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code dst) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code dst) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code dst) (reg-code base))))))))
+
+(defun emit-mov-mem-byte (buf base src)
+  "MOV BYTE [base], src-low-byte.
+   REX + 88 /r"
+  (let ((r (reg-extended-p src))
+        (b (reg-extended-p base)))
+    ;; Need REX for SPL/BPL/SIL/DIL or extended regs
+    (emit-byte buf (rex-prefix nil r nil b))
+    (emit-byte buf #x88)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code src) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code src) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code src) (reg-code base))))))))
+
+(defun emit-mov-mem-word (buf base src)
+  "MOV WORD [base], src — 16-bit store.
+   66 prefix + 89 /r"
+  (let ((r (reg-extended-p src))
+        (b (reg-extended-p base)))
+    (emit-byte buf #x66) ; operand size override
+    (when (or r b)
+      (emit-byte buf (rex-prefix nil r nil b)))
+    (emit-byte buf #x89)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code src) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code src) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code src) (reg-code base))))))))
+
+(defun emit-mov-mem-dword (buf base src)
+  "MOV DWORD [base], src — 32-bit store.
+   89 /r (no REX.W)"
+  (let ((r (reg-extended-p src))
+        (b (reg-extended-p base)))
+    (when (or r b)
+      (emit-byte buf (rex-prefix nil r nil b)))
+    (emit-byte buf #x89)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code src) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code src) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code src) (reg-code base))))))))
+
+(defun emit-xchg-mem-reg (buf base reg)
+  "XCHG [base], reg — atomic exchange (implicit LOCK on x86).
+   REX.W + 87 /r"
+  (let ((r (reg-extended-p reg))
+        (b (reg-extended-p base)))
+    (emit-byte buf (rex-prefix t r nil b))
+    (emit-byte buf #x87)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((= (reg-code base) 5)
+         (emit-byte buf (modrm #b01 (reg-code reg) (reg-code base)))
+         (emit-byte buf 0))
+        (needs-sib
+         (emit-byte buf (modrm #b00 (reg-code reg) 4))
+         (emit-byte buf #x24))
+        (t
+         (emit-byte buf (modrm #b00 (reg-code reg) (reg-code base))))))))
+
+;;; ============================================================
+;;; Function Prologue / Epilogue
+;;; ============================================================
+
+(defun emit-function-prologue (buf)
+  "Emit the standard function prologue.
+   push rbp / mov rbp,rsp / sub rsp,frame_size / save RBX
+   In kernel mode, R12 (alloc ptr), R14 (alloc limit), R15 (nil) are global
+   state that must NOT be saved/restored.  RBX (V4) is callee-saved."
+  (emit-push buf 'rbp)
+  (emit-mov-reg-reg buf 'rbp 'rsp)
+  ;; Reserve space for callee-save + spill slots + frame slots
+  (emit-sub-reg-imm buf 'rsp +frame-total-size+)
+  ;; Save RBX (V4) as callee-saved register at [RBP-8]
+  (emit-mov-mem-reg buf 'rbp 'rbx -8))
+
+(defun emit-function-epilogue (buf)
+  "Emit the standard function epilogue.
+   Restore RBX / mov rsp,rbp / pop rbp / ret."
+  (emit-mov-reg-mem buf 'rbx 'rbp -8)
+  (emit-mov-reg-reg buf 'rsp 'rbp)
+  (emit-pop buf 'rbp)
+  (emit-ret buf))
+
+;;; ============================================================
+;;; Single Function Translation
+;;; ============================================================
+
+(defun translate-function (bytecode offset length target-buf)
+  "Translate a single MVM function starting at OFFSET in BYTECODE
+   for LENGTH bytes.  Native code is emitted into TARGET-BUF
+   (a code-buffer).  Returns the code-buffer."
+  (let* ((buf (or target-buf (make-code-buffer)))
+         (state (make-translate-state
+                 :buf buf
+                 :mvm-bytes bytecode
+                 :mvm-length length
+                 :mvm-offset offset)))
+    ;; Emit prologue
+    (emit-function-prologue buf)
+    ;; First pass: scan for branch targets and create labels
+    (scan-branch-targets state)
+    ;; Second pass: translate instructions
+    (let ((pos offset)
+          (limit (+ offset length)))
+      (loop while (< pos limit)
+            do (progn
+                 ;; If there is a label at this MVM position, emit it
+                 (let ((label (gethash pos (translate-state-position-labels state))))
+                   (when label
+                     (emit-label buf label)))
+                 ;; Decode and translate
+                 (multiple-value-bind (opcode operands new-pos)
+                     (decode-instruction bytecode pos)
+                   (translate-instruction state opcode operands new-pos)
+                   (setf pos new-pos)))))
+    ;; Resolve label fixups
+    (fixup-labels buf)
+    buf))
+
+(defun scan-branch-targets (state)
+  "Pre-scan MVM bytecode to identify all branch targets.
+   Creates labels for each target position so that forward branches
+   can be resolved during the translation pass."
+  (let* ((bytes (translate-state-mvm-bytes state))
+         (offset (translate-state-mvm-offset state))
+         (length (translate-state-mvm-length state))
+         (pos offset)
+         (limit (+ offset length)))
+    (loop while (< pos limit)
+          do (multiple-value-bind (opcode operands new-pos)
+                 (decode-instruction bytes pos)
+               ;; Check if this is a branch instruction
+               (let ((info (gethash opcode *opcode-table*)))
+                 (when info
+                   (let ((op-specs (opcode-info-operands info)))
+                     ;; Branch instructions have :off16 in their operand spec
+                     (when (member :off16 op-specs)
+                       ;; Find the offset operand
+                       (let ((off-idx (position :off16 op-specs)))
+                         (when off-idx
+                           (let* ((off (nth off-idx operands))
+                                  (target-pos (+ new-pos off)))
+                             (ensure-label-at state target-pos))))))))
+               (setf pos new-pos)))))
+
+;;; ============================================================
+;;; Full Bytecode Translation
+;;; ============================================================
+
+(defun translate-mvm-to-x64 (bytecode function-table)
+  "Translate MVM bytecode to x86-64 native code.
+   BYTECODE is a vector of (unsigned-byte 8) containing MVM instructions.
+   FUNCTION-TABLE is a list of (name offset length) entries describing
+   the functions within the bytecode.
+   Returns a code-buffer with the native code."
+  (let* ((buf (make-code-buffer))
+         (n-functions (length function-table))
+         ;; Create native labels for each function
+         (fn-labels (make-array n-functions))
+         (fn-map (make-hash-table :test 'equal))
+         ;; Map bytecode-offset → native label for CALL resolution
+         (fn-offset-to-label (make-hash-table :test 'eql)))
+    ;; Allocate a label for each function
+    (loop for i from 0 below n-functions
+          for entry in function-table
+          for name = (first entry)
+          for offset = (second entry)
+          do (let ((label (make-label)))
+               (setf (aref fn-labels i) label)
+               (setf (gethash name fn-map) label)
+               (setf (gethash offset fn-offset-to-label) label)))
+    ;; Translate each function
+    (loop for i from 0 below n-functions
+          for entry in function-table
+          for name = (first entry)
+          for offset = (second entry)
+          for length = (third entry)
+          do (let* ((fn-label (aref fn-labels i))
+                    (state (make-translate-state
+                            :buf buf
+                            :mvm-bytes bytecode
+                            :mvm-length length
+                            :mvm-offset offset
+                            :function-table fn-offset-to-label)))
+               ;; Emit function label
+               (emit-label buf fn-label)
+               ;; Emit prologue
+               (emit-function-prologue buf)
+               ;; Pre-scan branch targets
+               (scan-branch-targets state)
+               ;; Translate instructions
+               (let ((pos offset)
+                     (limit (+ offset length)))
+                 (loop while (< pos limit)
+                       do (progn
+                            ;; Emit label if branch target
+                            (let ((label (gethash pos
+                                                  (translate-state-position-labels state))))
+                              (when label
+                                (emit-label buf label)))
+                            ;; Decode and translate
+                            (multiple-value-bind (opcode operands new-pos)
+                                (decode-instruction bytecode pos)
+                              (handler-case
+                                  (translate-instruction state opcode operands new-pos)
+                                (error (c)
+                                  (error "~A (fn ~D '~A' mvm-pos ~D opcode ~D operands ~S)"
+                                         c i name pos opcode operands)))
+                              (setf pos new-pos)))))))
+    ;; Resolve all label fixups
+    (fixup-labels buf)
+    ;; Return result
+    (values buf fn-map)))
+
+;;; ============================================================
+;;; Target Descriptor Installation
+;;; ============================================================
+
+(defun install-x64-translator ()
+  "Install the x86-64 translator into the target descriptor.
+   Sets translate-fn, emit-prologue, and emit-epilogue on *target-x86-64*."
+  (setf (target-translate-fn modus64.mvm:*target-x86-64*)
+        #'translate-mvm-to-x64)
+  (setf (target-emit-prologue modus64.mvm:*target-x86-64*)
+        #'emit-function-prologue)
+  (setf (target-emit-epilogue modus64.mvm:*target-x86-64*)
+        #'emit-function-epilogue)
+  modus64.mvm:*target-x86-64*)
+
+(defun translate-single-instruction (opcode operands target buf)
+  "Translate one MVM instruction to native code.
+   Conforms to the target translate-fn signature:
+   (opcode operands target buf) → native code in buf."
+  (declare (ignore target))
+  (let ((state (make-translate-state :buf buf)))
+    ;; mvm-next-pos is not meaningful for a single instruction
+    ;; (branches will need fixup at a higher level)
+    (translate-instruction state opcode operands 0)))
+
+;;; ============================================================
+;;; Utilities
+;;; ============================================================
+
+(defun translated-code-bytes (buf)
+  "Return the native code bytes from a code-buffer as a simple vector."
+  (let* ((bytes (code-buffer-bytes buf))
+         (len (fill-pointer bytes))
+         (result (make-array len :element-type '(unsigned-byte 8))))
+    (replace result bytes)
+    result))
+
+(defun disassemble-native (buf &key (start 0) (end nil))
+  "Print a hex dump of the native code in BUF for debugging."
+  (let* ((bytes (code-buffer-bytes buf))
+         (limit (or end (fill-pointer bytes))))
+    (loop for pos from start below limit
+          do (when (zerop (mod (- pos start) 16))
+               (when (> pos start) (terpri))
+               (format t "  ~4,'0X: " pos))
+             (format t "~2,'0X " (aref bytes pos)))
+    (terpri)))
+
+(defun translation-statistics (bytecode-length native-buf)
+  "Return statistics about the translation.
+   Values: native-length, expansion-ratio."
+  (let ((native-length (code-buffer-position native-buf)))
+    (values native-length
+            (if (zerop bytecode-length)
+                0.0
+                (float (/ native-length bytecode-length))))))

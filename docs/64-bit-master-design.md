@@ -1,5 +1,7 @@
 # Modus 64-bit Lisp OS: Master Design Document
 
+**Note**: This is the original design document. The core architecture (tagging, memory layout, GC, register convention) is implemented as described. The system now also includes the MVM portable virtual machine (9 architectures) and full SMP support not covered here. See `mvm.md` and `actors.md` for those additions.
+
 ## Vision
 
 A native 64-bit Lisp operating system that runs on bare metal x86-64 hardware.

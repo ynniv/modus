@@ -1,5 +1,7 @@
 # Modus 64-bit Implementation Plan
 
+**Note**: This is the original implementation roadmap. All phases are complete. The actual implementation added the MVM portable virtual machine (9 architectures), self-hosting, and SMP beyond what was originally planned. See `mvm.md` and `actors.md` for current architecture.
+
 ## Overview
 
 This document breaks down the implementation into concrete tasks with

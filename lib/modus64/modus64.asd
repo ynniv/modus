@@ -11,12 +11,30 @@
   :depends-on ()
   :serial t
   :components
-  ((:module "cross"
+  ((:module "cross-base"
     :serial t
+    :pathname "cross"
     :components
     ((:file "packages")
-     (:file "x64-asm")
-     (:file "cross-compile")
+     (:file "x64-asm")))
+   (:module "mvm"
+    :serial t
+    :depends-on ("cross-base")
+    :components
+    ((:file "mvm")
+     (:file "target")
+     (:file "compiler")))
+   (:module "mvm-x64"
+    :depends-on ("cross-base" "mvm")
+    :pathname "mvm"
+    :components
+    ((:file "translate-x64")))
+   (:module "cross"
+    :serial t
+    :depends-on ("cross-base")
+    :pathname "cross"
+    :components
+    ((:file "cross-compile")
      (:file "build")))
    (:module "boot"
     :serial t
