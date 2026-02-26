@@ -33,6 +33,7 @@
 (mvm-load "boot/boot-x64.lisp")
 (mvm-load "boot/boot-riscv.lisp")
 (mvm-load "boot/boot-aarch64.lisp")
+(mvm-load "boot/boot-rpi.lisp")
 (mvm-load "boot/boot-ppc64.lisp")
 (mvm-load "boot/boot-ppc32.lisp")
 (mvm-load "boot/boot-i386.lisp")
@@ -107,7 +108,8 @@
 
 (format t "~%Building kernel images...~%")
 
-(dolist (target-name (list-targets))
+;; Build for all registered targets plus board-specific variants
+(dolist (target-name (append (list-targets) '(:rpi)))
   (let ((bin-path (format nil "~A~(~A~).bin" *output-dir* target-name))
         (code-path (format nil "~A~(~A~).code" *output-dir* target-name)))
     (handler-case

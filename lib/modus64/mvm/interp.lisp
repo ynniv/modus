@@ -283,6 +283,24 @@
                        (tag-fixnum (ash (untag-fixnum (svref regs vs)) (- amt))))
                  (setf pc npc3)))))
 
+          (#.+op-shlv+ ; shift left by register
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (tag-fixnum (ash (untag-fixnum (svref regs vs))
+                                       (untag-fixnum (svref regs vc)))))
+                 (setf pc npc3)))))
+
+          (#.+op-sarv+ ; arithmetic shift right by register
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (vs npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vc npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (tag-fixnum (ash (untag-fixnum (svref regs vs))
+                                       (- (untag-fixnum (svref regs vc))))))
+                 (setf pc npc3)))))
+
           (#.+op-ldb+ ; bit field extract
            (multiple-value-bind (vd npc) (fetch-reg bc pc)
              (multiple-value-bind (vs npc2) (fetch-reg bc npc)

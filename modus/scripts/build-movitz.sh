@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build the Modus bootable image
+# build-movitz.sh — Build the Modus32 (Movitz) bootable image
 
 set -e
 cd "$(dirname "$0")/../.."
@@ -30,5 +30,5 @@ sbcl --non-interactive \
 
 echo "======================================"
 echo "Build successful: $OUTPUT"
-echo "Run with: ./modus/scripts/run.sh"
+echo "Run with: ./modus/scripts/run-movitz-repl.sh"
 echo "======================================"

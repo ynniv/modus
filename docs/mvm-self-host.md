@@ -63,7 +63,7 @@ pmemsave(val=0x08000000, size=image_size, filename="gen1.elf")
 ### Build script
 
 ```bash
-./modus/scripts/run-modus64-self-hosted-ssh.sh --rebuild --repl
+./modus/scripts/run-x64-gen1-repl.sh --rebuild
 ```
 
 This script:

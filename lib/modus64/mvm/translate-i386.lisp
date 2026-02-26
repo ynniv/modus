@@ -485,6 +485,16 @@
              (i386-emit-byte buf (i386-modrm #b11 7 reg))
              (i386-emit-byte buf count))))
 
+(defun i386-emit-shl-reg-cl (buf reg)
+  "SHL reg, CL — shift left by count in CL"
+  (i386-emit-byte buf #xD3)
+  (i386-emit-byte buf (i386-modrm #b11 4 reg)))
+
+(defun i386-emit-sar-reg-cl (buf reg)
+  "SAR reg, CL — arithmetic shift right by count in CL"
+  (i386-emit-byte buf #xD3)
+  (i386-emit-byte buf (i386-modrm #b11 7 reg)))
+
 ;;; --- Multiply / Divide ---
 
 (defun i386-emit-imul-reg-reg (buf dst src)
@@ -950,6 +960,23 @@
          (let ((vd (first operands)) (vs (second operands)) (amt (third operands)))
            (i386-load-vreg buf +i386-eax+ vs)
            (i386-emit-sar-reg-imm buf +i386-eax+ amt)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-shlv+)
+         ;; (shlv Vd Vs Vc) — shift left by register count
+         ;; Load count into ECX (CL), source into EAX, SHL EAX,CL
+         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
+           (i386-load-vreg buf +i386-ecx+ vc)
+           (i386-load-vreg buf +i386-eax+ vs)
+           (i386-emit-shl-reg-cl buf +i386-eax+)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-sarv+)
+         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
+         (let ((vd (first operands)) (vs (second operands)) (vc (third operands)))
+           (i386-load-vreg buf +i386-ecx+ vc)
+           (i386-load-vreg buf +i386-eax+ vs)
+           (i386-emit-sar-reg-cl buf +i386-eax+)
            (i386-store-vreg buf vd +i386-eax+)))
 
         ((op= +op-ldb+)

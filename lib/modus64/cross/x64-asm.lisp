@@ -379,6 +379,24 @@
         (emit-byte buf (modrm #b11 7 (reg-code reg)))
         (emit-byte buf count))))
 
+(defun emit-shl-reg-cl (buf reg)
+  "SHL reg, CL — shift left by count in CL register."
+  (emit-rex-if-needed buf reg nil)
+  (emit-byte buf #xD3)
+  (emit-byte buf (modrm #b11 4 (reg-code reg))))
+
+(defun emit-shr-reg-cl (buf reg)
+  "SHR reg, CL — logical shift right by count in CL register."
+  (emit-rex-if-needed buf reg nil)
+  (emit-byte buf #xD3)
+  (emit-byte buf (modrm #b11 5 (reg-code reg))))
+
+(defun emit-sar-reg-cl (buf reg)
+  "SAR reg, CL — arithmetic shift right by count in CL register."
+  (emit-rex-if-needed buf reg nil)
+  (emit-byte buf #xD3)
+  (emit-byte buf (modrm #b11 7 (reg-code reg))))
+
 ;;; Jumps and Calls
 
 (defun emit-jmp (buf target)

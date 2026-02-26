@@ -38,9 +38,10 @@ Modus has two runtime targets:
 - Real-time clock: `(print-time)`, `(unix-time)`
 
 **Networking and crypto**
-- E1000 driver with TCP/IP, UDP, DHCP, DNS, ICMP
+- E1000 driver with TCP/IP, UDP, DHCP, DNS, ICMP (x86-64 and AArch64)
 - SSH server (multi-connection, Ed25519, X25519, ChaCha20-Poly1305)
-- Crypto: SHA-256, X25519, Ed25519, ChaCha20, Poly1305
+- Crypto: SHA-256, SHA-512, X25519, Ed25519, ChaCha20, Poly1305
+- Shared networking code with thin arch adapters (x86 I/O ports vs AArch64 ECAM PCI)
 
 **Concurrency**
 - Erlang-style actors: `spawn`, `send`, `receive`, `link`
@@ -56,23 +57,39 @@ Requires SBCL and QEMU.
 ### Modus32
 
 ```bash
-./modus/scripts/build.sh           # build image
-./modus/scripts/run.sh             # boot to serial REPL
-./modus/scripts/run-ssh-server.sh  # boot with SSH on port 2222
+./modus/scripts/build-movitz.sh       # build image
+./modus/scripts/run-movitz-repl.sh    # boot to serial REPL
+./modus/scripts/run-movitz-ssh.sh     # boot with SSH on port 2222
 ```
 
 ### Modus64
 
 ```bash
-./modus/scripts/run-modus64.sh       # boot to serial REPL
-./modus/scripts/run-modus64-ssh.sh   # boot with SSH networking
+./modus/scripts/run-x64-repl.sh      # boot to serial REPL
+./modus/scripts/run-x64-ssh.sh       # boot with SSH networking
 ```
 
 ### Self-hosted Modus64
 
 ```bash
-./modus/scripts/run-modus64-self-hosted-ssh.sh        # Gen0 → Gen1, boot Gen1 with SSH
-./modus/scripts/run-modus64-self-hosted-ssh.sh --repl  # Gen1 REPL only
+./modus/scripts/run-x64-gen1-ssh.sh          # Gen0 → Gen1, boot Gen1 with SSH
+./modus/scripts/run-x64-gen1-repl.sh         # Gen1 REPL only
+./modus/scripts/run-x64-gen1-repl.sh --rebuild  # force full rebuild
+```
+
+### AArch64 (QEMU virt)
+
+```bash
+./modus/scripts/run-aarch64-repl.sh  # AArch64 REPL on QEMU virt
+./modus/scripts/run-aarch64-ssh.sh   # AArch64 with SSH networking (E1000, port 2222)
+```
+
+Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
+
+### RPi REPL
+
+```bash
+./modus/scripts/run-rpi-repl.sh      # AArch64 REPL on emulated raspi3b
 ```
 
 SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely. Build artifacts are cached by content hash.
@@ -81,7 +98,14 @@ SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-6
 
 ```
 lib/modus64/
-  cross/                 Cross-compiler, x64 assembler, runtime (build.lisp ~17K lines)
+  cross/                 Cross-compiler, x64 assembler, runtime (build.lisp ~13K lines)
+  net/                   Shared networking/crypto/SSH (arch-independent, ~4800 lines)
+    arch-x86.lisp        x86 PCI I/O, addresses
+    arch-aarch64.lisp    AArch64 ECAM PCI, addresses
+    e1000.lisp           E1000 network driver
+    ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
+    crypto.lisp          SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
+    ssh.lisp             SSH server (multi-connection)
   mvm/                   Modus Virtual Machine
     mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
     compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)
@@ -112,7 +136,7 @@ docs/                    Design documents
 
 MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
 
-All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). The other 8 targets boot and run serial output programs.
+All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via QEMU virt (PCI ECAM + E1000). The other 7 targets boot and run serial output programs.
 
 ### Tagged objects
 

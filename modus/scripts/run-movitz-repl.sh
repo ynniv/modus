@@ -1,9 +1,9 @@
 #!/bin/bash
-# Run Modus in QEMU
+# run-movitz-repl.sh — Run Modus32 (Movitz) in QEMU
 #
 # Usage:
-#   ./run.sh              # interactive REPL
-#   ./run.sh '(+ 1 2)'   # evaluate expression and exit
+#   ./run-movitz-repl.sh              # interactive REPL
+#   ./run-movitz-repl.sh '(+ 1 2)'   # evaluate expression and exit
 
 cd "$(dirname "$0")/../.."
 
@@ -12,7 +12,7 @@ LOGDIR="modus/log"
 mkdir -p "$LOGDIR"
 
 if [ ! -f "$IMAGE_PATH" ]; then
-  echo "Error: Image '$IMAGE_PATH' not found. Run ./modus/scripts/build.sh first."
+  echo "Error: Image '$IMAGE_PATH' not found. Run ./modus/scripts/build-movitz.sh first."
   exit 1
 fi
 

@@ -1,31 +1,25 @@
 #!/bin/bash
-# Build and run a SELF-HOSTED Modus64 kernel
+# run-x64-gen1-ssh.sh — Build and run self-hosted Modus64 Gen1 (SSH server)
 #
 # Pipeline: SBCL cross-compiles Gen0, Gen0 natively compiles Gen1,
-# Gen1 boots with networking + SSH (or REPL-only with --repl).
+# Gen1 boots with networking + SSH.
 # Caches Gen0/Gen1 and skips rebuilds when source files are unchanged.
 #
 # Usage:
-#   ./run-modus64-self-hosted-ssh.sh [PORT]           # SSH mode (default port 2222)
-#   ./run-modus64-self-hosted-ssh.sh --repl            # REPL-only (no networking)
-#   ./run-modus64-self-hosted-ssh.sh --rebuild [...]   # Force full rebuild
-#
-# The kernel evaluates Lisp forms from -append, e.g.:
-#   -append "(progn (net-init-dhcp) (ed25519-init) (ssh-server 22))"
+#   ./run-x64-gen1-ssh.sh [PORT]             # SSH mode (default port 2222)
+#   ./run-x64-gen1-ssh.sh [PORT] --rebuild   # force full rebuild
 #
 # Connect with: ssh -p $PORT -o StrictHostKeyChecking=no test@localhost
 
 set -e
 cd "$(dirname "$0")/../.."
 
-MODE="ssh"
 PORT=2222
 FORCE=0
 for arg in "$@"; do
     case "$arg" in
-        --repl)   MODE="repl" ;;
         --rebuild) FORCE=1 ;;
-        *)        PORT="$arg" ;;
+        *)         PORT="$arg" ;;
     esac
 done
 
@@ -92,55 +86,47 @@ else
     echo "  Gen1: $(stat -c%s "$GEN1") bytes"
 fi
 
-# Step 3: Boot Gen1
-if [ "$MODE" = "repl" ]; then
-    echo "Step 3/3: Booting self-hosted kernel (REPL)..."
-    exec "$SCRIPTDIR/no-thp-exec" qemu-system-x86_64 \
-        -kernel "$GEN1" -m 512 \
-        -cpu qemu64 -smp 1 \
-        -nographic
-else
-    echo "Step 3/3: Booting self-hosted kernel with SSH..."
-    > "$LOGFILE"
-    "$SCRIPTDIR/no-thp-exec" qemu-system-x86_64 \
-        -kernel "$GEN1" -append "(progn (net-init-dhcp) (ed25519-init) (ssh-server 22))" -m 512 \
-        -cpu qemu64 -smp 1 \
-        -nographic \
-        -device 'e1000,netdev=net0,romfile=,rombar=0' \
-        -netdev "user,id=net0,hostfwd=tcp::${PORT}-:22" \
-        -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-        > "$LOGFILE" 2>&1 &
-    QEMU_PID=$!
+# Step 3: Boot Gen1 with SSH
+echo "Step 3/3: Booting self-hosted kernel with SSH..."
+> "$LOGFILE"
+"$SCRIPTDIR/no-thp-exec" qemu-system-x86_64 \
+    -kernel "$GEN1" -append "(progn (net-init-dhcp) (ed25519-init) (ssh-server 22))" -m 512 \
+    -cpu qemu64 -smp 1 \
+    -nographic \
+    -device 'e1000,netdev=net0,romfile=,rombar=0' \
+    -netdev "user,id=net0,hostfwd=tcp::${PORT}-:22" \
+    -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+    > "$LOGFILE" 2>&1 &
+QEMU_PID=$!
 
-    # Wait for SSH server
-    echo "  Waiting for SSH..."
-    TRIES=0
-    while [ $TRIES -lt 120 ]; do
-        if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo "QEMU exited unexpectedly. Log:"
-            cat "$LOGFILE"
-            exit 1
-        fi
-        if grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
-            break
-        fi
-        sleep 0.5
-        TRIES=$((TRIES + 1))
-    done
-
-    if ! grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
-        echo "Timed out waiting for SSH server. Log:"
+# Wait for SSH server
+echo "  Waiting for SSH..."
+TRIES=0
+while [ $TRIES -lt 120 ]; do
+    if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+        echo "QEMU exited unexpectedly. Log:"
         cat "$LOGFILE"
-        cleanup
         exit 1
     fi
+    if grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
+        break
+    fi
+    sleep 0.5
+    TRIES=$((TRIES + 1))
+done
 
-    echo ""
-    echo "Self-hosted Modus64 SSH server ready on port $PORT."
-    echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
-    echo ""
-    echo "Press Ctrl-C to stop."
-
-    wait "$QEMU_PID" 2>/dev/null
-    QEMU_PID=""
+if ! grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
+    echo "Timed out waiting for SSH server. Log:"
+    cat "$LOGFILE"
+    cleanup
+    exit 1
 fi
+
+echo ""
+echo "Self-hosted Modus64 SSH server ready on port $PORT."
+echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
+echo ""
+echo "Press Ctrl-C to stop."
+
+wait "$QEMU_PID" 2>/dev/null
+QEMU_PID=""

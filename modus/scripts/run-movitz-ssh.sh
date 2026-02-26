@@ -1,5 +1,5 @@
 #!/bin/bash
-# Run Modus SSH server - fire and forget
+# run-movitz-ssh.sh — Run Modus32 (Movitz) SSH server
 # Connect with: ssh -p 2222 -i ~/.ssh/id_ed25519 test@localhost
 
 cd "$(dirname "$0")/../.."

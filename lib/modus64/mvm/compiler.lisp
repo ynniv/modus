@@ -434,6 +434,7 @@
       ((string-equal op-name "+")        (compile-add (cdr form) env dest))
       ((string-equal op-name "-")        (compile-sub (cdr form) env dest))
       ((string-equal op-name "*")        (compile-mul (cdr form) env dest))
+      ((string-equal op-name "/")        (compile-div (cdr form) env dest))
       ((string-equal op-name "1+")       (compile-1+ (cadr form) env dest))
       ((string-equal op-name "1-")       (compile-1- (cadr form) env dest))
       ((string-equal op-name "TRUNCATE") (compile-truncate (cdr form) env dest))
@@ -495,6 +496,7 @@
 
       ;; --- Serial Console ---
       ((string-equal op-name "WRITE-CHAR-SERIAL") (compile-write-char-serial (cdr form) env dest))
+      ((string-equal op-name "READ-CHAR-SERIAL")  (compile-read-char-serial dest))
 
       ;; --- System Registers ---
       ((string-equal op-name "GET-ALLOC-PTR")   (compile-get-alloc-ptr dest))
@@ -931,6 +933,24 @@
          (emit-ir :pop dest)
          (emit-ir :mul dest dest temp)
          (free-temp-reg))))))
+
+(defun compile-div (args env dest)
+  "Compile (/ a b). Truncating integer division for tagged fixnums.
+   Push/pop dest around divisor to survive function calls."
+  (when (null args) (error "/ requires at least one argument"))
+  (if (null (cdr args))
+      ;; (/ x) = 1/x (not meaningful for integers, just return x)
+      (compile-form (car args) env dest)
+      ;; (/ a b ...) -- divide pairwise
+      (progn
+        (compile-form (car args) env dest)
+        (dolist (arg (cdr args))
+          (let ((temp (alloc-temp-reg)))
+            (emit-ir :push dest)
+            (compile-form arg env temp)
+            (emit-ir :pop dest)
+            (emit-ir :div dest dest temp)
+            (free-temp-reg))))))
 
 (defun compile-1+ (arg env dest)
   "Compile (1+ x) -> add tagged 1 (which is 2)"
@@ -1527,8 +1547,13 @@
          (let ((addr-reg (alloc-temp-reg)))
            ;; Compile value first
            (compile-form value-form env dest)
+           ;; Save value across address evaluation (may involve function calls
+           ;; that clobber caller-saved regs including dest)
+           (emit-ir :push dest)
            ;; Compile address
            (compile-form addr-form env addr-reg)
+           ;; Restore value
+           (emit-ir :pop dest)
            ;; Untag address
            (emit-ir :sar addr-reg addr-reg +fixnum-shift+)
            ;; Untag value for sub-64-bit stores
@@ -1707,6 +1732,12 @@
   (compile-form (car args) env +vreg-v0+)
   (emit-ir :trap #x0300)
   (emit-ir :li dest 0))
+
+(defun compile-read-char-serial (dest)
+  "Compile (read-char-serial) — read a character from the serial port.
+   Uses TRAP #x0301; result is a tagged fixnum char code in V0."
+  (emit-ir :trap #x0301)
+  (emit-ir :mov dest +vreg-v0+))
 
 (defun compile-sti (dest)
   "Compile (sti) - enable interrupts. Returns 0."
@@ -2159,12 +2190,10 @@
            (mvm-sar buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- Variable shift (reg + reg + reg) ----
-          ;; Encoded as the shift op with the third arg being a register
-          ;; The native backend interprets register vs immediate from context
           (:shl-var
-           (mvm-shl buf (second insn) (third insn) (fourth insn)))
+           (mvm-shlv buf (second insn) (third insn) (fourth insn)))
           (:sar-var
-           (mvm-sar buf (second insn) (third insn) (fourth insn)))
+           (mvm-sarv buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- Load Immediate ----
           (:li

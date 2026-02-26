@@ -51,6 +51,9 @@
    #:emit-shl-reg-imm
    #:emit-shr-reg-imm
    #:emit-sar-reg-imm
+   #:emit-shl-reg-cl
+   #:emit-shr-reg-cl
+   #:emit-sar-reg-cl
    #:emit-test-reg-reg
    #:emit-test-reg-imm
    #:emit-jmp

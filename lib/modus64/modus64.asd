@@ -43,4 +43,11 @@
     ((:file "multiboot")
      (:file "boot32")
      (:file "kernel64")
-     (:file "multiboot1")))))
+     (:file "multiboot1")))
+   (:module "boot-mvm"
+    :serial t
+    :depends-on ("mvm")
+    :pathname "boot"
+    :components
+    ((:file "boot-aarch64")
+     (:file "boot-rpi")))))

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Build and run Modus64 REPL
+# run-x64-repl.sh — Build and run Modus64 serial REPL
 # Ctrl-A X to quit QEMU
 # Ctrl-A C to toggle monitor
 

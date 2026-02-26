@@ -522,6 +522,51 @@
            (emit-sar-reg-imm buf d count)
            (maybe-store-scratch buf vd)))
 
+        ((op= +op-shlv+)
+         ;; (shlv Vd Vs Vc) — shift left by register count
+         ;; x86-64 variable shifts require count in CL (RCX)
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (vc (third operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vc))
+                (need-save (and (not (eq pc 'rcx))
+                                (not (eq d 'rcx)))))
+           ;; Load source into dest reg
+           (emit-load-vreg buf vs d)
+           ;; Get shift count into RCX
+           (cond
+             ((eq pc 'rcx))  ; already in RCX
+             (t
+              (when need-save (emit-push buf 'rcx))
+              (emit-load-vreg buf vc 'rcx)))
+           ;; Shift
+           (emit-shl-reg-cl buf d)
+           ;; Restore RCX if saved
+           (when (and need-save (not (eq pc 'rcx)))
+             (emit-pop buf 'rcx))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-sarv+)
+         ;; (sarv Vd Vs Vc) — arithmetic shift right by register count
+         (let* ((vd (first operands))
+                (vs (second operands))
+                (vc (third operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vc))
+                (need-save (and (not (eq pc 'rcx))
+                                (not (eq d 'rcx)))))
+           (emit-load-vreg buf vs d)
+           (cond
+             ((eq pc 'rcx))
+             (t
+              (when need-save (emit-push buf 'rcx))
+              (emit-load-vreg buf vc 'rcx)))
+           (emit-sar-reg-cl buf d)
+           (when (and need-save (not (eq pc 'rcx)))
+             (emit-pop buf 'rcx))
+           (maybe-store-scratch buf vd)))
+
         ((op= +op-ldb+)
          ;; (ldb Vd Vs pos:imm8 size:imm8) — bit field extract
          ;; Shift right by pos, mask to size bits

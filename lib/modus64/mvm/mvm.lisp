@@ -34,7 +34,7 @@
    #:+op-add+ #:+op-sub+ #:+op-mul+ #:+op-div+ #:+op-mod+
    #:+op-neg+ #:+op-inc+ #:+op-dec+
    #:+op-and+ #:+op-or+ #:+op-xor+
-   #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-ldb+
+   #:+op-shl+ #:+op-shr+ #:+op-sar+ #:+op-shlv+ #:+op-sarv+ #:+op-ldb+
    #:+op-cmp+ #:+op-test+
    #:+op-br+ #:+op-beq+ #:+op-bne+ #:+op-blt+ #:+op-bge+
    #:+op-ble+ #:+op-bgt+ #:+op-bnull+ #:+op-bnnull+
@@ -66,7 +66,7 @@
    #:mvm-add #:mvm-sub #:mvm-mul #:mvm-div #:mvm-mod
    #:mvm-neg #:mvm-inc #:mvm-dec
    #:mvm-and #:mvm-or #:mvm-xor
-   #:mvm-shl #:mvm-shr #:mvm-sar #:mvm-ldb
+   #:mvm-shl #:mvm-shr #:mvm-sar #:mvm-shlv #:mvm-sarv #:mvm-ldb
    #:mvm-cmp #:mvm-test
    #:mvm-br #:mvm-beq #:mvm-bne #:mvm-blt #:mvm-bge
    #:mvm-ble #:mvm-bgt #:mvm-bnull #:mvm-bnnull
@@ -233,6 +233,8 @@
 (defconstant +op-shl+    #x2B)  ; (shl Vd Vs imm8) - 2 reg + imm8
 (defconstant +op-shr+    #x2C)  ; (shr Vd Vs imm8) - 2 reg + imm8
 (defconstant +op-sar+    #x2D)  ; (sar Vd Vs imm8) - 2 reg + imm8
+(defconstant +op-shlv+   #x2F)  ; (shlv Vd Vs Vc) - 3 reg, shift left by register
+(defconstant +op-sarv+   #x32)  ; (sarv Vd Vs Vc) - 3 reg, arithmetic shift right by register
 (defconstant +op-ldb+    #x2E)  ; (ldb Vd Vs pos:imm8 size:imm8) - 2 reg + 2 imm8
 
 ;; Comparison
@@ -346,6 +348,8 @@
 (defopcode :shl    #x2B (:reg :reg :imm8)     "Shift left by immediate")
 (defopcode :shr    #x2C (:reg :reg :imm8)     "Logical shift right by immediate")
 (defopcode :sar    #x2D (:reg :reg :imm8)     "Arithmetic shift right by immediate")
+(defopcode :shlv   #x2F (:reg :reg :reg)      "Shift left by register")
+(defopcode :sarv   #x32 (:reg :reg :reg)      "Arithmetic shift right by register")
 (defopcode :ldb    #x2E (:reg :reg :imm8 :imm8) "Bit field extract (pos, size)")
 
 ;; Comparison
@@ -634,6 +638,12 @@
 
 (defun mvm-sar (buf vd vs amt)
   (encode-instruction buf +op-sar+ vd vs amt))
+
+(defun mvm-shlv (buf vd vs vc)
+  (encode-instruction buf +op-shlv+ vd vs vc))
+
+(defun mvm-sarv (buf vd vs vc)
+  (encode-instruction buf +op-sarv+ vd vs vc))
 
 (defun mvm-ldb (buf vd vs pos size)
   (encode-instruction buf +op-ldb+ vd vs pos size))

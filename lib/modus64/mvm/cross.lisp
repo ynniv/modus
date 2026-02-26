@@ -409,7 +409,8 @@
       (when (kernel-image-boot-code image)
         (loop for b across (kernel-image-boot-code image)
               do (mvm-emit-byte final-buf b)))
-      ;; Native code
+      ;; Native code (kernel-main must be the first function in source
+      ;; so that boot code falls through to it)
       (let ((code-offset (mvm-buffer-position final-buf)))
         (loop for b across native-code
               do (mvm-emit-byte final-buf b))
@@ -458,11 +459,19 @@
 ;;; Top-Level API
 ;;; ============================================================
 
+(defun resolve-target-arch (target)
+  "Resolve a target keyword to its underlying architecture keyword.
+   Board-specific targets (e.g. :rpi) map to their base architecture."
+  (case target
+    (:rpi :aarch64)
+    (otherwise target)))
+
 (defun build-image (&key (target :x86-64) (source nil) (source-text nil))
   "Build a bootable kernel image for TARGET.
 
-   TARGET: keyword naming the target architecture
-           (:x86-64, :riscv64, :aarch64, :ppc64, :ppc32, :i386, :68k, :arm32)
+   TARGET: keyword naming the target architecture or board
+           (:x86-64, :riscv64, :aarch64, :ppc64, :ppc32, :i386, :68k,
+            :arm32, :rpi)
 
    SOURCE: list of Lisp forms to compile (alternative to source-text)
 
@@ -473,8 +482,10 @@
    Usage:
      (build-image :target :riscv64)     ; from any running Modus
      (build-image :target :x86-64)      ; cross-compile back
-     (build-image :target :aarch64)     ; or to ARM"
-  (let ((target-desc (find-target target)))
+     (build-image :target :aarch64)     ; or to ARM
+     (build-image :target :rpi)         ; Raspberry Pi (AArch64)"
+  (let* ((arch (resolve-target-arch target))
+         (target-desc (find-target arch)))
     (unless target-desc
       (error "Unknown target architecture: ~A~%Known targets: ~{~A~^, ~}"
              target (list-targets)))
@@ -491,10 +502,13 @@
       ;; Compile
       (let ((module (compile-source-to-module src-text)))
         ;; Get boot descriptor for target
-        (let ((boot-desc (get-boot-descriptor target)))
-          ;; Assemble image
-          (assemble-kernel-image module target-desc
-                                 :boot-descriptor boot-desc))))))
+        (let* ((boot-desc (get-boot-descriptor target))
+               (serial-base (getf boot-desc :serial-base)))
+          ;; Bind serial base if boot descriptor overrides it
+          (let ((*aarch64-serial-base* (or serial-base *aarch64-serial-base*)))
+            ;; Assemble image
+            (assemble-kernel-image module target-desc
+                                   :boot-descriptor boot-desc)))))))
 
 (defun get-boot-descriptor (target-name)
   "Get the boot descriptor for the given target architecture.
@@ -510,6 +524,7 @@
     (:68k     (m68k-boot-descriptor))
     (:arm32   (arm32-boot-descriptor))
     (:armv7   (armv7-boot-descriptor))
+    (:rpi     (rpi-boot-descriptor))
     (otherwise nil)))
 
 (defun write-kernel-image (image pathname)

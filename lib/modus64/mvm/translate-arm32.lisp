@@ -1054,6 +1054,20 @@
              (arm32-asr-imm buf +arm-r12+ ps (logand amount 31))
              (arm32-store-vreg buf +arm-r12+ vd))))
 
+        (#.+op-shlv+
+         ;; (shlv Vd Vs Vc) — shift left by register
+         (let ((vd (vreg 0)))
+           (with-src2 (ps (vreg 1) +arm-r12+) (pc (vreg 2) +arm-lr+)
+             (arm32-lsl-reg buf +arm-r12+ ps pc)
+             (arm32-store-vreg buf +arm-r12+ vd))))
+
+        (#.+op-sarv+
+         ;; (sarv Vd Vs Vc) — arithmetic shift right by register
+         (let ((vd (vreg 0)))
+           (with-src2 (ps (vreg 1) +arm-r12+) (pc (vreg 2) +arm-lr+)
+             (arm32-asr-reg buf +arm-r12+ ps pc)
+             (arm32-store-vreg buf +arm-r12+ vd))))
+
         (#.+op-ldb+
          ;; Extract bit field: (LDB (BYTE size pos) src)
          (let ((vd (vreg 0))
@@ -1226,7 +1240,8 @@
            (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 2)
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
-           (let ((total (* (1+ size) 4)))
+           ;; Align to 16 bytes to keep cons alloc pointer aligned
+           (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
              (multiple-value-bind (rot imm) (arm32-encode-imm total)
                (if rot
                    (arm32-add-imm buf +arm-r9+ +arm-r9+ rot imm)

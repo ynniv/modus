@@ -30,7 +30,7 @@ done
 
 # Default: all targets
 if [ ${#TARGETS[@]} -eq 0 ]; then
-    TARGETS=(x86-64 i386 aarch64 riscv64 ppc64 ppc32 68k arm32 armv7)
+    TARGETS=(x86-64 i386 aarch64 riscv64 ppc64 ppc32 68k arm32 armv7 rpi)
 fi
 
 # Architecture → objdump command mapping
@@ -44,6 +44,7 @@ OBJDUMP_CMD[ppc32]="powerpc64-linux-gnu-objdump -D -b binary -m powerpc:common -
 OBJDUMP_CMD[68k]="m68k-linux-gnu-objdump -D -b binary -m m68k"
 OBJDUMP_CMD[arm32]="aarch64-linux-gnu-objdump -D -b binary -m arm"
 OBJDUMP_CMD[armv7]="aarch64-linux-gnu-objdump -D -b binary -m arm"
+OBJDUMP_CMD[rpi]="aarch64-linux-gnu-objdump -D -b binary -m aarch64"
 
 # Architecture → QEMU command mapping
 # Use -serial file:SERIAL to capture serial output to a file
@@ -58,6 +59,7 @@ QEMU_CMD[ppc32]="qemu-system-ppc -machine ppce500 -cpu e500v2 -kernel FILE -disp
 QEMU_CMD[68k]="qemu-system-m68k -machine virt -kernel FILE -display none -monitor none -serial file:SERIAL -m 64"
 QEMU_CMD[arm32]="qemu-system-arm -machine versatilepb -cpu arm926 -kernel FILE -display none -monitor none -serial file:SERIAL -m 64"
 QEMU_CMD[armv7]="qemu-system-arm -machine virt -cpu cortex-a15 -kernel FILE -display none -monitor none -serial file:SERIAL -m 64"
+QEMU_CMD[rpi]="qemu-system-aarch64 -machine raspi3b -kernel FILE -display none -serial file:SERIAL"
 
 # Color output
 RED='\033[0;31m'
@@ -276,6 +278,16 @@ for arch in "${TARGETS[@]}"; do
                 pass "$arch: $insn_count insns, $has_pop pop-pc(s), $has_sdiv sdiv(s), ${bad_pct}% unknown"
             else
                 fail "$arch: no pop {pc} instruction found"
+            fi
+            ;;
+        rpi)
+            # RPi uses AArch64 — same validation as aarch64
+            has_ret=$(grep -c '\bret\b' "$disasm_file" 2>/dev/null || true)
+            has_ret=${has_ret:-0}
+            if [ "$has_ret" -gt 0 ]; then
+                pass "$arch: $insn_count insns, $has_ret ret(s), ${bad_pct}% unknown"
+            else
+                fail "$arch: no ret instruction found"
             fi
             ;;
         *)

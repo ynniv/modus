@@ -761,6 +761,22 @@
          (rv-emit-srai buf +rv-t0+ rs amt)
          (store-result vd +rv-t0+)))
 
+      (#.+op-shlv+
+       ;; (shlv Vd Vs Vc) — shift left by register
+       (let* ((vd (vreg 0))
+              (rs (resolve (vreg 1)))
+              (rc (resolve2 (vreg 2))))
+         (rv-emit-sll buf +rv-t0+ rs rc)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-sarv+
+       ;; (sarv Vd Vs Vc) — arithmetic shift right by register
+       (let* ((vd (vreg 0))
+              (rs (resolve (vreg 1)))
+              (rc (resolve2 (vreg 2))))
+         (rv-emit-sra buf +rv-t0+ rs rc)
+         (store-result vd +rv-t0+)))
+
       (#.+op-ldb+
        ;; Bit field extract: (src >> pos) & ((1 << size) - 1)
        (let* ((vd (vreg 0))
@@ -929,7 +945,8 @@
        (let* ((vd (vreg 0))
               (size-words (vreg 1))
               (subtag (vreg 2))
-              (total-bytes (* (1+ size-words) 8)))  ; +1 for header word
+              ;; Align to 16 bytes to keep cons alloc pointer aligned
+              (total-bytes (logand (+ (* (1+ size-words) 8) 15) (lognot 15))))
          ;; Build and store header
          (rv-emit-li buf +rv-t0+ (logior (ash size-words 8) subtag))
          (rv-emit-sd buf +rv-t0+ +rv-s8+ 0)

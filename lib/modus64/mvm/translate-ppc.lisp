@@ -1150,6 +1150,30 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
+      (#.+op-shlv+
+       ;; (shlv Vd Vs Vc) — shift left by register
+       (let ((vd (first operands))
+             (vs (second operands))
+             (vc (third operands)))
+         (let ((ps (vreg-or-scratch vs +ppc-scratch1+))
+               (pc (vreg-or-scratch vc +ppc-scratch2+)))
+           (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+             (ppc-emit-shift-left buf pd ps pc)
+             (unless (ppc-vreg-phys vd)
+               (ppc-store-vreg buf vd pd))))))
+
+      (#.+op-sarv+
+       ;; (sarv Vd Vs Vc) — arithmetic shift right by register
+       (let ((vd (first operands))
+             (vs (second operands))
+             (vc (third operands)))
+         (let ((ps (vreg-or-scratch vs +ppc-scratch1+))
+               (pc (vreg-or-scratch vc +ppc-scratch2+)))
+           (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+             (ppc-emit-shift-right-arith buf pd ps pc)
+             (unless (ppc-vreg-phys vd)
+               (ppc-store-vreg buf vd pd))))))
+
       (#.+op-ldb+
        (let ((vd (first operands))
              (vs (second operands))
@@ -1358,7 +1382,8 @@
              (subtag (third operands)))
          (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+))
                (ws (ppc-word-size)))
-           (let ((total-bytes (* (1+ size) ws)))  ; header + slots
+           ;; Align to 16 bytes to keep cons alloc pointer aligned
+          (let ((total-bytes (logand (+ (* (1+ size) ws) 15) (lognot 15))))
              ;; Build header: (subtag << 8) | +tag-object+
              (ppc-emit-addi buf +ppc-r0+ 0 (logior (ash subtag 8) +tag-object+))
              (ppc-emit-store-word buf +ppc-r0+ +ppc-r19+ 0)

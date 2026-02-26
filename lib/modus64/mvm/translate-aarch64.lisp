@@ -24,6 +24,15 @@
 (in-package :modus64.mvm)
 
 ;;; ============================================================
+;;; Configurable UART Base Address
+;;; ============================================================
+
+(defvar *aarch64-serial-base* #x09000000
+  "Base address of the PL011 UART for AArch64 serial-out.
+   Default is 0x09000000 (QEMU virt). Bind to 0x3F201000 for
+   Raspberry Pi 3, or 0x1F00030000 for Raspberry Pi 5.")
+
+;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
 
@@ -129,10 +138,10 @@
   (let ((code (a64-buffer-code buf)))
     (dolist (fixup (a64-buffer-fixups buf))
       (destructuring-bind (index label-id type) fixup
-        (let* ((target (gethash label-id (a64-buffer-labels buf)))
-               (offset (- target index)))
+        (let* ((target (gethash label-id (a64-buffer-labels buf))))
           (unless target
-            (error "AArch64: undefined label ~D" label-id))
+            (error "AArch64: undefined label ~D (fixup at index ~D, type ~A)" label-id index type))
+          (let ((offset (- target index)))
           (ecase type
             (:b
              ;; B imm26: patch bits [25:0]
@@ -151,7 +160,7 @@
              (let ((word (aref code index)))
                (setf (aref code index)
                      (logior (logand word #xFF00001F)
-                             (ash (logand offset #x7FFFF) 5)))))))))))
+                             (ash (logand offset #x7FFFF) 5))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."
@@ -747,6 +756,11 @@
   (a64-emit buf (logior #xD4200000
                         (ash (logand imm16 #xFFFF) 5))))
 
+(defun a64-hlt (buf imm16)
+  "HLT #imm16  (halt / semihosting trap)"
+  (a64-emit buf (logior #xD4400000
+                        (ash (logand imm16 #xFFFF) 5))))
+
 (defun a64-svc (buf imm16)
   "SVC #imm16  (supervisor call)"
   (a64-emit buf (logior #xD4000001
@@ -758,13 +772,13 @@
 
 (defun a64-dmb (buf &key (option #xB))
   "DMB option  (data memory barrier, default ISH)"
-  (a64-emit buf (logior #xD5033000
+  (a64-emit buf (logior #xD503301F
                         (ash #b101 5)
                         (ash (logand option #xF) 8))))
 
 (defun a64-dsb (buf &key (option #xB))
   "DSB option  (data synchronization barrier, default ISH)"
-  (a64-emit buf (logior #xD5033000
+  (a64-emit buf (logior #xD503301F
                         (ash #b100 5)
                         (ash (logand option #xF) 8))))
 
@@ -861,9 +875,10 @@
    Frame slots grow downward: slot N is at FP + frame-slot-base + N*(-8).
    This is below all spill slots (which end at FP-56) to avoid overlap.")
 
-(defconstant +a64-locals-frame-size+ 128
+(defconstant +a64-locals-frame-size+ 1024
   "Extra stack allocation below FP for spill slots (56 bytes) and
-   frame slots (64 bytes) = 120, rounded to 128 for 16-byte alignment.")
+   frame slots. 1024 bytes provides ~120 frame slots for local variables,
+   sufficient for deeply nested crypto functions like fe-mul (~80 slots).")
 
 (defun a64-spill-slot-offset (vreg)
   "Compute the FP-relative offset for a spilled vreg (V9-V15).
@@ -914,37 +929,41 @@
      MOV x29, sp
      STP x19, x20, [sp, #16]
      STP x21, x22, [sp, #32]
-     STP x23, x24, [sp, #48]
-     STP x25, x26, [sp, #64]
-     SUB sp, sp, #128
-   Frame: 80 bytes save area + 128 bytes for spill slots and frame locals."
+     STP x23, xzr, [sp, #48]
+     ;; x24/x25/x26 are global state (alloc/limit/nil) — NOT saved
+     SUB sp, sp, #1024
+   Frame: 80 bytes save area + 1024 bytes for spill slots and frame locals.
+   Note: x24 (alloc ptr), x25 (alloc limit), x26 (nil) are global state
+   shared across all functions. They must NOT be saved/restored, or
+   allocations made by callees would be lost on return."
   ;; Save FP and LR, allocate save area
   (a64-stp-pre buf +a64-x29+ +a64-x30+ +a64-sp+ -80)
   ;; Set up frame pointer: ADD x29, SP, #0
   ;; (Cannot use a64-mov-reg because ORR encodes reg 31 as XZR, not SP)
   (a64-add-imm buf +a64-x29+ +a64-sp+ 0)
-  ;; Save callee-saved registers
+  ;; Save callee-saved registers (x19-x23 only)
+  ;; x24/x25/x26 are global alloc/limit/nil — must persist across calls
   (a64-stp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
   (a64-stp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
-  (a64-stp-offset buf +a64-x23+ +a64-x24+ +a64-sp+ 48)
-  (a64-stp-offset buf +a64-x25+ +a64-x26+ +a64-sp+ 64)
+  ;; Save x23 paired with xzr (x31 = zero register in this context)
+  (a64-stp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
   ;; Allocate space for spill slots and frame locals below FP
   (a64-sub-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+))
 
 (defun a64-emit-epilogue (buf)
   "Emit the standard function epilogue:
-     ADD sp, sp, #128
-     LDP x25, x26, [sp, #64]
-     LDP x23, x24, [sp, #48]
+     ADD sp, sp, #1024
+     LDP x23, xzr, [sp, #48]
      LDP x21, x22, [sp, #32]
      LDP x19, x20, [sp, #16]
      LDP x29, x30, [sp], #80
-     RET"
+     RET
+   Note: x24/x25/x26 are NOT restored (global state)."
   ;; Deallocate spill/frame-slot area
   (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
-  ;; Restore callee-saved registers
-  (a64-ldp-offset buf +a64-x25+ +a64-x26+ +a64-sp+ 64)
-  (a64-ldp-offset buf +a64-x23+ +a64-x24+ +a64-sp+ 48)
+  ;; Restore callee-saved registers (x19-x23 only)
+  ;; x24/x25/x26 are global alloc/limit/nil — do NOT restore
+  (a64-ldp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
   (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
   (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
   ;; Restore FP/LR and deallocate save area
@@ -1033,7 +1052,16 @@
              (cond
                ((< code #x0100)
                 ;; Frame-enter: emit function prologue
-                (a64-emit-prologue buf))
+                (a64-emit-prologue buf)
+                ;; If > 4 params, copy overflow args from caller's stack
+                ;; to local frame slots so stack-load can find them.
+                ;; Overflow arg k is at [FP + 80 + k*8] (above save area).
+                (when (> code 4)
+                  (loop for i from 4 below code
+                        for src-offset = (+ 80 (* (- i 4) 8))
+                        for dst-offset = (+ +a64-frame-slot-base+ (* i -8))
+                        do (a64-ldur buf +a64-x16+ +a64-x29+ src-offset)
+                           (a64-stur buf +a64-x16+ +a64-x29+ dst-offset))))
                ((< code #x0300)
                 ;; Frame-alloc/frame-free: NOP for now
                 nil)
@@ -1041,10 +1069,30 @@
                 ;; Serial write: V0 (x0) contains tagged fixnum char code
                 ;; asr x16, x0, #1 (untag)
                 (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
-                ;; load UART base (0x09000000 - PL011 on QEMU virt)
-                (a64-load-imm64 buf +a64-x17+ #x09000000)
+                ;; load UART base (configurable via *aarch64-serial-base*)
+                (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
                 ;; strb w16, [x17] (store byte to UART data register)
                 (a64-str-width buf +a64-x16+ +a64-x17+ 0 0))
+               ((= code #x0301)
+                ;; Serial read: poll UART until a byte is available,
+                ;; return tagged fixnum char code in x0.
+                ;; PL011 UARTFR offset = 0x18, RXFE bit = bit 4
+                ;; load UART base into x17
+                (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
+                ;; poll loop (2 instructions):
+                ;;   ldrb w16, [x17, #0x18]   ; read UARTFR
+                (a64-ldr-width buf +a64-x16+ +a64-x17+ #x18 0)
+                ;;   tbnz x16, #4, -4         ; if RXFE set, branch back
+                ;; TBNZ encoding: b5|011011|1|b40|imm14|Rt
+                ;; b5=0, b40=00100 (bit 4), imm14=-1 (back 1 insn), Rt=x16
+                (a64-emit buf (logior (ash #b00110111 24)  ; TBNZ
+                                      (ash 4 19)           ; bit number = 4
+                                      (ash (logand -1 #x3FFF) 5)  ; imm14 = -1
+                                      +a64-x16+))
+                ;; read data byte: ldrb w0, [x17, #0]
+                (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 0)
+                ;; tag as fixnum: lsl x0, x0, #1
+                (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))
@@ -1230,6 +1278,26 @@
                   (amt (vr 2))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              (a64-asr-imm buf pd ps amt)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- SHLV Vd, Vs, Vc ---- (shift left by register)
+          ((= op +op-shlv+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pc (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-lslv buf pd ps pc)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- SARV Vd, Vs, Vc ---- (arithmetic shift right by register)
+          ((= op +op-sarv+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pc (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asrv buf pd ps pc)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1462,7 +1530,9 @@
            (let* ((vd (vr 0))
                   (size (vr 1))
                   (subtag (vr 2))
-                  (total-size (+ 8 size))  ; header + payload
+                  ;; Align total size to 16 bytes so cons alloc pointer
+                  ;; stays 16-byte aligned (cons tag uses low 4 bits)
+                  (total-size (logand (+ 8 size 15) (lognot 15)))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Build header in x16: (subtag << 56) | (size << 40)
              ;; Simplified: store subtag and size in header word
@@ -1472,7 +1542,7 @@
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
              ;; Result = alloc pointer + 8 (skip header) + object tag (2)
              (a64-add-imm buf pd +a64-x24+ 10)  ; 8 (header) + 2 (tag)
-             ;; Bump alloc pointer
+             ;; Bump alloc pointer (aligned to 16 bytes)
              (if (<= total-size #xFFF)
                  (a64-add-imm buf +a64-x24+ +a64-x24+ total-size)
                  (progn
@@ -1489,8 +1559,14 @@
                   (idx (vr 2))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              (if (= vobj +vreg-vfp+)
-                 ;; Frame slot access: use safe FP-relative offset below spill area
-                 (a64-ldur buf pd +a64-x29+ (+ +a64-frame-slot-base+ (* idx -8)))
+                 ;; Frame slot access: use FP-relative offset below spill area
+                 (let ((offset (+ +a64-frame-slot-base+ (* idx -8))))
+                   (if (and (>= offset -256) (<= offset 255))
+                       (a64-ldur buf pd +a64-x29+ offset)
+                       ;; Large offset: SUB x16, x29, #abs_offset; LDUR pd, [x16]
+                       (progn
+                         (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
+                         (a64-ldur buf pd +a64-x16+ 0))))
                  ;; Normal object slot access
                  (let* ((pobj (ensure-src vobj +a64-x16+))
                         (offset (- (* idx 8) 2)))  ; subtract object tag
@@ -1509,8 +1585,14 @@
                   (idx (vr 1))
                   (ps (ensure-src (vr 2) +a64-x17+)))
              (if (= vobj +vreg-vfp+)
-                 ;; Frame slot store: use safe FP-relative offset below spill area
-                 (a64-stur buf ps +a64-x29+ (+ +a64-frame-slot-base+ (* idx -8)))
+                 ;; Frame slot store: use FP-relative offset below spill area
+                 (let ((offset (+ +a64-frame-slot-base+ (* idx -8))))
+                   (if (and (>= offset -256) (<= offset 255))
+                       (a64-stur buf ps +a64-x29+ offset)
+                       ;; Large offset: SUB x16, x29, #abs_offset; STUR ps, [x16]
+                       (progn
+                         (a64-sub-imm buf +a64-x16+ +a64-x29+ (- offset))
+                         (a64-stur buf ps +a64-x16+ 0))))
                  ;; Normal object slot store
                  (let* ((pobj (ensure-src vobj +a64-x16+))
                         (offset (- (* idx 8) 2)))
@@ -1594,9 +1676,9 @@
                   (label (gethash target-offset mvm-to-native-label)))
              (when label
                ;; Deallocate spill/frame-slot area and restore callee-saved regs
+               ;; x24/x25/x26 are global state — NOT restored
                (a64-add-imm buf +a64-sp+ +a64-sp+ +a64-locals-frame-size+)
-               (a64-ldp-offset buf +a64-x25+ +a64-x26+ +a64-sp+ 64)
-               (a64-ldp-offset buf +a64-x23+ +a64-x24+ +a64-sp+ 48)
+               (a64-ldp-offset buf +a64-x23+ +a64-xzr+ +a64-sp+ 48)
                (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 32)
                (a64-ldp-offset buf +a64-x19+ +a64-x20+ +a64-sp+ 16)
                (a64-ldp-post buf +a64-x29+ +a64-x30+ +a64-sp+ 80)
@@ -1697,7 +1779,17 @@
 
           ;; ---- HALT ----
           ((= op +op-halt+)
-           (a64-wfi buf))
+           ;; Semihosting SYS_EXIT: makes QEMU exit cleanly
+           ;; Build param block on stack: [ADP_Stopped_ApplicationExit, 0]
+           (a64-load-imm64 buf +a64-x0+ #x20026) ; ADP_Stopped_ApplicationExit
+           (a64-movz buf +a64-x1+ 0)              ; exit code 0
+           (a64-stp-pre buf +a64-x0+ +a64-x1+ +a64-sp+ -16) ; push param block
+           (a64-movz buf +a64-x0+ #x18)           ; SYS_EXIT
+           (a64-mov-reg buf +a64-x1+ +a64-sp+)    ; X1 = &param_block
+           (a64-hlt buf #xF000)                    ; semihosting trap
+           ;; Fallback if semihosting not enabled: WFI loop
+           (a64-wfi buf)
+           (a64-b buf (logand -2 #x3FFFFFF)))
 
           ;; ---- CLI (disable interrupts) ----
           ((= op +op-cli+)
@@ -1780,6 +1872,20 @@
                    (setf (gethash (list :func func-idx) mvm-to-native-label) label)
                    (setf (gethash mvm-offset mvm-to-native-label) label)))
                function-table))
+
+    ;; Pre-pass: register labels for ALL branch targets (including backward branches)
+    (dolist (insn insns)
+      (let ((op (decoded-mvm-insn-opcode insn))
+            (operands (decoded-mvm-insn-operands insn)))
+        (when (and (>= op #x40) (<= op #x48))  ; BR through BNNULL
+          (let* ((off-idx (if (or (= op #x47) (= op #x48)) 1 0))  ; BNULL/BNNULL have Vs first
+                 (mvm-offset (nth off-idx operands))
+                 (target-byte (+ (decoded-mvm-insn-offset insn)
+                                 (decoded-mvm-insn-size insn)
+                                 mvm-offset)))
+            (unless (gethash target-byte mvm-to-native-label)
+              (setf (gethash target-byte mvm-to-native-label)
+                    (incf *mvm-label-counter*)))))))
 
     ;; Pass 1: Translate all instructions
     (dolist (insn insns)
@@ -1889,6 +1995,12 @@
             (if (= (decoded-mvm-insn-opcode insn) +op-ret+)
                 (a64-emit-epilogue buf)
                 (translate-mvm-insn insn buf mvm-to-native-label))))))
+
+    ;; Handle labels pointing past the last instruction
+    (let ((end-offset (length bytecode)))
+      (let ((label (gethash end-offset mvm-to-native-label)))
+        (when label
+          (a64-set-label buf label))))
 
     ;; Resolve fixups
     (a64-resolve-fixups buf)

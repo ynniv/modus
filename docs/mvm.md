@@ -247,7 +247,7 @@ Each target computes factorial(10) and prints `3628800` via serial port.
 ### Self-hosting verification
 
 ```bash
-./modus/scripts/run-modus64-self-hosted-ssh.sh --rebuild --repl
+./modus/scripts/run-x64-gen1-repl.sh --rebuild
 ```
 
 Builds Gen0 via MVM, boots it, runs `(build-image)` to compile Gen1, extracts Gen1 via QMP, boots Gen1 to REPL. Verifies arithmetic, loops, factorial, and RTC functions.

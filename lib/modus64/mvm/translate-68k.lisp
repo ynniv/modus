@@ -1271,6 +1271,26 @@
                (m68k-emit-asr-dn buf +68k-d1+ +68k-d0+)))
          (m68k-store-vreg buf vd +68k-d0+)))
 
+      (#.+op-shlv+
+       ;; (shlv Vd Vs Vc) — shift left by register
+       (let ((vd (first operands))
+             (vs (second operands))
+             (vc (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-load-vreg buf +68k-d1+ vc)
+         (m68k-emit-lsl-dn buf +68k-d1+ +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-sarv+
+       ;; (sarv Vd Vs Vc) — arithmetic shift right by register
+       (let ((vd (first operands))
+             (vs (second operands))
+             (vc (third operands)))
+         (m68k-load-vreg buf +68k-d0+ vs)
+         (m68k-load-vreg buf +68k-d1+ vc)
+         (m68k-emit-asr-dn buf +68k-d1+ +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
       (#.+op-ldb+
        (let ((vd (first operands))
              (vs (second operands))
@@ -1493,8 +1513,8 @@
            ;; Tag the pointer
            (m68k-emit-move-an-dn buf +68k-a2+ +68k-d0+)
            (m68k-emit-ori buf +68k-d0+ +tag-object+)
-           ;; Bump alloc: (1+size)*4 bytes
-           (let ((total (* (1+ size) 4)))
+           ;; Bump alloc: (1+size)*4 bytes, aligned to 16 bytes to keep cons alloc pointer aligned
+           (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
              (if (<= total 8)
                  (m68k-emit-addq-an buf +68k-a2+ total)
                  (progn
