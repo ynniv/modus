@@ -169,23 +169,75 @@
     ;; x26 = NIL = 0 (already zero from QEMU reset, but be explicit)
     (emit-aarch64-movz buf x26 0 0)
 
-    ;; 4. Fall through to native code (kernel-main prologue follows)
+    ;; 4. Set TPIDR_EL1 = BSP per-CPU data base (0x41200000)
+    (emit-aarch64-movz buf x16 #x4120 16)     ; x16 = 0x41200000
+    (emit-aarch64-u32 buf #xD518D090)          ; MSR TPIDR_EL1, x16
+
+    ;; 5. Set VBAR_EL1 = exception vector table (at image offset 0x800)
+    ;; Image loads at 0x40000000 on QEMU virt, so vectors at 0x40000800
+    (emit-aarch64-movz buf x16 #x4000 16)     ; x16 = 0x40000000
+    (emit-aarch64-movk buf x16 #x0800 0)      ; x16 = 0x40000800
+    (emit-aarch64-u32 buf #xD518C010)          ; MSR VBAR_EL1, x16
+    (emit-aarch64-u32 buf #xD5033FDF)          ; ISB (sync system reg writes)
+
+    ;; 6. Branch over exception vectors to native code
+    ;; Vectors occupy 0x800-0x1000 (2KB). Native code starts at offset 0x1000.
+    (let* ((current-insn (/ (mvm-buffer-position buf) 4))
+           (native-start 1024)                  ; instruction 1024 = offset 0x1000
+           (skip (- native-start current-insn)))
+      ;; B forward to native code
+      (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
+      ;; Pad with NOPs to offset 0x800 (instruction 512)
+      (let ((pad (- 512 (/ (mvm-buffer-position buf) 4))))
+        (dotimes (i pad)
+          (emit-aarch64-u32 buf #xD503201F))))
+
+    ;; 7. Exception vector table (2KB at offset 0x800)
+    (emit-aarch64-exception-vectors buf)
+    ;; Native code follows immediately (kernel-main at offset 0x1000)
     ))
 
 (defun emit-aarch64-exception-vectors (buf)
   "Emit AArch64 exception vector table.
    Must be aligned to 2KB (0x800).
-   4 exception levels × 4 types = 16 entries, 32 instructions each."
-  ;; Exception vectors:
-  ;; Offset 0x000: Current EL with SP_EL0 (Synchronous)
-  ;; Offset 0x080: Current EL with SP_EL0 (IRQ)
-  ;; Offset 0x100: Current EL with SP_EL0 (FIQ)
-  ;; Offset 0x180: Current EL with SP_EL0 (SError)
-  ;; Offset 0x200: Current EL with SP_ELx (Synchronous)
-  ;; Offset 0x280: Current EL with SP_ELx (IRQ)
-  ;; ... etc.
-  (dotimes (i 512)  ; 16 × 32 instructions = 512
-    (mvm-emit-u32 buf #xD503201F)))  ; NOP (filled during build)
+   4 exception levels × 4 types = 16 entries, 32 instructions each.
+   Entry 5 (offset 0x280, Current EL with SP_ELx IRQ) has a real
+   GICv2 IRQ handler. All others are infinite loops for debugging."
+  ;; Exception vectors layout (16 entries × 32 instructions = 512 words):
+  ;;   Entry 0 (0x000): Current EL, SP_EL0, Sync  → B .
+  ;;   Entry 1 (0x080): Current EL, SP_EL0, IRQ   → B .
+  ;;   Entry 2 (0x100): Current EL, SP_EL0, FIQ   → B .
+  ;;   Entry 3 (0x180): Current EL, SP_EL0, SError → B .
+  ;;   Entry 4 (0x200): Current EL, SP_ELx, Sync  → B .
+  ;;   Entry 5 (0x280): Current EL, SP_ELx, IRQ   → GIC IRQ handler
+  ;;   Entry 6 (0x300): Current EL, SP_ELx, FIQ   → B .
+  ;;   Entry 7-15: Lower EL vectors               → B .
+  (dotimes (entry 16)
+    (if (= entry 5)
+        ;; Entry 5: IRQ handler for Current EL with SP_ELx
+        ;; This is the active IRQ vector when running in EL1 with SP_EL1.
+        ;; Minimal handler: save regs, acknowledge GIC, restore, ERET.
+        (progn
+          ;; STP x0, x1, [SP, #-16]!    (save scratch regs)
+          (mvm-emit-u32 buf #xA9BF07E0)
+          ;; MOVZ x0, #0x0801, LSL #16  (x0 = 0x08010000 = GICC base)
+          (mvm-emit-u32 buf #xD2A10020)
+          ;; LDR w1, [x0, #0x0C]        (w1 = GICC_IAR — acknowledge IRQ)
+          (mvm-emit-u32 buf #xB9400C01)
+          ;; STR w1, [x0, #0x10]        (GICC_EOIR = w1 — end of interrupt)
+          (mvm-emit-u32 buf #xB9001001)
+          ;; LDP x0, x1, [SP], #16      (restore scratch regs)
+          (mvm-emit-u32 buf #xA8C107E0)
+          ;; ERET                        (return from exception)
+          (mvm-emit-u32 buf #xD69F03E0)
+          ;; Fill remaining 26 instructions with NOP
+          (dotimes (i 26)
+            (mvm-emit-u32 buf #xD503201F)))
+        ;; All other entries: B . (infinite loop for debugging)
+        (progn
+          (mvm-emit-u32 buf #x14000000)    ; B . (branch to self)
+          (dotimes (i 31)
+            (mvm-emit-u32 buf #xD503201F))))))
 
 ;;; ============================================================
 ;;; AArch64 PL011 UART

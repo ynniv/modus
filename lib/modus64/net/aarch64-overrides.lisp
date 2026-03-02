@@ -357,6 +357,7 @@
                 ()))
           1))))
 
+
 ;; Override ssh-server for single-threaded AArch64
 ;; No GC helper, no actor-spawn. Runs network loop directly.
 (defun ssh-server (port)
@@ -445,15 +446,16 @@
     (when (eq msg-type 1)
       (setf (mem-ref flag-addr :u32) 0))))
 
-;; Message loop
+;; Message loop — runs until client disconnects.
+;; Never times out: keeps polling for data indefinitely.
 (defun ssh-message-loop (ssh)
   (let ((flag-addr (+ (conn-ssh 3) #x700)))
     (setf (mem-ref flag-addr :u32) 1)
     (loop
       (when (zerop (mem-ref flag-addr :u32)) (return ()))
-      (let ((pkt (ssh-receive-packet ssh 600)))
-        (when (zerop pkt)
-          (setf (mem-ref flag-addr :u32) 0))
+      ;; Use a reasonable per-poll timeout, but retry on nil (no-data).
+      ;; Only exit when flag is cleared (client disconnect/close).
+      (let ((pkt (ssh-receive-packet ssh 50000)))
         (when pkt
           (ssh-dispatch-msg ssh (car pkt) (cdr pkt) flag-addr))))))
 

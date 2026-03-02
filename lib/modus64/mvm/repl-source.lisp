@@ -24,6 +24,13 @@
     (repl globals)))
 
 ;;; ============================================================
+;;; Input indirection: read-char-input defaults to serial UART.
+;;; HID build overrides this (loaded last wins) to poll USB keyboard.
+;;; ============================================================
+
+(defun read-char-input () (read-char-serial))
+
+;;; ============================================================
 ;;; Output helpers
 ;;; ============================================================
 
@@ -113,7 +120,7 @@
   (halt-loop))
 
 (defun read-skip-ws ()
-  (let ((c (read-char-serial)))
+  (let ((c (read-char-input)))
     (if (= c 4)
         (progn
           (write-newline)
@@ -137,7 +144,7 @@
     (read-number-rest acc)))
 
 (defun read-number-rest (acc)
-  (let ((c (read-char-serial)))
+  (let ((c (read-char-input)))
     (if (is-digit c)
         (progn
           (write-char-serial c)
@@ -154,7 +161,7 @@
     c))
 
 (defun read-symbol-chars ()
-  (let ((c (read-char-serial)))
+  (let ((c (read-char-input)))
     (if (is-delimiter c)
         (progn
           (write-char-serial c)
@@ -194,7 +201,7 @@
       ((is-digit c)
        (read-number c))
       ((= c 45)
-       (let ((c2 (read-char-serial)))
+       (let ((c2 (read-char-input)))
          (if (is-digit c2)
              (progn
                (write-char-serial c2)
@@ -232,7 +239,7 @@
     ((is-digit c)
      (read-number c))
     ((= c 45)
-     (let ((c2 (read-char-serial)))
+     (let ((c2 (read-char-input)))
        (if (is-digit c2)
            (progn
              (write-char-serial c2)

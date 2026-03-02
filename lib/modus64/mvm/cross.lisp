@@ -504,8 +504,8 @@
         ;; Get boot descriptor for target
         (let* ((boot-desc (get-boot-descriptor target))
                (serial-base (getf boot-desc :serial-base)))
-          ;; Bind serial base if boot descriptor overrides it
-          (let ((*aarch64-serial-base* (or serial-base *aarch64-serial-base*)))
+          ;; Serial base priority: explicit setf > boot descriptor > QEMU virt default
+          (let ((*aarch64-serial-base* (or *aarch64-serial-base* serial-base #x09000000)))
             ;; Assemble image
             (assemble-kernel-image module target-desc
                                    :boot-descriptor boot-desc)))))))

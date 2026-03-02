@@ -48,6 +48,7 @@
    #:+op-save-ctx+ #:+op-restore-ctx+ #:+op-yield+ #:+op-atomic-xchg+
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
+   #:+op-fn-addr+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -80,6 +81,7 @@
    #:mvm-save-ctx #:mvm-restore-ctx #:mvm-yield #:mvm-atomic-xchg
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
+   #:mvm-fn-addr
    #:mvm-trap
    ;; Tagging (from compiler.lisp, shared across modules)
    #:+tag-fixnum+ #:+tag-cons+ #:+tag-object+ #:+tag-immediate+ #:+tag-forward+
@@ -298,6 +300,7 @@
 (defconstant +op-sti+        #xA4)  ; (sti) - enable interrupts
 (defconstant +op-percpu-ref+ #xA5)  ; (percpu-ref Vd offset:imm16) - reg + imm16
 (defconstant +op-percpu-set+ #xA6)  ; (percpu-set offset:imm16 Vs) - imm16 + reg
+(defconstant +op-fn-addr+   #xA7)  ; (fn-addr Vd target:imm32) - load tagged function address
 
 ;;; ============================================================
 ;;; Opcode Metadata Table
@@ -400,8 +403,8 @@
 (defopcode :write-barrier #x8A (:reg)         "Mark card table dirty")
 
 ;; Actor/concurrency
-(defopcode :save-ctx    #x90 ()               "Save actor context")
-(defopcode :restore-ctx #x91 ()               "Restore actor context")
+(defopcode :save-ctx    #x90 (:reg)           "Save actor context (addr in reg, result in reg)")
+(defopcode :restore-ctx #x91 (:reg)           "Restore actor context (addr in reg, never returns)")
 (defopcode :yield       #x92 ()               "Preemption check point")
 (defopcode :atomic-xchg #x93 (:reg :reg :reg) "Atomic exchange for spinlocks")
 
@@ -413,6 +416,7 @@
 (defopcode :sti        #xA4 ()                    "Enable interrupts")
 (defopcode :percpu-ref #xA5 (:reg :imm16)         "Per-CPU data read")
 (defopcode :percpu-set #xA6 (:imm16 :reg)         "Per-CPU data write")
+(defopcode :fn-addr   #xA7 (:reg :imm32)          "Load tagged function address")
 
 ;;; ============================================================
 ;;; Memory Width Constants
@@ -755,11 +759,11 @@
   (encode-instruction buf +op-write-barrier+ vobj))
 
 ;; Actor/concurrency
-(defun mvm-save-ctx (buf)
-  (encode-instruction buf +op-save-ctx+))
+(defun mvm-save-ctx (buf reg)
+  (encode-instruction buf +op-save-ctx+ reg))
 
-(defun mvm-restore-ctx (buf)
-  (encode-instruction buf +op-restore-ctx+))
+(defun mvm-restore-ctx (buf reg)
+  (encode-instruction buf +op-restore-ctx+ reg))
 
 (defun mvm-yield (buf)
   (encode-instruction buf +op-yield+))
@@ -788,6 +792,9 @@
 
 (defun mvm-percpu-set (buf offset vs)
   (encode-instruction buf +op-percpu-set+ offset vs))
+
+(defun mvm-fn-addr (buf vd target)
+  (encode-instruction buf +op-fn-addr+ vd target))
 
 ;;; ============================================================
 ;;; Disassembler

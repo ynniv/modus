@@ -50,6 +50,15 @@ Modus has two runtime targets:
 - SMP: multi-core boot, per-CPU scheduling, IPI wakeup (tested on 8 CPUs)
 - Per-actor heaps with independent garbage collection
 
+**Raspberry Pi (bare-metal hardware)**
+- Runs on Pi Zero 2 W (BCM2710A1, Cortex-A53) and QEMU raspi3b
+- DWC2 USB host stack: enumeration, hub support, CDC Ethernet (QEMU)
+- DWC2 USB device mode: CDC-ECM gadget for Pi Zero 2 W networking
+- USB HID: keyboard, mouse, tablet via boot protocol
+- BCM2835 peripherals: system timer, GPIO LED, GPU framebuffer (640x480 HDMI)
+- UART serial bootloader: deploy new kernels over serial from Pi 5 — no SD card swapping
+- Qubes-like actor isolation: net-domain owns hardware, SSH handlers use mailbox messages
+
 ## Building and running
 
 Requires SBCL and QEMU.
@@ -86,11 +95,28 @@ Requires SBCL and QEMU.
 
 Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
-### RPi REPL
+### Raspberry Pi (QEMU raspi3b)
 
 ```bash
 ./modus/scripts/run-rpi-repl.sh      # AArch64 REPL on emulated raspi3b
+./modus/scripts/run-rpi-ssh.sh       # SSH over USB CDC Ethernet (port 2222)
+./modus/scripts/run-rpi-hid.sh       # USB keyboard-driven REPL
 ```
+
+### Raspberry Pi Zero 2 W (real hardware)
+
+```bash
+# One-time: build bootloader and flash SD card
+cd lib/modus64 && bash scripts/make-sdcard-bootloader.sh
+sudo dd if=/tmp/pizero2w-sdcard.img of=/dev/sdX bs=4M
+
+# Deploy kernels over UART (no SD card swapping)
+sbcl --script mvm/build-pizero2w-ssh.lisp          # or any build script
+scp /tmp/piboot/kernel8.img pi5:~/kernel8.img
+ssh pi5 'python3 deploy-kernel.py ~/kernel8.img'    # GPIO17 reset + UART upload
+```
+
+See [`docs/rpi-zero-2w.md`](docs/rpi-zero-2w.md) for wiring, memory map, and hardware details.
 
 SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely. Build artifacts are cached by content hash.
 
@@ -99,13 +125,22 @@ SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-6
 ```
 lib/modus64/
   cross/                 Cross-compiler, x64 assembler, runtime (build.lisp ~13K lines)
-  net/                   Shared networking/crypto/SSH (arch-independent, ~4800 lines)
+  net/                   Shared networking/crypto/SSH (arch-independent, ~8000 lines)
     arch-x86.lisp        x86 PCI I/O, addresses
     arch-aarch64.lisp    AArch64 ECAM PCI, addresses
+    arch-raspi3b.lisp    RPi 3B/Zero 2 W adapter (DWC2 addresses, PCI stubs)
     e1000.lisp           E1000 network driver
+    dwc2.lisp            DWC2 USB host controller (QEMU raspi3b)
+    dwc2-device.lisp     DWC2 USB gadget + CDC-ECM Ethernet (Pi Zero 2 W)
+    usb.lisp             USB enumeration, hub support
+    cdc-ether.lisp       CDC Ethernet NIC (USB host mode)
+    hid.lisp             USB HID keyboard/mouse/tablet
     ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
     crypto.lisp          SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
     ssh.lisp             SSH server (multi-connection)
+    actors.lisp          Actor system (spawn, yield, send, receive, scheduler)
+    bcm2835-periph.lisp  System timer, GPIO LED, GPU framebuffer
+    uart-bootloader.lisp UART serial bootloader protocol
   mvm/                   Modus Virtual Machine
     mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
     compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)

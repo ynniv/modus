@@ -27,10 +27,24 @@
 ;;; Configurable UART Base Address
 ;;; ============================================================
 
-(defvar *aarch64-serial-base* #x09000000
-  "Base address of the PL011 UART for AArch64 serial-out.
-   Default is 0x09000000 (QEMU virt). Bind to 0x3F201000 for
-   Raspberry Pi 3, or 0x1F00030000 for Raspberry Pi 5.")
+(defvar *aarch64-serial-base* nil
+  "Base address of the UART for AArch64 serial-out.
+   If nil (default), build-image uses the boot descriptor's :serial-base,
+   falling back to 0x09000000 (QEMU virt PL011).
+   Set explicitly to override: 0x3F215040 for BCM2837 mini UART,
+   0x3F201000 for BCM2837 PL011, 0x1F00030000 for Raspberry Pi 5.")
+
+(defvar *aarch64-serial-width* 0
+  "Store width for serial write: 0=byte (strb, PL011), 2=word (str, mini UART).
+   BCM2835 mini UART requires 32-bit stores to AUX_MU_IO register.")
+
+(defvar *aarch64-serial-tx-poll* nil
+  "TX-ready poll config: nil (no poll) or (offset bit polarity).
+   offset = byte offset from serial base to status register.
+   bit = bit number to test.
+   polarity = :tbz (wait while clear) or :tbnz (wait while set).
+   Mini UART: '(#x14 5 :tbz) — LSR at base+0x14, bit 5 = TX empty, wait while clear.
+   PL011:     '(#x18 5 :tbnz) — UARTFR at base+0x18, bit 5 = TXFF, wait while set.")
 
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
@@ -160,7 +174,20 @@
              (let ((word (aref code index)))
                (setf (aref code index)
                      (logior (logand word #xFF00001F)
-                             (ash (logand offset #x7FFFF) 5))))))))))))
+                             (ash (logand offset #x7FFFF) 5)))))
+            (:adr
+             ;; ADR Xd: immlo(2)|10000|immhi(19)|Rd(5)
+             ;; offset is in instructions, convert to bytes for ADR encoding
+             (let* ((byte-off (* offset 4))
+                    (immlo (logand byte-off 3))
+                    (immhi (logand (ash byte-off -2) #x7FFFF))
+                    (word (aref code index))
+                    (rd (logand word #x1F)))
+               (setf (aref code index)
+                     (logior (ash immlo 29)
+                             (ash #b10000 24)
+                             (ash immhi 5)
+                             rd)))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."
@@ -805,15 +832,31 @@
                         (ash (logand imm4 #xF) 8)
                         #x1F)))
 
-;;; --- MRS (read system register) ---
+;;; --- MRS/MSR (system register access) ---
+;;; System register encoding: op0[1:0]|op1[2:0]|CRn[3:0]|CRm[3:0]|op2[2:0] = 16 bits
+;;; This 16-bit value must be shifted left by 5 to align with instruction bits [20:5].
+;;; Common encodings:
+;;;   TPIDR_EL1 (S3_0_C13_C0_4) = #xC684
+;;;   VBAR_EL1  (S3_0_C12_C0_0) = #xC600
 
 (defun a64-mrs (buf rt sysreg-encoding)
   "MRS Xt, <sysreg>  (read system register)"
-  ;; MRS: 1101010100|1|1|op0|op1|CRn|CRm|op2|Rt
-  ;; sysreg-encoding packs op0..op2 into bits [19:5]
+  ;; MRS: 1101010100|1|op0[1:0]|op1[2:0]|CRn[3:0]|CRm[3:0]|op2[2:0]|Rt[4:0]
+  ;; Base #xD5300000 has L=1 (read), op0 MSB set (op0 >= 2)
   (a64-emit buf (logior #xD5300000
-                        sysreg-encoding
+                        (ash sysreg-encoding 5)
                         rt)))
+
+(defun a64-msr-sysreg (buf sysreg-encoding rt)
+  "MSR <sysreg>, Xt  (write system register)"
+  ;; MSR: 1101010100|0|op0[1:0]|op1[2:0]|CRn[3:0]|CRm[3:0]|op2[2:0]|Rt[4:0]
+  ;; Base #xD5100000 has L=0 (write), op0 MSB set (op0 >= 2)
+  (a64-emit buf (logior #xD5100000
+                        (ash sysreg-encoding 5)
+                        rt)))
+
+(defconstant +sysreg-tpidr-el1+ #xC684 "TPIDR_EL1: S3_0_C13_C0_4")
+(defconstant +sysreg-vbar-el1+  #xC600 "VBAR_EL1: S3_0_C12_C0_0")
 
 ;;; --- Atomic exchange (LDXR/STXR pair) ---
 ;;; LDXR Xt, [Xn]: size|001000|0|1|0|Rs(11111)|0|Rt2(11111)|Rn|Rt
@@ -1071,8 +1114,21 @@
                 (a64-asr-imm buf +a64-x16+ +a64-x0+ 1)
                 ;; load UART base (configurable via *aarch64-serial-base*)
                 (a64-load-imm64 buf +a64-x17+ *aarch64-serial-base*)
-                ;; strb w16, [x17] (store byte to UART data register)
-                (a64-str-width buf +a64-x16+ +a64-x17+ 0 0))
+                ;; TX-ready poll: wait for transmit FIFO to have space
+                (when *aarch64-serial-tx-poll*
+                  (destructuring-bind (offset bit polarity) *aarch64-serial-tx-poll*
+                    ;; ldr w18, [x17, #offset] — read status register (32-bit)
+                    (a64-ldr-width buf 18 +a64-x17+ offset 2)
+                    ;; tbz/tbnz x18, #bit, -4 — loop back to ldr
+                    (let ((opcode (ecase polarity
+                                    (:tbz  #b00110110)   ; wait while bit clear
+                                    (:tbnz #b00110111)))) ; wait while bit set
+                      (a64-emit buf (logior (ash opcode 24)
+                                            (ash bit 19)
+                                            (ash (logand -1 #x3FFF) 5)
+                                            18)))))
+                ;; store to UART data register (strb for PL011, str for mini UART)
+                (a64-str-width buf +a64-x16+ +a64-x17+ 0 *aarch64-serial-width*))
                ((= code #x0301)
                 ;; Serial read: poll UART until a byte is available,
                 ;; return tagged fixnum char code in x0.
@@ -1093,6 +1149,15 @@
                 (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 0)
                 ;; tag as fixnum: lsl x0, x0, #1
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((= code #x0303)
+                ;; Jump to address: untag V0 (ASR 1), BR x0
+                (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)
+                (a64-br buf +a64-x0+))
+               ((= code #x0400)
+                ;; switch-idle-stack: set SP to per-CPU idle-stack-top
+                (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
+                (a64-ldr-unsigned buf +a64-x16+ +a64-x16+ #x38)
+                (a64-add-imm buf +a64-sp+ +a64-x16+ 0))
                (t
                 ;; Real CPU trap
                 (a64-svc buf code)))))
@@ -1710,26 +1775,112 @@
            ;; offset and store a dirty byte. For now, emit a memory barrier.
            (a64-dmb buf :option #xB))
 
-          ;; ---- SAVE-CTX ----
-          ;; Save all virtual registers to the actor context block
-          ;; For now: push all callee-saved to stack
+          ;; ---- SAVE-CTX Vd ----
+          ;; Real setjmp semantics for actor context switching.
+          ;; Vd holds save area address (untagged by compiler).
+          ;; Returns 0 (initial save) or 2 (resumed via restore-ctx).
+          ;; Extra callee-saved (x20-x23, x29, x30) are pushed to the stack
+          ;; so they're recovered when SP is restored. Only essential state
+          ;; (SP, x24, x25, x19, continuation, obj-alloc/limit) goes in save area.
           ((= op +op-save-ctx+)
-           (a64-stp-pre buf +a64-x19+ +a64-x20+ +a64-sp+ -64)
-           (a64-stp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 16)
-           (a64-stp-offset buf +a64-x23+ +a64-x24+ +a64-sp+ 32)
-           (a64-stp-offset buf +a64-x25+ +a64-x26+ +a64-sp+ 48))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src vd +a64-x0+)))
+             ;; 1. Push extra callee-saved to stack (48 bytes, 16-byte aligned)
+             (a64-stp-pre buf +a64-x20+ +a64-x21+ +a64-sp+ -48)
+             (a64-stp-offset buf +a64-x22+ +a64-x23+ +a64-sp+ 16)
+             (a64-stp-offset buf +a64-x29+ +a64-x30+ +a64-sp+ 32)
+             ;; 2. Save SP (post-push) to save area [pa+0x00]
+             (a64-add-imm buf +a64-x16+ +a64-sp+ 0)   ; MOV x16, SP
+             (a64-str-unsigned buf +a64-x16+ pa 0)     ; [pa+0x00] = SP
+             ;; 3. Save key registers to save area
+             (a64-str-unsigned buf +a64-x24+ pa 8)     ; [pa+0x08] = x24 (alloc ptr)
+             (a64-str-unsigned buf +a64-x25+ pa 16)    ; [pa+0x10] = x25 (alloc limit)
+             (a64-str-unsigned buf +a64-x19+ pa 24)    ; [pa+0x18] = x19 (V4)
+             ;; 4. ADR x17 → continuation; store to [pa+0x28]
+             (let ((adr-idx (a64-current-index buf)))
+               (a64-emit buf 0)                         ; placeholder for ADR x17
+               (a64-str-unsigned buf +a64-x17+ pa #x28) ; [pa+0x28] = continuation
+               ;; 5. Save per-CPU obj-alloc/obj-limit from TPIDR_EL1
+               (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
+               (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
+               (a64-str-unsigned buf +a64-x17+ pa #x68)  ; [pa+0x68] = obj-alloc
+               (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x30)
+               (a64-str-unsigned buf +a64-x17+ pa #x70)  ; [pa+0x70] = obj-limit
+               ;; 6. Initial save: return 0
+               (a64-movz buf +a64-x0+ 0)
+               ;; 7. B to pop (skip resume entry)
+               (let ((b-idx (a64-current-index buf)))
+                 (a64-b buf 0)                           ; placeholder
+                 ;; 8. Continuation label — restore-ctx BR's here
+                 (let ((cont-idx (a64-current-index buf)))
+                   ;; Patch ADR x17, <continuation>
+                   ;; ADR: immlo(2)|10000|immhi(19)|Rd(5)
+                   (let* ((byte-off (* (- cont-idx adr-idx) 4))
+                          (immlo (logand byte-off 3))
+                          (immhi (logand (ash byte-off -2) #x7FFFF)))
+                     (setf (aref (a64-buffer-code buf) adr-idx)
+                           (logior (ash immlo 29)
+                                   (ash #b10000 24)
+                                   (ash immhi 5)
+                                   +a64-x17+)))
+                   ;; Resume path: return 2 (tagged fixnum 1)
+                   (a64-movz buf +a64-x0+ 2)
+                   ;; 9. Pop callee-saved (both paths converge here)
+                   (let ((pop-idx (a64-current-index buf)))
+                     ;; Patch B forward to here
+                     (setf (aref (a64-buffer-code buf) b-idx)
+                           (logior (ash #b000101 26)
+                                   (logand (- pop-idx b-idx) #x3FFFFFF)))
+                     (a64-ldp-offset buf +a64-x29+ +a64-x30+ +a64-sp+ 32)
+                     (a64-ldp-offset buf +a64-x22+ +a64-x23+ +a64-sp+ 16)
+                     (a64-ldp-post buf +a64-x20+ +a64-x21+ +a64-sp+ 48)
+                     ;; 10. Store result (x0) into Vd
+                     (store-dst +a64-x0+ vd)))))))
 
-          ;; ---- RESTORE-CTX ----
+          ;; ---- RESTORE-CTX Vd ----
+          ;; Real longjmp semantics. Restores registers from save area,
+          ;; switches SP, releases scheduler lock, enables interrupts,
+          ;; then BR to saved continuation. Never returns.
           ((= op +op-restore-ctx+)
-           (a64-ldp-offset buf +a64-x25+ +a64-x26+ +a64-sp+ 48)
-           (a64-ldp-offset buf +a64-x23+ +a64-x24+ +a64-sp+ 32)
-           (a64-ldp-offset buf +a64-x21+ +a64-x22+ +a64-sp+ 16)
-           (a64-ldp-post buf +a64-x19+ +a64-x20+ +a64-sp+ 64))
+           (let* ((vd (vr 0))
+                  (pa (ensure-src vd +a64-x0+)))
+             ;; Move addr to x16 (pa may be x19/x24/x25 which get overwritten)
+             (a64-mov-reg buf +a64-x16+ pa)
+             ;; Load continuation address into x17
+             (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x28)
+             ;; Restore per-CPU obj-alloc/obj-limit via TPIDR_EL1
+             (a64-mrs buf +a64-x0+ +sysreg-tpidr-el1+)
+             (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x68)
+             (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x28)  ; TPIDR+0x28 = obj-alloc
+             (a64-ldr-unsigned buf +a64-x1+ +a64-x16+ #x70)
+             (a64-str-unsigned buf +a64-x1+ +a64-x0+ #x30)  ; TPIDR+0x30 = obj-limit
+             ;; Restore callee-saved from save area
+             (a64-ldr-unsigned buf +a64-x19+ +a64-x16+ #x18)
+             (a64-ldr-unsigned buf +a64-x24+ +a64-x16+ #x08)
+             (a64-ldr-unsigned buf +a64-x25+ +a64-x16+ #x10)
+             ;; Restore SP from save area (AFTER register loads, SP change is the
+             ;; "point of no return" — we're now on the resumed actor's stack)
+             (a64-ldr-unsigned buf +a64-x0+ +a64-x16+ 0)
+             (a64-add-imm buf +a64-sp+ +a64-x0+ 0)     ; MOV SP, x0
+             ;; Release scheduler lock (MUST be after SP switch to prevent
+             ;; another CPU from dequeuing this actor while on its stack)
+             (a64-load-imm64 buf +a64-x0+ #x41200200)   ; scheduler lock addr
+             (a64-str-unsigned buf +a64-xzr+ +a64-x0+ 0) ; store 0 → unlock
+             ;; Memory barrier — ensure lock release visible to other CPUs
+             (a64-dmb buf :option #xB)
+             ;; Enable interrupts
+             (a64-msr-daifclr buf #x3)
+             ;; Jump to continuation (save-ctx's resume entry point)
+             (a64-br buf +a64-x17+)))
 
           ;; ---- YIELD ----
-          ;; Preemption check: test a flag, yield if set
-          ;; Simplified: WFE (wait for event, low-power yield)
+          ;; Preemption check point (emitted at end of every loop iteration).
+          ;; SEV + WFE: SEV sets the event register, then WFE sees it set,
+          ;; clears it, and returns immediately (never waits). This lets
+          ;; QEMU process events while avoiding the stall that bare WFE
+          ;; causes on real Cortex-A53 cores with no pending events.
           ((= op +op-yield+)
+           (a64-emit buf #xD503209F)   ; SEV (send event)
            (a64-wfe buf))
 
           ;; ---- ATOMIC-XCHG Vd, Vaddr, Vs ----
@@ -1778,18 +1929,10 @@
              (a64-str-width buf ps +a64-x16+ 0 width)))
 
           ;; ---- HALT ----
+          ;; WFI for idle scheduler loop. Wakes on interrupt (SGI/timer).
+          ;; Semihosting exit is handled by a separate shutdown() function.
           ((= op +op-halt+)
-           ;; Semihosting SYS_EXIT: makes QEMU exit cleanly
-           ;; Build param block on stack: [ADP_Stopped_ApplicationExit, 0]
-           (a64-load-imm64 buf +a64-x0+ #x20026) ; ADP_Stopped_ApplicationExit
-           (a64-movz buf +a64-x1+ 0)              ; exit code 0
-           (a64-stp-pre buf +a64-x0+ +a64-x1+ +a64-sp+ -16) ; push param block
-           (a64-movz buf +a64-x0+ #x18)           ; SYS_EXIT
-           (a64-mov-reg buf +a64-x1+ +a64-sp+)    ; X1 = &param_block
-           (a64-hlt buf #xF000)                    ; semihosting trap
-           ;; Fallback if semihosting not enabled: WFI loop
-           (a64-wfi buf)
-           (a64-b buf (logand -2 #x3FFFFFF)))
+           (a64-wfi buf))
 
           ;; ---- CLI (disable interrupts) ----
           ((= op +op-cli+)
@@ -1807,8 +1950,7 @@
            (let* ((vd (vr 0))
                   (offset (vr 1))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; MRS x17, TPIDR_EL1  (encoding: S3_0_C13_C0_4 → 0xC684)
-             (a64-mrs buf +a64-x17+ #xC684)  ; system reg encoding for TPIDR_EL1
+             (a64-mrs buf +a64-x17+ +sysreg-tpidr-el1+)  ; system reg encoding for TPIDR_EL1
              ;; LDR Xd, [x17, #offset]
              (if (and (zerop (mod offset 8)) (<= offset (* #xFFF 8)))
                  (a64-ldr-unsigned buf pd +a64-x17+ offset)
@@ -1823,14 +1965,36 @@
           ((= op +op-percpu-set+)
            (let ((offset (vr 0))
                  (ps (ensure-src (vr 1) +a64-x17+)))
-             ;; MRS x16, TPIDR_EL1
-             (a64-mrs buf +a64-x16+ #xC684)
+             (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
              (if (and (zerop (mod offset 8)) (<= offset (* #xFFF 8)))
                  (a64-str-unsigned buf ps +a64-x16+ offset)
                  (progn
                    (a64-load-imm64 buf +a64-x17+ offset)
                    (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x17+)
                    (a64-stur buf ps +a64-x16+ 0)))))
+
+          ;; ---- FN-ADDR Vd, target:imm32 ----
+          ;; Load tagged function address. Target is bytecode offset.
+          ;; Resolved via ADR (PC-relative), then LSL #1 to tag as fixnum.
+          ((= op +op-fn-addr+)
+           (let* ((vd (vr 0))
+                  (target-offset (vr 1))
+                  (pd (or (a64-phys-reg vd) +a64-x16+))
+                  (label (gethash target-offset mvm-to-native-label)))
+             (if label
+                 (let ((idx (a64-current-index buf)))
+                   ;; ADR Xd, target — placeholder, resolved by fixup
+                   (a64-emit buf (logior (ash #b10000 24) pd))
+                   (a64-add-fixup buf idx label :adr)
+                   ;; LSL Xd, Xd, #1 — tag as fixnum (shift left by 1)
+                   (a64-emit buf (logior #xD3400000       ; UBFM (64-bit)
+                                         (ash 63 16)      ; immr=63 for LSL #1
+                                         (ash 62 10)      ; imms=62 for LSL #1
+                                         (ash pd 5) pd)))
+                 ;; Unknown target: load 0
+                 (a64-movz buf pd 0))
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
 
           ;; ---- Unknown opcode ----
           (t

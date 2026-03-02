@@ -527,6 +527,12 @@
       ((string-equal op-name "SET-RSP")          (compile-set-rsp (cadr form) env dest))
       ((string-equal op-name "LIDT")             (compile-lidt (cadr form) env dest))
 
+      ;; --- Jump ---
+      ((string-equal op-name "JUMP-TO-ADDRESS")  (compile-jump-to-address (cadr form) env dest))
+
+      ;; --- Function Address ---
+      ((string-equal op-name "FN-ADDR")          (compile-fn-addr (cadr form) dest))
+
       ;; --- Function Call (default) ---
       (t (compile-call op (cdr form) env dest)))))
 
@@ -1649,8 +1655,11 @@
 
 (defun compile-save-context (addr-form env dest)
   "Compile (save-context addr) - save registers to actor struct.
-   Returns 0 on initial save, 1 when resumed via restore-context."
+   Returns 0 on initial save, 1 when resumed via restore-context.
+   Untags the address before passing to save-ctx."
   (compile-form addr-form env dest)
+  ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
+  (emit-ir :sar dest dest +fixnum-shift+)
   ;; The save-ctx MVM instruction handles the actual save.
   ;; It stores the continuation point internally.
   (emit-ir :save-ctx dest)
@@ -1659,8 +1668,11 @@
 
 (defun compile-restore-context (addr-form env dest)
   "Compile (restore-context addr) - restore registers from actor struct.
-   This never returns to the caller."
+   This never returns to the caller.
+   Untags the address before passing to restore-ctx."
   (compile-form addr-form env dest)
+  ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
+  (emit-ir :sar dest dest +fixnum-shift+)
   (emit-ir :restore-ctx dest)
   ;; restore-ctx never returns, but we need dest for type consistency
   )
@@ -1688,6 +1700,12 @@
     ;; Result is in VR
     (unless (= dest +vreg-vr+)
       (emit-ir :mov dest +vreg-vr+))))
+
+(defun compile-fn-addr (name dest)
+  "Compile (fn-addr name) - load tagged native function address.
+   Resolves function name at link time via FN-ADDR opcode."
+  (let ((fn-name (normalize-name name)))
+    (emit-ir :fn-addr dest fn-name)))
 
 ;;; ============================================================
 ;;; SMP Primitives
@@ -1791,8 +1809,13 @@
 (defun compile-switch-idle-stack (dest)
   "Compile (switch-idle-stack) - switch to per-CPU idle stack. Returns 0."
   ;; This is implemented as a special percpu-ref that loads the stack pointer
-  (emit-ir :trap 2)  ; trap code 2 = switch-idle-stack
+  (emit-ir :trap #x0400)  ; trap code 0x400 = switch-idle-stack (above frame-enter range)
   (emit-ir :li dest 0))
+
+(defun compile-jump-to-address (addr-form env dest)
+  "Compile (jump-to-address addr) — untag fixnum, branch to it. Never returns."
+  (compile-form addr-form env +vreg-v0+)
+  (emit-ir :trap #x0303))
 
 (defun compile-set-rsp (addr-form env dest)
   "Compile (set-rsp addr) - set stack pointer from tagged fixnum"
@@ -2011,6 +2034,9 @@
       (:li-const 10)
       (:li-func 10)
 
+      ;; Function address: 1 opcode + 1 reg + 4 imm32 = 6 bytes
+      (:fn-addr 6)
+
       ;; Branch (unconditional): 1 opcode + 2 off16 = 3 bytes
       (:br    3)
 
@@ -2058,10 +2084,9 @@
       (:stack-load  4)
       (:stack-store 4)
 
-      ;; Context save/restore: 1 opcode, no operands = 1 byte
-      ;; (the register in the IR is not encoded in bytecode)
-      (:save-ctx  1)
-      (:restore-ctx 1)
+      ;; Context save/restore: 1 opcode + 1 reg = 2 bytes
+      (:save-ctx  2)
+      (:restore-ctx 2)
 
       ;; Trap: 1 opcode + 2 imm16 = 3 bytes
       (:trap  3)
@@ -2288,6 +2313,16 @@
            ;; Emit as call-indirect
            (mvm-call-ind buf (second insn)))
 
+          ;; ---- Function address ----
+          (:fn-addr
+           (let* ((dest-reg (second insn))
+                  (fn-name (third insn))
+                  (fn-info (gethash fn-name *functions*))
+                  (target (if fn-info
+                              (function-info-bytecode-offset fn-info)
+                              0)))
+             (mvm-fn-addr buf dest-reg target)))
+
           ;; ---- Memory ----
           (:load
            (mvm-load buf (second insn) (third insn) (fourth insn)))
@@ -2338,9 +2373,9 @@
 
           ;; ---- Context ----
           (:save-ctx
-           (mvm-save-ctx buf))
+           (mvm-save-ctx buf (second insn)))
           (:restore-ctx
-           (mvm-restore-ctx buf))
+           (mvm-restore-ctx buf (second insn)))
 
           ;; ---- Trap ----
           (:trap

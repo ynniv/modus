@@ -1,0 +1,695 @@
+;;;; actors.lisp - Shared actor system (architecture-independent)
+;;;;
+;;;; Erlang-style actors with mailboxes, cooperative scheduling, and
+;;;; term serialization. Uses MVM intrinsics only.
+;;;;
+;;;; Requires architecture hooks (loaded before this file):
+;;;;   actor-table-base, sched-state-base, sched-lock-addr,
+;;;;   pool-state-base, staging-base-addr, actor-stack-base,
+;;;;   actor-heap-base, mailbox-pool-base, mailbox-pool-limit,
+;;;;   scratch-addr, decode-ptr-addr,
+;;;;   get-current-actor, set-current-actor,
+;;;;   get-idle-flag, set-idle-flag,
+;;;;   wake-idle-ap
+;;;;
+;;;; Actor struct layout (128 bytes, same as x86):
+;;;;   +0x00  status        (0=free, 1=running, 2=ready, 3=dead, 4=blocked)
+;;;;   +0x08  save area: SP
+;;;;   +0x10  save area: alloc ptr (x24/R12)
+;;;;   +0x18  save area: alloc limit (x25/R14)
+;;;;   +0x20  save area: V4 (x19/RBX)
+;;;;   +0x28  (reserved)
+;;;;   +0x30  save area: continuation (entry fn / resume addr)
+;;;;   +0x38  actor-id
+;;;;   +0x40  name
+;;;;   +0x48  next-in-queue
+;;;;   +0x50  mailbox-head
+;;;;   +0x58  mailbox-tail
+;;;;   +0x60  linked-actor
+;;;;   +0x68  (reserved)
+;;;;   +0x70  obj-alloc (per-actor object space)
+;;;;   +0x78  obj-limit (per-actor object space)
+
+;;; ============================================================
+;;; Spinlocks
+;;; ============================================================
+
+;; Acquire spinlock at addr using atomic exchange (TTAS pattern)
+(defun spin-lock (addr)
+  (loop
+    (if (zerop (xchg-mem addr 1))
+        (return 0)
+        (loop
+          (if (zerop (mem-ref addr :u64))
+              (return 0)
+              (pause))))))
+
+;; Release spinlock
+(defun spin-unlock (addr)
+  (mfence)
+  (setf (mem-ref addr :u64) 0))
+
+;;; ============================================================
+;;; Actor struct accessors
+;;; ============================================================
+
+;; Address of actor struct for actor ID
+(defun actor-struct-addr (id)
+  (+ (actor-table-base) (* id 128)))
+
+;; Read field from actor struct
+(defun actor-get (id offset)
+  (mem-ref (+ (actor-struct-addr id) offset) :u64))
+
+;; Write field to actor struct
+(defun actor-set (id offset val)
+  (setf (mem-ref (+ (actor-struct-addr id) offset) :u64) val))
+
+;; Stack top for actor ID (each gets 64KB, grows down)
+(defun actor-stack-top (id)
+  (+ (actor-stack-base) (* (+ id 1) #x10000)))
+
+;;; ============================================================
+;;; Run queue (linked list via actor struct +0x48)
+;;; ============================================================
+
+;; Add actor to run queue tail
+(defun actor-enqueue (id)
+  (actor-set id #x48 0)
+  (let ((head (mem-ref (+ (sched-state-base) #x10) :u64)))
+    (if (zerop head)
+        (setf (mem-ref (+ (sched-state-base) #x10) :u64) id)
+        (let ((cur head))
+          (loop
+            (let ((next (actor-get cur #x48)))
+              (when (zerop next)
+                (actor-set cur #x48 id)
+                (return 0))
+              (setq cur next)))))))
+
+;; Remove and return first actor from run queue (0 if empty)
+(defun actor-dequeue ()
+  (let ((head (mem-ref (+ (sched-state-base) #x10) :u64)))
+    (if (zerop head)
+        0
+        (let ((next (actor-get head #x48)))
+          (setf (mem-ref (+ (sched-state-base) #x10) :u64) next)
+          (actor-set head #x48 0)
+          head))))
+
+;;; ============================================================
+;;; Mailbox shared pool
+;;; ============================================================
+;;;
+;;; Pool state at pool-state-base:
+;;;   +0x00  pool-next   (next free cell raw address)
+;;;   +0x08  pool-limit  (end of pool)
+;;;   +0x10  free-head   (free list, cons-tagged or 0)
+
+(defun pool-init ()
+  (let ((ps (pool-state-base)))
+    (setf (mem-ref ps :u64) (mailbox-pool-base))
+    (let ((ps8 (+ ps 8)))
+      (setf (mem-ref ps8 :u64) (mailbox-pool-limit)))
+    (let ((ps16 (+ ps 16)))
+      (setf (mem-ref ps16 :u64) 0))))
+
+;; Allocate 16-byte cell. Returns cons-tagged pointer or 0.
+(defun pool-alloc ()
+  (let ((ps (pool-state-base)))
+    (let ((free (mem-ref (+ ps 16) :u64)))
+      (if (not (zerop free))
+          (progn
+            (setf (mem-ref (+ ps 16) :u64) (cdr free))
+            free)
+          (let ((ptr (mem-ref ps :u64)))
+            (if (>= ptr (mem-ref (+ ps 8) :u64))
+                0
+                (progn
+                  (setf (mem-ref ps :u64) (+ ptr 16))
+                  (logior (untag ptr) (untag 1)))))))))
+
+;; Return cell to free list
+(defun pool-free (cell)
+  (let ((ps (pool-state-base)))
+    (set-cdr cell (mem-ref (+ ps 16) :u64))
+    (setf (mem-ref (+ ps 16) :u64) cell)
+    0))
+
+;;; ============================================================
+;;; Actor init
+;;; ============================================================
+
+(defun actor-init ()
+  ;; Zero actor table (64 * 128 = 8192 bytes)
+  (let ((base (actor-table-base))
+        (i 0))
+    (loop
+      (when (>= i 8192) (return 0))
+      (setf (mem-ref (+ base i) :u64) 0)
+      (setq i (+ i 8))))
+  ;; Zero scheduler state
+  (let ((ss (sched-state-base)))
+    (setf (mem-ref (+ ss 8) :u64) 2)    ; actor-count = 2 (next available)
+    (setf (mem-ref (+ ss #x10) :u64) 0) ; run-head = none
+    (setf (mem-ref (+ ss #x18) :u64) 0)) ; initialized = 0 (set after per-CPU)
+  ;; Per-CPU: current-actor = 1 (primordial), reduction counter
+  (set-current-actor 1)
+  (percpu-set 8 4000)         ; reduction counter: tagged 2000
+  ;; Set initialized flag
+  (setf (mem-ref (+ (sched-state-base) #x18) :u64) 1)
+  ;; Initialize mailbox pool
+  (pool-init)
+  ;; Set up actor 1 (primordial)
+  (actor-set 1 #x00 1)    ; status = running
+  (actor-set 1 #x38 1)    ; actor-id = 1
+  ;; Primordial actor keeps boot-time alloc region (large enough for SSH crypto).
+  ;; Just record current alloc state for context-switch save/restore.
+  (let ((cur-alloc (get-alloc-ptr))
+        (cur-limit (get-alloc-limit)))
+    (actor-set 1 #x70 cur-alloc)
+    (actor-set 1 #x78 cur-limit)
+    (percpu-set 40 cur-alloc)
+    (percpu-set 48 cur-limit))
+  ;; Print "ACT"
+  (write-byte 65) (write-byte 67) (write-byte 84) (write-byte 10))
+
+;;; ============================================================
+;;; Actor spawn
+;;; ============================================================
+;;;
+;;; fn is a tagged native function address.
+;;; Entry function MUST NOT return (no actor-exit on AArch64 yet).
+;;; Loop forever or explicitly handle lifecycle.
+
+(defun actor-spawn (fn)
+  (spin-lock (sched-lock-addr))
+  (let ((count (mem-ref (+ (sched-state-base) 8) :u64)))
+    (if (>= count 64)
+        (progn
+          (spin-unlock (sched-lock-addr))
+          (write-byte 33)   ; '!' too many actors
+          0)
+        (let ((id count))
+          ;; Bump actor count
+          (setf (mem-ref (+ (sched-state-base) 8) :u64) (+ count 1))
+          ;; Initialize actor struct
+          (actor-set id #x00 2)    ; status = ready
+          (actor-set id #x38 id)   ; actor-id
+          ;; Set up save area for restore-context
+          (let ((stack-top (actor-stack-top id)))
+            ;; SP = stack top (no actor-exit pushed — fn must not return)
+            (actor-set id #x08 (untag stack-top))
+            ;; Per-actor heap: base = actor-heap-base + (id-1) * 0x400000 (4MB each)
+            (let ((id1 (- id 1)))
+              (let ((heap-off (ash id1 22)))
+                (let ((heap-base (+ (actor-heap-base) heap-off)))
+                  ;; Alloc ptr (x24/R12): bump allocator start
+                  (actor-set id #x10 (untag heap-base))
+                  ;; Alloc limit (x25/R14): bump allocator end (4MB per actor)
+                  ;; Both cons and objects allocate from x24→x25 on AArch64
+                  (let ((limit (+ heap-base #x400000)))
+                    (actor-set id #x18 (untag limit)))
+                  ;; obj-alloc and obj-limit (TAGGED — percpu-ref returns tagged values)
+                  ;; 3.5MB obj space: 0x80000 to 0x400000 (enough for SSH crypto)
+                  (actor-set id #x70 (+ heap-base #x80000))
+                  (actor-set id #x78 (+ heap-base #x400000)))))
+            ;; V4 (x19/RBX) = 0
+            (actor-set id #x20 0)
+            ;; Continuation = entry function
+            (actor-set id #x30 (untag fn)))
+          ;; Add to run queue
+          (actor-enqueue id)
+          (spin-unlock (sched-lock-addr))
+          ;; Wake idle AP
+          (wake-idle-ap)
+          id))))
+
+;;; ============================================================
+;;; Yield (cooperative context switch)
+;;; ============================================================
+
+(defun yield ()
+  (if (zerop (mem-ref (+ (sched-state-base) #x18) :u64))
+      ;; Actor system not initialized, no-op
+      0
+      (progn
+        (spin-lock (sched-lock-addr))
+        (let ((next-id (actor-dequeue)))
+          (if (zerop next-id)
+              ;; No other actors ready
+              (progn (spin-unlock (sched-lock-addr)) 0)
+              (let ((cur-id (get-current-actor)))
+                  (if (zerop cur-id)
+                      ;; No current actor (idle scheduler) — run dequeued directly
+                      (progn
+                        (set-idle-flag 0)
+                        (set-current-actor next-id)
+                        (actor-set next-id #x00 1)
+                        (percpu-set 40 (actor-get next-id #x70))
+                        (percpu-set 48 (actor-get next-id #x78))
+                        (let ((next-addr (actor-struct-addr next-id)))
+                          (restore-context (+ next-addr #x08))))
+                      (let ((cur-addr (actor-struct-addr cur-id)))
+                        ;; save-context returns 0 on save, nonzero on resume
+                        (if (zerop (save-context (+ cur-addr #x08)))
+                            ;; Save path: do the switch
+                            (progn
+                              (actor-set cur-id #x00 2)
+                              ;; Save outgoing actor's object space
+                              (actor-set cur-id #x70 (percpu-ref 40))
+                              (actor-set cur-id #x78 (percpu-ref 48))
+                              (actor-enqueue cur-id)
+                              ;; Switch to next actor
+                              (set-current-actor next-id)
+                              (actor-set next-id #x00 1)
+                              (percpu-set 40 (actor-get next-id #x70))
+                              (percpu-set 48 (actor-get next-id #x78))
+                              (let ((next-addr (actor-struct-addr next-id)))
+                                (restore-context (+ next-addr #x08))))
+                            ;; Resume path: lock already released by restore-context
+                            0)))))))))
+
+;;; ============================================================
+;;; Actor lifecycle
+;;; ============================================================
+
+(defun actor-self ()
+  (get-current-actor))
+
+(defun actor-count ()
+  (mem-ref (+ (sched-state-base) 8) :u64))
+
+;; Called when a spawned actor's function returns.
+;; Entry functions SHOULD call this explicitly on AArch64.
+(defun actor-exit ()
+  (let ((cur (get-current-actor)))
+    ;; Notify linked actor if any
+    (let ((linked (actor-get cur #x60)))
+      (if (not (zerop linked))
+          (send linked cur)
+          0))
+    ;; Mark dead
+    (actor-set cur #x00 3))
+  ;; Switch to next ready actor
+  (spin-lock (sched-lock-addr))
+  (let ((next-id (actor-dequeue)))
+    (if (zerop next-id)
+        (progn (spin-unlock (sched-lock-addr)) (ap-scheduler))
+        (progn
+          (set-current-actor next-id)
+          (actor-set next-id #x00 1)
+          (percpu-set 40 (actor-get next-id #x70))
+          (percpu-set 48 (actor-get next-id #x78))
+          (let ((next-addr (actor-struct-addr next-id)))
+            (restore-context (+ next-addr #x08)))))))
+
+;; Link current actor to another
+(defun link (other-id)
+  (let ((self-id (actor-self)))
+    (actor-set self-id #x60 other-id)
+    (actor-set other-id #x60 self-id)
+    0))
+
+;; Spawn + link
+(defun spawn-link (fn)
+  (let ((wid (actor-spawn fn)))
+    (link wid)
+    wid))
+
+;;; ============================================================
+;;; Scheduler (idle loop)
+;;; ============================================================
+
+(defun ap-scheduler ()
+  ;; Switch to per-CPU idle stack
+  (switch-idle-stack)
+  ;; No actor running
+  (set-current-actor 0)
+  (loop
+    (cli)
+    (set-idle-flag 1)
+    (spin-lock (sched-lock-addr))
+    (let ((next-id (actor-dequeue)))
+      (if (zerop next-id)
+          ;; Nothing to do: unlock, then STI+HLT (WFI on AArch64)
+          (progn
+            (spin-unlock (sched-lock-addr))
+            (sti-hlt))
+          ;; Got work: switch to actor
+          (progn
+            (set-idle-flag 0)
+            (set-current-actor next-id)
+            (actor-set next-id #x00 1)
+            (percpu-set 40 (actor-get next-id #x70))
+            (percpu-set 48 (actor-get next-id #x78))
+            (let ((next-addr (actor-struct-addr next-id)))
+              (restore-context (+ next-addr #x08))))))))
+
+;;; ============================================================
+;;; Term serialization (staging buffers)
+;;; ============================================================
+;;;
+;;; Per-actor staging buffers at staging-base-addr (16KB each, max 64).
+;;; Layout: [0:8] write-offset, [8:16] read-offset, [16:16384] data.
+
+(defun staging-init ()
+  (let ((base (staging-base-addr))
+        (i 0))
+    (loop
+      (when (>= i 131072) (return 0))
+      (setf (mem-ref (+ base (ash i 3)) :u64) 0)
+      (setq i (+ i 1)))))
+
+;; Check if val needs serialization (machine bit 0 = 1 means cons/object)
+(defun needs-staging (val)
+  (let ((sa (scratch-addr)))
+    (setf (mem-ref sa :u64) val)
+    (logand (mem-ref sa :u8) 1)))
+
+;; Tag a buffer address for staging (set machine bit 0)
+(defun staging-tag (buf-addr)
+  (let ((sa (scratch-addr)))
+    (setf (mem-ref sa :u64) buf-addr)
+    (let ((b0 (mem-ref sa :u8)))
+      (setf (mem-ref sa :u8) (logior b0 1)))
+    (mem-ref sa :u64)))
+
+;; Check if pool cell car is a staging pointer
+(defun staging-ptr-p (raw-msg)
+  (let ((sa (scratch-addr)))
+    (setf (mem-ref sa :u64) raw-msg)
+    (logand (mem-ref sa :u8) 1)))
+
+;; Remove staging tag (clear machine bit 0)
+(defun staging-untag (raw-msg)
+  (let ((sa (scratch-addr)))
+    (setf (mem-ref sa :u64) raw-msg)
+    (let ((b0 (mem-ref sa :u8)))
+      (setf (mem-ref sa :u8) (logand b0 (- 0 2))))
+    (mem-ref sa :u64)))
+
+;; Read subtag byte from object header.
+;; Compatible with try-alloc-obj pointer format (tag in low 2 bits).
+;; Uses the same raw-address derivation as aref/array-length.
+(defun soft-subtag (obj)
+  (let ((raw (ash (logand obj (- 0 4)) 1)))
+    (mem-ref raw :u8)))
+
+;; Compute serialized byte count for a term
+(defun term-size (val)
+  (if (zerop val) 1
+      (if (consp val)
+          (let ((s1 (term-size (car val))))
+            (let ((s2 (term-size (cdr val))))
+              (+ 1 (+ s1 s2))))
+          (if (numberp val) 9
+              (let ((st (soft-subtag val)))
+                (if (= st #x32) (+ 5 (array-length val))
+                    (if (= st #x30)
+                        (let ((addr (ash (logand val (- 0 4)) 1)))
+                          (+ 5 (ash (ash (mem-ref addr :u64) -15) 3)))
+                        9)))))))
+
+;; Serialize term to buffer at raw address buf. Returns bytes written.
+;; Uses soft-subtag for object type dispatch (compatible with try-alloc-obj).
+(defun term-encode (val buf)
+  (if (zerop val)
+      (progn (setf (mem-ref buf :u8) 0) 1)
+      (if (consp val)
+          (progn
+            (setf (mem-ref buf :u8) 2)
+            (let ((n1 (term-encode (car val) (+ buf 1))))
+              (let ((buf2 (+ (+ buf 1) n1)))
+                (let ((n2 (term-encode (cdr val) buf2)))
+                  (+ (+ 1 n1) n2)))))
+          (if (numberp val)
+              ;; Fixnum (non-zero)
+              (progn
+                (setf (mem-ref buf :u8) 1)
+                (setf (mem-ref (+ buf 1) :u64) val)
+                9)
+              ;; Object: dispatch on subtag
+              (let ((st (soft-subtag val)))
+                (if (= st #x32)
+                    ;; Array
+                    (let ((alen (array-length val)))
+                      (setf (mem-ref buf :u8) 4)
+                      (setf (mem-ref (+ buf 1) :u32) alen)
+                      (let ((i 0))
+                        (loop
+                          (when (>= i alen) (return 0))
+                          (setf (mem-ref (+ (+ buf 5) i) :u8) (aref val i))
+                          (setq i (+ i 1))))
+                      (+ 5 alen))
+                    (if (= st #x30)
+                        ;; Bignum
+                        (let ((addr (ash (logand val (- 0 4)) 1)))
+                          (let ((nlimbs (ash (mem-ref addr :u64) -15)))
+                            (setf (mem-ref buf :u8) 5)
+                            (setf (mem-ref (+ buf 1) :u32) nlimbs)
+                            (let ((i 0))
+                              (loop
+                                (when (>= i nlimbs) (return 0))
+                                (setf (mem-ref (+ (+ buf 5) (ash i 3)) :u64)
+                                      (mem-ref (+ (+ addr 8) (ash i 3)) :u64))
+                                (setq i (+ i 1))))
+                            (+ 5 (ash nlimbs 3))))
+                        ;; Unknown object type — encode as fixnum
+                        (progn
+                          (setf (mem-ref buf :u8) 1)
+                          (setf (mem-ref (+ buf 1) :u64) val)
+                          9))))))))
+
+;; Deserialize one term from staging buffer.
+;; Uses global read pointer at decode-ptr-addr to track position.
+(defun term-decode-step ()
+  (let ((da (decode-ptr-addr)))
+    (let ((buf (mem-ref da :u64)))
+      (let ((tag (mem-ref buf :u8)))
+        (if (zerop tag)
+            (progn (setf (mem-ref da :u64) (+ buf 1)) 0)
+            (if (= tag 1)
+                (let ((v (mem-ref (+ buf 1) :u64)))
+                  (setf (mem-ref da :u64) (+ buf 9))
+                  v)
+                (if (= tag 2)
+                    (progn
+                      (setf (mem-ref da :u64) (+ buf 1))
+                      (let ((car-val (term-decode-step)))
+                        (let ((cdr-val (term-decode-step)))
+                          (cons car-val cdr-val))))
+                    (if (= tag 3)
+                        (let ((slen (mem-ref (+ buf 1) :u32)))
+                          (let ((s (make-string slen)))
+                            (let ((i 0))
+                              (loop
+                                (when (>= i slen) (return 0))
+                                (string-set s i (mem-ref (+ (+ buf 5) i) :u8))
+                                (setq i (+ i 1))))
+                            (setf (mem-ref da :u64) (+ (+ buf 5) slen))
+                            s))
+                        (if (= tag 4)
+                            (let ((alen (mem-ref (+ buf 1) :u32)))
+                              (let ((a (make-array alen)))
+                                (let ((i 0))
+                                  (loop
+                                    (when (>= i alen) (return 0))
+                                    (aset a i (mem-ref (+ (+ buf 5) i) :u8))
+                                    (setq i (+ i 1))))
+                                (setf (mem-ref da :u64) (+ (+ buf 5) alen))
+                                a))
+                            ;; Bignum (tag 5)
+                            (let ((nlimbs (mem-ref (+ buf 1) :u32)))
+                              (let ((b (make-bignum-n nlimbs)))
+                                (let ((baddr (ash (logand b (- 0 4)) 1)))
+                                  (let ((i 0))
+                                    (loop
+                                      (when (>= i nlimbs) (return 0))
+                                      (setf (mem-ref (+ (+ baddr 8) (ash i 3)) :u64)
+                                            (mem-ref (+ (+ buf 5) (ash i 3)) :u64))
+                                      (setq i (+ i 1))))
+                                (setf (mem-ref da :u64)
+                                      (+ (+ buf 5) (ash nlimbs 3)))
+                                b))))))))))))
+
+;; Allocate bignum with nlimbs limbs
+(defun make-bignum-n (nlimbs)
+  (let ((byte-size (ash nlimbs 3)))
+    (let ((result (try-alloc-obj byte-size #x30)))
+      (if (zerop result) 0
+          (let ((raw (ash (logand result (- 0 4)) 1)))
+            (setf (mem-ref raw :u64) (logior (ash nlimbs 15) (untag #x30)))
+            result)))))
+
+;; Compact staging buffer
+(defun staging-compact (staging-base)
+  (let ((roff (mem-ref (+ staging-base 8) :u64)))
+    (if (zerop roff)
+        0
+        (let ((woff (mem-ref staging-base :u64)))
+          (let ((remaining (- woff roff)))
+            (let ((i 0))
+              (loop
+                (when (>= i remaining) (return 0))
+                (let ((dst (+ (+ staging-base 16) i)))
+                  (let ((src (+ (+ (+ staging-base 16) roff) i)))
+                    (setf (mem-ref dst :u8) (mem-ref src :u8))))
+                (setq i (+ i 1))))
+            (setf (mem-ref staging-base :u64) remaining)
+            (setf (mem-ref (+ staging-base 8) :u64) 0)
+            remaining)))))
+
+;;; ============================================================
+;;; Mailbox operations
+;;; ============================================================
+
+;; Dequeue message from actor's mailbox. Returns 0 if empty.
+(defun mailbox-dequeue (id)
+  (let ((head (actor-get id #x50)))
+    (if (zerop head)
+        0
+        (let ((raw-msg (car head)))
+          (let ((next (cdr head)))
+            (actor-set id #x50 next)
+            (if (zerop next) (actor-set id #x58 0) ())
+            (pool-free head)
+            (if (not (zerop (staging-ptr-p raw-msg)))
+                ;; Staging pointer — decode into receiver's heap
+                (let ((buf-addr (staging-untag raw-msg)))
+                  (setf (mem-ref (decode-ptr-addr) :u64) buf-addr)
+                  (let ((result (term-decode-step)))
+                    (let ((staging-base (+ (staging-base-addr) (ash id 14))))
+                      (let ((new-roff (- (mem-ref (decode-ptr-addr) :u64)
+                                         (+ staging-base 16))))
+                        (setf (mem-ref (+ staging-base 8) :u64) new-roff)))
+                    result))
+                ;; Fixnum/nil — return as-is
+                raw-msg))))))
+
+;; Enqueue cell into target's mailbox and wake if blocked
+(defun mailbox-enqueue-and-wake (target-id cell)
+  (let ((tail (actor-get target-id #x58)))
+    (if (zerop tail)
+        (progn
+          (actor-set target-id #x50 cell)
+          (actor-set target-id #x58 cell))
+        (progn
+          (set-cdr tail cell)
+          (actor-set target-id #x58 cell))))
+  ;; If target was blocked (status=4), wake it
+  (if (= (actor-get target-id #x00) 4)
+      (progn
+        (actor-set target-id #x00 2)
+        (actor-enqueue target-id)
+        (spin-unlock (sched-lock-addr))
+        (wake-idle-ap)
+        0)
+      (progn
+        (spin-unlock (sched-lock-addr))
+        0)))
+
+;;; ============================================================
+;;; Send / Receive
+;;; ============================================================
+
+(defun send (target-id message)
+  (spin-lock (sched-lock-addr))
+  (let ((cell (pool-alloc)))
+    (if (zerop cell)
+        (progn (spin-unlock (sched-lock-addr)) 0)
+        (if (zerop (needs-staging message))
+            ;; Fast path: fixnum/nil
+            (progn
+              (set-car cell message)
+              (set-cdr cell 0)
+              (mailbox-enqueue-and-wake target-id cell))
+            ;; Slow path: serialize to target's staging buffer
+            (let ((size (term-size message)))
+              (let ((staging-base (+ (staging-base-addr) (ash target-id 14))))
+                (let ((woff (mem-ref staging-base :u64)))
+                  (if (> (+ woff size) 16368)
+                      ;; Try compacting
+                      (progn
+                        (staging-compact staging-base)
+                        (let ((woff2 (mem-ref staging-base :u64)))
+                          (if (> (+ woff2 size) 16368)
+                              (progn (pool-free cell)
+                                     (spin-unlock (sched-lock-addr)) 0)
+                              (let ((buf-addr (+ (+ staging-base 16) woff2)))
+                                (let ((written (term-encode message buf-addr)))
+                                  (setf (mem-ref staging-base :u64) (+ woff2 written))
+                                  (let ((stag (staging-tag buf-addr)))
+                                    (set-car cell stag))
+                                  (set-cdr cell 0)
+                                  (mailbox-enqueue-and-wake target-id cell))))))
+                      ;; Enough space
+                      (let ((buf-addr (+ (+ staging-base 16) woff)))
+                        (let ((written (term-encode message buf-addr)))
+                          (setf (mem-ref staging-base :u64) (+ woff written))
+                          (let ((stag (staging-tag buf-addr)))
+                            (set-car cell stag))
+                          (set-cdr cell 0)
+                          (mailbox-enqueue-and-wake target-id cell)))))))))))
+
+;; Receive a message, blocking if mailbox is empty.
+(defun receive ()
+  (spin-lock (sched-lock-addr))
+  (let ((cur-id (get-current-actor)))
+    (let ((msg (mailbox-dequeue cur-id)))
+      (if (not (zerop msg))
+          (progn (spin-unlock (sched-lock-addr)) msg)
+          ;; Block until message arrives
+          (let ((cur-addr (actor-struct-addr cur-id)))
+            (if (zerop (save-context (+ cur-addr #x08)))
+                ;; Save path: mark blocked, switch
+                (progn
+                  (actor-set cur-id #x00 4)
+                  (actor-set cur-id #x70 (percpu-ref 40))
+                  (actor-set cur-id #x78 (percpu-ref 48))
+                  (let ((next-id (actor-dequeue)))
+                    (if (zerop next-id)
+                        (progn (spin-unlock (sched-lock-addr))
+                               (ap-scheduler))
+                        (progn
+                          (set-current-actor next-id)
+                          (actor-set next-id #x00 1)
+                          (percpu-set 40 (actor-get next-id #x70))
+                          (percpu-set 48 (actor-get next-id #x78))
+                          (let ((next-addr (actor-struct-addr next-id)))
+                            (restore-context (+ next-addr #x08)))))))
+                ;; Resumed: dequeue the message that woke us
+                (progn
+                  (spin-lock (sched-lock-addr))
+                  (let ((m (mailbox-dequeue (get-current-actor))))
+                    (spin-unlock (sched-lock-addr))
+                    m))))))))
+
+;; Non-blocking receive: check mailbox, return message or 0.
+;; Used by net-domain to interleave E1000 polling with outbound dispatch.
+(defun try-receive ()
+  (spin-lock (sched-lock-addr))
+  (let ((msg (mailbox-dequeue (get-current-actor))))
+    (spin-unlock (sched-lock-addr))
+    msg))
+
+;; Receive with timeout (busy-poll via yield)
+(defun receive-timeout (max-yields)
+  (let ((cur-id (get-current-actor)))
+    (spin-lock (sched-lock-addr))
+    (let ((msg (mailbox-dequeue cur-id)))
+      (spin-unlock (sched-lock-addr))
+      (if (not (zerop msg))
+          msg
+          (let ((count 0))
+            (loop
+              (yield)
+              (spin-lock (sched-lock-addr))
+              (let ((m (mailbox-dequeue (get-current-actor))))
+                (spin-unlock (sched-lock-addr))
+                (if (not (zerop m))
+                    (return m)
+                    (progn
+                      (setq count (+ count 1))
+                      (when (= count max-yields)
+                        (return 0)))))))))))
