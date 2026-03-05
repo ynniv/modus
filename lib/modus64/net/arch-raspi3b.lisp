@@ -65,6 +65,9 @@
 (defun e1000-tx-buf-base () #x01041400)
 (defun ssh-conn-base () #x01080000)
 
+;; USB IRQ ring buffer base (10KB, used by interrupt-driven DWC2 gadget ISR)
+(defun usb-ring-base () #x01090000)
+
 ;; Base address for SSH IPC shared state
 (defun ssh-ipc-base () #x01100000)
 
@@ -180,3 +183,32 @@
         (write-byte 100) (write-byte 117)
         (write-byte 115) (write-byte 54)
         (write-byte 52) (write-byte 62) (write-byte 32))))
+
+;; ============================================================
+;; Actor system address hooks (RPi 3B / Pi Zero 2 W memory layout)
+;; ============================================================
+;;
+;; Memory layout (1GB RAM at 0x00000000):
+;;   0x02000000  Per-CPU data (512B) + locks (+0x200)
+;;   0x02010000  Actor table (8KB)
+;;   0x02012000  Scheduler state
+;;   0x02020000  Actor stacks (4MB)
+;;   0x02420000  Mailbox pool (128KB)
+;;   0x02440000  Pool state
+;;   0x02500000  Staging buffers (1MB)
+;;     --- gap ---
+;;   0x04000000  Cons heap (existing, 16MB)
+;;   0x06000000  Per-actor heaps (4MB each)
+
+(defun percpu-data-base ()   #x02000000)
+(defun sched-lock-addr ()    #x02000200)
+(defun actor-table-base ()   #x02010000)
+(defun sched-state-base ()   #x02012000)
+(defun scratch-addr ()       #x02012050)
+(defun decode-ptr-addr ()    #x02012058)
+(defun actor-stack-base ()   #x02020000)
+(defun mailbox-pool-base ()  #x02420000)
+(defun mailbox-pool-limit () #x02440000)
+(defun pool-state-base ()    #x02440000)
+(defun staging-base-addr ()  #x02500000)
+(defun actor-heap-base ()    #x06000000)

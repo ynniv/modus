@@ -42,6 +42,7 @@
    #:+op-consp+ #:+op-atom+
    #:+op-alloc-obj+ #:+op-obj-ref+ #:+op-obj-set+
    #:+op-obj-tag+ #:+op-obj-subtag+
+   #:+op-aref+ #:+op-aset+ #:+op-array-len+
    #:+op-load+ #:+op-store+ #:+op-fence+
    #:+op-call+ #:+op-call-ind+ #:+op-ret+ #:+op-tailcall+
    #:+op-alloc-cons+ #:+op-gc-check+ #:+op-write-barrier+
@@ -55,7 +56,7 @@
    #:opcode-info-code #:opcode-info-name #:opcode-info-operands #:opcode-info-description
    ;; Encoding/decoding
    #:encode-instruction #:decode-instruction
-   #:make-mvm-buffer #:mvm-buffer-bytes #:mvm-buffer-position #:mvm-buffer-labels
+   #:make-mvm-buffer #:mvm-buffer-bytes #:mvm-buffer-used-bytes #:mvm-buffer-position #:mvm-buffer-labels
    #:mvm-emit-byte #:mvm-emit-u16 #:mvm-emit-u32 #:mvm-emit-u64
    #:mvm-emit-s16
    ;; Labels
@@ -75,6 +76,8 @@
    #:mvm-consp #:mvm-atom
    #:mvm-alloc-obj #:mvm-obj-ref #:mvm-obj-set
    #:mvm-obj-tag #:mvm-obj-subtag
+   #:mvm-aref #:mvm-aset #:mvm-array-len
+   #:+op-alloc-array+ #:mvm-alloc-array
    #:mvm-load #:mvm-store #:mvm-fence
    #:mvm-call #:mvm-call-ind #:mvm-ret #:mvm-tailcall
    #:mvm-alloc-cons #:mvm-gc-check #:mvm-write-barrier
@@ -269,6 +272,10 @@
 (defconstant +op-obj-set+    #x62)  ; (obj-set Vobj idx:imm8 Vs) - 2 reg + imm8
 (defconstant +op-obj-tag+    #x63)  ; (obj-tag Vd Vs) - 2 reg
 (defconstant +op-obj-subtag+ #x64)  ; (obj-subtag Vd Vs) - 2 reg
+(defconstant +op-aref+       #x65)  ; (aref Vd Vobj Vidx) - 3 reg, variable-index array load
+(defconstant +op-aset+       #x66)  ; (aset Vobj Vidx Vs) - 3 reg, variable-index array store
+(defconstant +op-array-len+  #x67)  ; (array-len Vd Vobj) - 2 reg, extract element count
+(defconstant +op-alloc-array+ #x68) ; (alloc-array Vd Vcount) - 2 reg, dynamic array allocation
 
 ;; Memory (raw, for drivers/hardware)
 (defconstant +op-load+   #x70)  ; (load Vd Vaddr width:imm8) - 2 reg + width
@@ -385,6 +392,10 @@
 (defopcode :obj-set    #x62 (:reg :imm8 :reg)     "Store object slot")
 (defopcode :obj-tag    #x63 (:reg :reg)            "Extract 4-bit tag")
 (defopcode :obj-subtag #x64 (:reg :reg)            "Extract 8-bit subtag from header")
+(defopcode :aref      #x65 (:reg :reg :reg)        "Variable-index array load")
+(defopcode :aset      #x66 (:reg :reg :reg)        "Variable-index array store")
+(defopcode :array-len #x67 (:reg :reg)             "Extract array element count")
+(defopcode :alloc-array #x68 (:reg :reg)           "Dynamic array allocation from register count")
 
 ;; Memory
 (defopcode :load   #x70 (:reg :reg :imm8)     "Raw memory read (width in imm8)")
@@ -432,16 +443,24 @@
 ;;; ============================================================
 
 (defstruct mvm-buffer
-  (bytes (make-array 4096 :element-type '(unsigned-byte 8)
-                          :adjustable t :fill-pointer 0))
+  (bytes (make-array 2097152))              ; 2MB fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))     ; label-id → position
   (fixups nil)                               ; list of (position label-id offset-from)
   (position 0))
 
 (defun mvm-emit-byte (buf byte)
   "Emit a single byte to the MVM bytecode buffer"
-  (vector-push-extend (logand byte #xFF) (mvm-buffer-bytes buf))
-  (incf (mvm-buffer-position buf)))
+  (let ((pos (mvm-buffer-position buf)))
+    (setf (aref (mvm-buffer-bytes buf) pos) (logand byte #xFF))
+    (setf (mvm-buffer-position buf) (+ pos 1))))
+
+(defun mvm-buffer-used-bytes (buf)
+  "Return a new array containing only the bytes emitted so far."
+  (let* ((n (mvm-buffer-position buf))
+         (src (mvm-buffer-bytes buf))
+         (result (make-array n)))
+    (dotimes (i n result)
+      (setf (aref result i) (aref src i)))))
 
 (defun mvm-emit-u16 (buf val)
   "Emit a 16-bit value (little-endian)"
@@ -569,7 +588,7 @@
         (:width
          (push (aref bytes cur) operands)
          (incf cur 1))))
-    (values opcode (nreverse operands) cur)))
+    (cons opcode (cons (nreverse operands) cur))))
 
 ;;; ============================================================
 ;;; Convenience Instruction Constructors
@@ -725,6 +744,18 @@
 (defun mvm-obj-subtag (buf vd vs)
   (encode-instruction buf +op-obj-subtag+ vd vs))
 
+(defun mvm-aref (buf vd vobj vidx)
+  (encode-instruction buf +op-aref+ vd vobj vidx))
+
+(defun mvm-aset (buf vobj vidx vs)
+  (encode-instruction buf +op-aset+ vobj vidx vs))
+
+(defun mvm-array-len (buf vd vobj)
+  (encode-instruction buf +op-array-len+ vd vobj))
+
+(defun mvm-alloc-array (buf vd vcount)
+  (encode-instruction buf +op-alloc-array+ vd vcount))
+
 ;; Memory
 (defun mvm-load (buf vd vaddr width)
   (encode-instruction buf +op-load+ vd vaddr width))
@@ -806,8 +837,10 @@
         (pos start))
     (loop while (< pos limit)
           do (let ((ipos pos))
-               (multiple-value-bind (opcode operands new-pos)
-                   (decode-instruction bytes pos)
+               (let* ((decoded (decode-instruction bytes pos))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pos (cddr decoded)))
                  (let ((info (gethash opcode *opcode-table*)))
                    (if info
                        (format t "  ~4D: ~A~{ ~A~}~%"

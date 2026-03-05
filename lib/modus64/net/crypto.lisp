@@ -175,6 +175,8 @@
       (let ((total (+ msg-len 9 (if (zerop r) 0 (- 64 r)))))
         ;; Create padded message
         (let ((padded (make-array total)))
+          ;; Zero padding (make-array doesn't zero on real hardware)
+          (dotimes (i total) (aset padded i 0))
           ;; Copy message
           (dotimes (i msg-len)
             (aset padded i (aref msg i)))
@@ -580,6 +582,8 @@
 
 (defun fe-from-int (n)
   (let ((fe (make-array 40)))
+    ;; Zero all limbs (make-array doesn't zero on real hardware)
+    (dotimes (i 40) (aset fe i 0))
     (buf-write-u32 fe 0 (logand n #x3FFFFFF))
     (buf-write-u32 fe 4 (logand (ash n -26) #x1FFFFFF))
     fe))
@@ -819,7 +823,9 @@
 (defun fe-sq-iter (dst n)
   ;; Square dst n times in-place
   (dotimes (i n)
-    (fe-sq dst dst)))
+    (fe-sq dst dst)
+    ;; Poll USB every 16 squarings to prevent host watchdog timeout
+    (when (zerop (logand i 15)) (usb-keepalive))))
 
 (defun fe-invert (z)
   ;; z^(p-2) = z^(2^255-21) via addition chain
@@ -928,11 +934,15 @@
     (aset kc 0 (logand (aref kc 0) #xF8))
     (aset kc 31 (logand (aref kc 31) #x7F))
     (aset kc 31 (logior (aref kc 31) #x40))
-    ;; Initialize
+    ;; Initialize (zero arrays - make-array doesn't zero on real hardware)
     (fe-copy x1 (fe-from-bytes u))
+    (dotimes (i 40) (aset x2 i 0))
     (buf-write-u32 x2 0 1)
+    (dotimes (i 40) (aset z2 i 0))
     (fe-copy x3 x1)
+    (dotimes (i 40) (aset z3 i 0))
     (buf-write-u32 z3 0 1)
+    (dotimes (i 40) (aset a24 i 0))
     (buf-write-u32 a24 0 121665)
     ;; Montgomery ladder: 255 iterations
     (dotimes (iter 255)
@@ -964,7 +974,9 @@
         (fe-mul t1 a24 fe-e)
         (fe-add t2 aa t1)
         (fe-mul z2 fe-e t2))
-      (setf pos (- pos 1)))
+      (setf pos (- pos 1))
+      ;; Poll USB every 32 iterations to prevent host watchdog timeout
+      (when (zerop (logand iter 31)) (usb-keepalive)))
     ;; Final swap
     (when (not (zerop swap))
       (fe-copy t1 x2) (fe-copy x2 x3) (fe-copy x3 t1)
@@ -975,6 +987,8 @@
 
 (defun x25519-public-key (k)
   (let ((bp (make-array 32)))
+    ;; Zero base point (make-array doesn't zero on real hardware)
+    (dotimes (i 32) (aset bp i 0))
     (aset bp 0 9)
     (x25519 k bp)))
 
@@ -1256,6 +1270,8 @@
     (let ((r (mod (+ msg-len 17) 128)))
       (let ((total (+ msg-len 17 (if (zerop r) 0 (- 128 r)))))
         (let ((padded (make-array total)))
+          ;; Zero padding (make-array doesn't zero on real hardware)
+          (dotimes (i total) (aset padded i 0))
           (dotimes (i msg-len)
             (aset padded i (aref msg i)))
           (aset padded msg-len #x80)
@@ -1588,7 +1604,9 @@
         (dotimes (bit-idx 8)
           (when (logand byte-val (ash 1 bit-idx))
             (setq result (ed-add result temp)))
-          (setq temp (ed-double temp)))))
+          (setq temp (ed-double temp))))
+      ;; Poll USB every 4 bytes to prevent host watchdog timeout
+      (when (zerop (logand byte-idx 3)) (usb-keepalive)))
     result))
 
 ;; Base point multiplication
@@ -1923,7 +1941,8 @@
 (defun ed25519-test ()
   (write-byte 69) (write-byte 84)  ; "ET"
   (let ((privkey (make-array 32)))
-    ;; All zeros private key
+    ;; All zeros private key (must zero - make-array doesn't on real hardware)
+    (dotimes (i 32) (aset privkey i 0))
     (let ((pubkey (ed25519-public-key privkey)))
       ;; Print first 4 bytes
       (write-byte 80) (write-byte 58)  ; "P:"

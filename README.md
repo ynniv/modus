@@ -1,6 +1,6 @@
 # Modus
 
-A bare-metal Lisp operating system. Boots directly on x86 hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
+A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
 
 Modus has two runtime targets:
 
@@ -26,6 +26,7 @@ Modus has two runtime targets:
 - 9 architecture backends: x86-64, i386, AArch64, RISC-V 64, PPC64, PPC32, ARM32 (ARMv5), ARMv7, Motorola 68k
 - Self-hosting: the kernel compiles itself from embedded source via `(build-image)`
 - SBCL bootstraps Gen0; Gen0 compiles Gen1 natively; Gen1 can repeat the process
+- MVM self-compilation: the compiler compiles its own source (759 functions) to architecture-independent bytecode
 - Runtime native compiler (defun, let, lambda, if, closures, loops)
 - Closures, hash tables, structs, global variables
 
@@ -40,6 +41,7 @@ Modus has two runtime targets:
 **Networking and crypto**
 - E1000 driver with TCP/IP, UDP, DHCP, DNS, ICMP (x86-64 and AArch64)
 - SSH server (multi-connection, Ed25519, X25519, ChaCha20-Poly1305)
+- HTTP/1.0 server and client with DNS resolution
 - Crypto: SHA-256, SHA-512, X25519, Ed25519, ChaCha20, Poly1305
 - Shared networking code with thin arch adapters (x86 I/O ports vs AArch64 ECAM PCI)
 
@@ -49,15 +51,17 @@ Modus has two runtime targets:
 - Reduction-counting preemption with LAPIC timer backup
 - SMP: multi-core boot, per-CPU scheduling, IPI wakeup (tested on 8 CPUs)
 - Per-actor heaps with independent garbage collection
+- Qubes-like actor isolation: net-domain owns hardware, SSH handlers use mailbox messages
 
 **Raspberry Pi (bare-metal hardware)**
 - Runs on Pi Zero 2 W (BCM2710A1, Cortex-A53) and QEMU raspi3b
 - DWC2 USB host stack: enumeration, hub support, CDC Ethernet (QEMU)
-- DWC2 USB device mode: CDC-ECM gadget for Pi Zero 2 W networking
+- DWC2 USB device mode: CDC-ECM gadget for Pi Zero 2 W networking over USB
 - USB HID: keyboard, mouse, tablet via boot protocol
 - BCM2835 peripherals: system timer, GPIO LED, GPU framebuffer (640x480 HDMI)
 - UART serial bootloader: deploy new kernels over serial from Pi 5 — no SD card swapping
-- Qubes-like actor isolation: net-domain owns hardware, SSH handlers use mailbox messages
+- HTTP fetch from bare metal: `(fetch-test)` makes outbound TCP connections via USB
+- Interrupt-driven USB RX with ring buffer to prevent host watchdog timeout during crypto
 
 ## Building and running
 
@@ -105,18 +109,26 @@ Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
 ### Raspberry Pi Zero 2 W (real hardware)
 
+The Pi Zero 2 W boots via USB (no SD card needed) using rpiboot, with SSH over USB CDC-ECM Ethernet.
+
 ```bash
-# One-time: build bootloader and flash SD card
-cd lib/modus64 && bash scripts/make-sdcard-bootloader.sh
-sudo dd if=/tmp/pizero2w-sdcard.img of=/dev/sdX bs=4M
+# One-time: program USB boot OTP fuse (irreversible, requires SD card)
+cd lib/modus64 && bash scripts/fuse-pizero2w.sh
+sudo dd if=/tmp/pizero2w-fuse.img of=/dev/sdX bs=4M  # boot once to program fuse
 
-# Deploy kernels over UART (no SD card swapping)
-sbcl --script mvm/build-pizero2w-ssh.lisp          # or any build script
+# Build and deploy
+sbcl --script mvm/build-pizero2w-actors.lisp   # actor-based SSH + HTTP
+# or: sbcl --script mvm/build-pizero2w-ssh.lisp   # single-threaded SSH
+
+# Full workflow (build, USB boot or UART redeploy, network setup, SSH)
+bash scripts/boot-pizero2w.sh
+
+# Manual deployment via UART bootloader (fast iteration)
 scp /tmp/piboot/kernel8.img pi5:~/kernel8.img
-ssh pi5 'python3 deploy-kernel.py ~/kernel8.img'    # GPIO17 reset + UART upload
+ssh pi5 'sudo python3 ~/deploy-kernel.py ~/kernel8.img'
+ssh pi5 'sudo ip addr add 10.0.0.1/24 dev usb0; sudo ip link set usb0 up'
+ssh -o ConnectTimeout=30 test@10.0.0.2
 ```
-
-See [`docs/rpi-zero-2w.md`](docs/rpi-zero-2w.md) for wiring, memory map, and hardware details.
 
 SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely. Build artifacts are cached by content hash.
 
@@ -138,12 +150,16 @@ lib/modus64/
     ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
     crypto.lisp          SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
     ssh.lisp             SSH server (multi-connection)
+    http.lisp            HTTP/1.0 server
+    http-client.lisp     HTTP client with URL parsing and DNS
     actors.lisp          Actor system (spawn, yield, send, receive, scheduler)
+    isolated-net.lisp    Qubes-like isolation (net-domain owns all hardware)
     bcm2835-periph.lisp  System timer, GPIO LED, GPU framebuffer
     uart-bootloader.lisp UART serial bootloader protocol
   mvm/                   Modus Virtual Machine
     mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
     compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)
+    prelude.lisp         MVM-compilable CL library (hash tables, sort, mapcar)
     translate-x64.lisp   x86-64 native translator
     translate-riscv.lisp RISC-V translator
     translate-aarch64.lisp AArch64 translator
@@ -155,6 +171,7 @@ lib/modus64/
     target.lisp          Architecture descriptors (9 targets)
   boot/                  Per-architecture boot sequences (9 targets)
   runtime/               Tags, subtags
+  scripts/               Pi Zero 2 W deployment and boot scripts
 lib/movitz/              Movitz bare-metal Lisp framework (Fjeld)
 lib/binary-types/        Binary data type library (Fjeld)
 modus/
@@ -171,7 +188,7 @@ docs/                    Design documents
 
 MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
 
-All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via QEMU virt (PCI ECAM + E1000). The other 7 targets boot and run serial output programs.
+All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via both QEMU virt (PCI ECAM + E1000) and real Pi hardware (DWC2 USB + CDC-ECM). The other 7 targets boot and run serial output programs.
 
 ### Tagged objects
 
@@ -179,7 +196,7 @@ All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-
 
 ### Self-hosting
 
-The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap.
+The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap. The MVM compiler can also compile its own source to architecture-independent bytecode, proving the compilation pipeline is a fixed point.
 
 ### Actors and SMP
 

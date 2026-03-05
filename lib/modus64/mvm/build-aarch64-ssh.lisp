@@ -119,6 +119,8 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
+                         ;; Pre-compute ed25519 host key derivatives (s, prefix)
+                         "  (pre-compute-host-sign)"
                          "  (write-byte 83) (write-byte 83) (write-byte 72)"
                          "  (write-byte 58) (print-dec 22) (write-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
@@ -127,6 +129,8 @@
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
+                         ;; Pre-compute server ephemeral X25519 key pair
+                         "  (pre-compute-server-eph (conn-ssh 0))"
                          "  (net-actor-main))")))
        ;; SSH kernel-main MUST be first: boot code falls through to it.
        ;; Net source and REPL source follow (functions resolved via NFN table).

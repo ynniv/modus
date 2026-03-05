@@ -1544,8 +1544,10 @@
                    (when label
                      (emit-label buf label)))
                  ;; Decode and translate
-                 (multiple-value-bind (opcode operands new-pos)
-                     (decode-instruction bytecode pos)
+                 (let* ((decoded (decode-instruction bytecode pos))
+                        (opcode (car decoded))
+                        (operands (cadr decoded))
+                        (new-pos (cddr decoded)))
                    (translate-instruction state opcode operands new-pos)
                    (setf pos new-pos)))))
     ;; Resolve label fixups
@@ -1562,8 +1564,10 @@
          (pos offset)
          (limit (+ offset length)))
     (loop while (< pos limit)
-          do (multiple-value-bind (opcode operands new-pos)
-                 (decode-instruction bytes pos)
+          do (let* ((decoded (decode-instruction bytes pos))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pos (cddr decoded)))
                ;; Check if this is a branch instruction
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
@@ -1634,8 +1638,10 @@
                               (when label
                                 (emit-label buf label)))
                             ;; Decode and translate
-                            (multiple-value-bind (opcode operands new-pos)
-                                (decode-instruction bytecode pos)
+                            (let* ((decoded (decode-instruction bytecode pos))
+                                   (opcode (car decoded))
+                                   (operands (cadr decoded))
+                                   (new-pos (cddr decoded)))
                               (handler-case
                                   (translate-instruction state opcode operands new-pos)
                                 (error (c)
@@ -1679,15 +1685,15 @@
 (defun translated-code-bytes (buf)
   "Return the native code bytes from a code-buffer as a simple vector."
   (let* ((bytes (code-buffer-bytes buf))
-         (len (fill-pointer bytes))
-         (result (make-array len :element-type '(unsigned-byte 8))))
-    (replace result bytes)
-    result))
+         (len (code-buffer-position buf))
+         (result (make-array len)))
+    (dotimes (i len result)
+      (setf (aref result i) (aref bytes i)))))
 
 (defun disassemble-native (buf &key (start 0) (end nil))
   "Print a hex dump of the native code in BUF for debugging."
   (let* ((bytes (code-buffer-bytes buf))
-         (limit (or end (fill-pointer bytes))))
+         (limit (or end (code-buffer-position buf))))
     (loop for pos from start below limit
           do (when (zerop (mod (- pos start) 16))
                (when (> pos start) (terpri))

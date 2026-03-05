@@ -190,16 +190,16 @@
 ;;; ============================================================
 
 (defstruct i386-buffer
-  (bytes (make-array 4096 :element-type '(unsigned-byte 8)
-                          :adjustable t :fill-pointer 0))
+  (bytes (make-array 131072))           ; fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)     ; list of (byte-position label-id fixup-type)
   (position 0))
 
 (defun i386-emit-byte (buf byte)
   "Emit a single byte."
-  (vector-push-extend (logand byte #xFF) (i386-buffer-bytes buf))
-  (incf (i386-buffer-position buf)))
+  (let ((pos (i386-buffer-position buf)))
+    (setf (aref (i386-buffer-bytes buf) pos) (logand byte #xFF))
+    (setf (i386-buffer-position buf) (+ pos 1))))
 
 (defun i386-emit-u16 (buf val)
   "Emit a 16-bit little-endian value."
@@ -260,9 +260,9 @@
 
 (defun i386-buffer-to-bytes (buf)
   "Return the code buffer as a simple byte vector."
-  (let* ((fp (fill-pointer (i386-buffer-bytes buf)))
-         (result (make-array fp :element-type '(unsigned-byte 8))))
-    (dotimes (i fp result)
+  (let* ((len (i386-buffer-position buf))
+         (result (make-array len)))
+    (dotimes (i len result)
       (setf (aref result i) (aref (i386-buffer-bytes buf) i)))))
 
 ;;; ============================================================
@@ -1520,8 +1520,10 @@
          (pos offset)
          (limit (+ offset length)))
     (loop while (< pos limit)
-          do (multiple-value-bind (opcode operands new-pos)
-                 (decode-instruction bytes pos)
+          do (let* ((decoded (decode-instruction bytes pos))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pos (cddr decoded)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -1561,8 +1563,10 @@
                    (when label
                      (i386-emit-label buf label)))
                  ;; Decode and translate
-                 (multiple-value-bind (opcode operands new-pos)
-                     (decode-instruction bytecode pos)
+                 (let* ((decoded (decode-instruction bytecode pos))
+                        (opcode (car decoded))
+                        (operands (cadr decoded))
+                        (new-pos (cddr decoded)))
                    (i386-translate-insn state opcode operands new-pos)
                    (setf pos new-pos)))))
     ;; Resolve label fixups
@@ -1616,8 +1620,10 @@
                                                   (i386-translate-state-label-map state))))
                               (when label
                                 (i386-emit-label buf label)))
-                            (multiple-value-bind (opcode operands new-pos)
-                                (decode-instruction bytecode pos)
+                            (let* ((decoded (decode-instruction bytecode pos))
+                                   (opcode (car decoded))
+                                   (operands (cadr decoded))
+                                   (new-pos (cddr decoded)))
                               (i386-translate-insn state opcode operands new-pos)
                               (setf pos new-pos)))))))
     ;; Resolve all label fixups
@@ -1652,7 +1658,7 @@
 (defun i386-disassemble-native (buf &key (start 0) (end nil))
   "Print a hex dump of the native code in BUF."
   (let* ((bytes (i386-buffer-bytes buf))
-         (limit (or end (fill-pointer bytes))))
+         (limit (or end (i386-buffer-position buf))))
     (loop for pos from start below limit
           do (when (zerop (mod (- pos start) 16))
                (when (> pos start) (terpri))

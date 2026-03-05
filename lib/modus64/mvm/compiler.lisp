@@ -74,8 +74,8 @@
 (defvar *current-function-name* nil
   "Name of the function currently being compiled")
 
-(defvar *macro-table* (make-hash-table :test 'equal)
-  "Hash table of macro-name (string) -> expander function")
+(defvar *macro-table* (make-hash-table :test 'eql)
+  "Hash table of macro-name (hash integer) -> expander function")
 
 (defvar *label-counter* 0
   "Monotonic counter for generating unique labels")
@@ -91,6 +91,12 @@
 
 (defvar *function-return-label* nil
   "Label for early return from function body (return outside loop)")
+
+(defvar *globals* (make-hash-table :test 'eql)
+  "Set of known global variable names (hash -> t)")
+
+(defvar *constants* (make-hash-table :test 'eql)
+  "Map from constant name (hash) to compile-time value")
 
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
@@ -217,7 +223,7 @@
                                    (compile-env-bindings env))
                    :stack-depth (1+ slot)
                    :parent (compile-env-parent env))))
-    (values new-env slot)))
+    (cons new-env slot)))
 
 (defun env-child (env)
   "Create a child environment inheriting from ENV"
@@ -231,18 +237,30 @@
 ;;; ============================================================
 ;;;
 ;;; Cross-package compatibility: we compare operator names as
-;;; uppercase strings, matching cross-compile.lisp's string-equal approach.
+;;; name hashes (dual FNV-1a), matching cross.lisp's compute-name-hash.
+
+(defun compute-name-hash (name-string)
+  "Compute dual-FNV-1a hash for a name string. 60-bit collision-resistant."
+  (let ((name (string-upcase (string name-string)))
+        (h1 2166136261) (h2 3735928559))
+    (loop for c across name
+          do (setq h1 (logand (* (logxor h1 (char-code c)) 16777619) #xFFFFFFFF))
+             (setq h2 (logand (* (logxor h2 (char-code c)) 805306457) #xFFFFFFFF)))
+    (let ((combined (logior (ash (logand h1 #x3FFFFFFF) 30)
+                            (logand h2 #x3FFFFFFF))))
+      (if (zerop combined) 1 combined))))
 
 (defun normalize-name (sym)
-  "Convert a symbol to its uppercase name string for comparison"
-  (if (symbolp sym)
-      (symbol-name sym)
-      (string-upcase (princ-to-string sym))))
+  "Convert a symbol to its name hash for comparison"
+  (if (integerp sym)
+      sym
+      (compute-name-hash (symbol-name sym))))
 
 (defun name-eq (sym name-string)
-  "Check if SYM's name matches NAME-STRING (case-insensitive)"
+  "Check if SYM's name matches NAME-STRING via hash comparison"
   (and (symbolp sym)
-       (string-equal (symbol-name sym) name-string)))
+       (= (compute-name-hash (symbol-name sym))
+          (compute-name-hash name-string))))
 
 ;;; ============================================================
 ;;; Phase 1: Frontend (Source -> AST)
@@ -261,23 +279,27 @@
       (let* ((name (normalize-name (car form)))
              (expander (gethash name *macro-table*)))
         (if expander
-            (values (funcall expander form) t)
-            (values form nil)))
-      (values form nil)))
+            (cons (funcall expander form) t)
+            (cons form nil)))
+      (cons form nil)))
 
 (defun macroexpand-mvm (form)
   "Fully expand macros in FORM"
   (loop
-    (multiple-value-bind (expanded expanded-p) (macroexpand-1-mvm form)
+    (let* ((result (macroexpand-1-mvm form))
+           (expanded (car result))
+           (expanded-p (cdr result)))
       (unless expanded-p
         (return form))
       (setf form expanded))))
 
 (defun mvm-define-macro (name expander)
-  "Register a macro with NAME (string) and EXPANDER function.
+  "Register a macro with NAME (string or hash) and EXPANDER function.
    EXPANDER takes the whole form (including the operator) and returns
    the expansion."
-  (setf (gethash (string-upcase name) *macro-table*) expander))
+  (setf (gethash (if (integerp name) name (compute-name-hash name))
+                 *macro-table*)
+        expander))
 
 (defun register-mvm-bootstrap-macros ()
   "Register standard CL macros needed to compile *runtime-functions*."
@@ -288,7 +310,7 @@
         (if (null clauses) nil
             (let ((clause (car clauses)))
               (if (and (symbolp (car clause))
-                       (string-equal (symbol-name (car clause)) "T"))
+                       (= (compute-name-hash (symbol-name (car clause))) 307092296168853251))
                   `(progn ,@(cdr clause))
                   `(if ,(car clause)
                        (progn ,@(cdr clause))
@@ -308,7 +330,235 @@
               ((null (cdr args)) (car args))
               (t (let ((tmp (gensym "OR")))
                    `(let ((,tmp ,(car args)))
-                      (if ,tmp ,tmp (or ,@(cdr args)))))))))))
+                      (if ,tmp ,tmp (or ,@(cdr args))))))))))
+
+  ;; CASE → LET + COND + EQL
+  (mvm-define-macro "CASE"
+    (lambda (form)
+      (let ((keyform (cadr form))
+            (clauses (cddr form))
+            (tmp (gensym "CASE")))
+        `(let ((,tmp ,keyform))
+           (cond ,@(mapcar (lambda (clause)
+                             (let ((keys (car clause))
+                                   (body (cdr clause)))
+                               (cond
+                                 ((or (eq keys t)
+                                      (and (symbolp keys)
+                                           (= (compute-name-hash (symbol-name keys)) 351744830753626451)))
+                                  `(t ,@body))
+                                 ((listp keys)
+                                  `((or ,@(mapcar (lambda (k) `(eql ,tmp ',k)) keys))
+                                    ,@body))
+                                 (t `((eql ,tmp ',keys) ,@body)))))
+                           clauses))))))
+
+  ;; ECASE → CASE (same behavior for now; no error on mismatch)
+  (mvm-define-macro "ECASE"
+    (lambda (form)
+      `(case ,@(cdr form))))
+
+  ;; DOLIST → LET + LOOP
+  (mvm-define-macro "DOLIST"
+    (lambda (form)
+      (let ((spec (cadr form))
+            (body (cddr form)))
+        (let ((var (car spec))
+              (list-form (cadr spec))
+              (tmp (gensym "DL")))
+          `(let ((,tmp ,list-form))
+             (loop
+               (if (null ,tmp)
+                   (return nil)
+                   (let ((,var (car ,tmp)))
+                     ,@body
+                     (setq ,tmp (cdr ,tmp))))))))))
+
+  ;; INCF → SETQ + +
+  (mvm-define-macro "INCF"
+    (lambda (form)
+      (let ((place (cadr form))
+            (delta (or (caddr form) 1)))
+        (if (symbolp place)
+            `(setq ,place (+ ,place ,delta))
+            `(setf ,place (+ ,place ,delta))))))
+
+  ;; DECF → SETQ + -
+  (mvm-define-macro "DECF"
+    (lambda (form)
+      (let ((place (cadr form))
+            (delta (or (caddr form) 1)))
+        (if (symbolp place)
+            `(setq ,place (- ,place ,delta))
+            `(setf ,place (- ,place ,delta))))))
+
+  ;; PLUSP → (> x 0)
+  (mvm-define-macro "PLUSP"
+    (lambda (form)
+      `(> ,(cadr form) 0)))
+
+  ;; MINUSP → (< x 0)
+  (mvm-define-macro "MINUSP"
+    (lambda (form)
+      `(< ,(cadr form) 0)))
+
+  ;; LOGNOT → LOGXOR with -1
+  (mvm-define-macro "LOGNOT"
+    (lambda (form)
+      `(logxor ,(cadr form) -1)))
+
+  ;; MAX → IF + comparison
+  (mvm-define-macro "MAX"
+    (lambda (form)
+      (if (null (cddr form))
+          (cadr form)
+          (let ((tmp (gensym "MAX")))
+            `(let ((,tmp ,(cadr form)))
+               (if (> ,tmp ,(caddr form)) ,tmp ,(caddr form)))))))
+
+  ;; MIN → IF + comparison
+  (mvm-define-macro "MIN"
+    (lambda (form)
+      (if (null (cddr form))
+          (cadr form)
+          (let ((tmp (gensym "MIN")))
+            `(let ((,tmp ,(cadr form)))
+               (if (< ,tmp ,(caddr form)) ,tmp ,(caddr form)))))))
+
+  ;; ABS → IF + negate
+  (mvm-define-macro "ABS"
+    (lambda (form)
+      (let ((tmp (gensym "ABS")))
+        `(let ((,tmp ,(cadr form)))
+           (if (< ,tmp 0) (- 0 ,tmp) ,tmp)))))
+
+  ;; PROG1 → LET + body + return first value
+  (mvm-define-macro "PROG1"
+    (lambda (form)
+      (let ((tmp (gensym "P1")))
+        `(let ((,tmp ,(cadr form)))
+           ,@(cddr form)
+           ,tmp))))
+
+  ;; DEFPARAMETER → DEFVAR
+  (mvm-define-macro "DEFPARAMETER"
+    (lambda (form)
+      `(defvar ,(cadr form) ,(caddr form))))
+
+  ;; PUSH → (setq place (cons val place))
+  (mvm-define-macro "PUSH"
+    (lambda (form)
+      (let ((val (cadr form))
+            (place (caddr form)))
+        (if (symbolp place)
+            `(setq ,place (cons ,val ,place))
+            `(setf ,place (cons ,val ,place))))))
+
+  ;; POP → extract car, advance cdr
+  (mvm-define-macro "POP"
+    (lambda (form)
+      (let ((place (cadr form))
+            (tmp (gensym "POP")))
+        (if (symbolp place)
+            `(let ((,tmp (car ,place)))
+               (setq ,place (cdr ,place))
+               ,tmp)
+            `(let ((,tmp (car ,place)))
+               (setf ,place (cdr ,place))
+               ,tmp)))))
+
+  ;; DESTRUCTURING-BIND → LET* with car/cdr decomposition
+  (mvm-define-macro "DESTRUCTURING-BIND"
+    (lambda (form)
+      (let ((pattern (cadr form))
+            (expr (caddr form))
+            (body (cdddr form))
+            (tmp (gensym "DB")))
+        (let ((bindings nil)
+              (cur tmp))
+          ;; Walk the flat pattern, handling &rest and &body
+          (let ((rest-mode nil))
+            (dolist (elt pattern)
+              (cond
+                ((member elt '(&rest &body &optional))
+                 (setf rest-mode t))
+                (rest-mode
+                 ;; Bind rest of list
+                 (push (list elt cur) bindings)
+                 (setf rest-mode nil))
+                (t
+                 ;; Bind car, advance to cdr
+                 (let ((next-cur (gensym "D")))
+                   (push (list elt `(car ,cur)) bindings)
+                   (push (list next-cur `(cdr ,cur)) bindings)
+                   (setf cur next-cur))))))
+          `(let* ((,tmp ,expr)
+                  ,@(nreverse bindings))
+             ,@body)))))
+
+  ;; SECOND, THIRD, FOURTH, FIFTH → car of nthcdr
+  (mvm-define-macro "SECOND"
+    (lambda (form) `(car (cdr ,(cadr form)))))
+  (mvm-define-macro "THIRD"
+    (lambda (form) `(car (cdr (cdr ,(cadr form))))))
+  (mvm-define-macro "FOURTH"
+    (lambda (form) `(car (cdr (cdr (cdr ,(cadr form)))))))
+  (mvm-define-macro "FIFTH"
+    (lambda (form) `(car (cdr (cdr (cdr (cdr ,(cadr form))))))))
+
+  ;; SETF expansion for complex places (car, cdr, aref, gethash)
+  ;; Note: mem-ref SETF is handled directly in compile-setf
+  (mvm-define-macro "SETF"
+    (lambda (form)
+      (let ((place (cadr form))
+            (value (caddr form)))
+        (cond
+          ;; (setf var value) → (setq var value)
+          ((symbolp place)
+           `(setq ,place ,value))
+          ;; (setf (car x) v) → (set-car x v)
+          ((and (consp place) (name-eq (car place) "CAR"))
+           `(set-car ,(cadr place) ,value))
+          ;; (setf (cdr x) v) → (set-cdr x v)
+          ((and (consp place) (name-eq (car place) "CDR"))
+           `(set-cdr ,(cadr place) ,value))
+          ;; (setf (aref a i) v) → (aset a i v)
+          ((and (consp place) (name-eq (car place) "AREF"))
+           `(aset ,(cadr place) ,(caddr place) ,value))
+          ;; (setf (gethash k h) v) → (puthash k h v)
+          ((and (consp place) (name-eq (car place) "GETHASH"))
+           `(puthash ,(cadr place) ,(caddr place) ,value))
+          ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
+          ((and (consp place) (name-eq (car place) "MEM-REF"))
+           `(%setf-mem-ref ,place ,value))
+          ;; (setf (nth n lst) v) → (set-car (nthcdr n lst) v)
+          ((and (consp place) (name-eq (car place) "NTH"))
+           `(set-car (nthcdr ,(cadr place) ,(caddr place)) ,value))
+          ;; (setf (svref a i) v) → (aset a i v)
+          ((and (consp place) (name-eq (car place) "SVREF"))
+           `(aset ,(cadr place) ,(caddr place) ,value))
+          ;; Generic struct accessor: (setf (foo-bar x) v) → (set-foo-bar x v)
+          ((consp place)
+           (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
+                                 :modus64.mvm)))
+             `(,setter ,(cadr place) ,value)))))))
+  )
+
+;;; ============================================================
+;;; Declare Form Stripping
+;;; ============================================================
+;;;
+;;; CL allows (declare ...) forms at the start of let/defun bodies.
+;;; MVM ignores declarations; this helper strips them.
+
+(defun strip-declares (body)
+  "Remove leading (declare ...) forms from BODY."
+  (loop while (and (consp body)
+                   (consp (car body))
+                   (symbolp (caar body))
+                   (= (compute-name-hash (symbol-name (caar body))) 524150358979133175))
+        do (setf body (cdr body)))
+  body)
 
 ;;; ============================================================
 ;;; Phase 2: IR Generation (AST -> MVM IR)
@@ -318,12 +568,109 @@
 ;;; The result of every expression ends up in a destination register,
 ;;; which defaults to VR (the return value register).
 
+;;; ------ Backquote Expansion ------
+;;;
+;;; SBCL represents `(a ,b ,@c) as:
+;;;   (SB-INT:QUASIQUOTE (a #S(COMMA :EXPR b :KIND 0) #S(COMMA :EXPR c :KIND 2)))
+;;; We expand this to explicit list/cons/append calls before compiling.
+
+(defun bq-comma-p (x)
+  "Check if X is an SBCL comma struct"
+  (typep x 'sb-impl::comma))
+
+(defun bq-comma-expr (x)
+  "Get the expression from an SBCL comma struct"
+  (sb-impl::comma-expr x))
+
+(defun bq-comma-kind (x)
+  "Get the kind from an SBCL comma struct (0=unquote, 2=splice)"
+  (sb-impl::comma-kind x))
+
+(defun expand-backquote (template)
+  "Expand a backquote template into explicit list-building code.
+   Handles ,x (unquote) and ,@x (splice)."
+  (cond
+    ;; Atom (no unquoting needed): quote it
+    ((null template) nil)
+    ((bq-comma-p template)
+     ;; Bare ,x at top level
+     (bq-comma-expr template))
+    ((atom template)
+     (list 'quote template))
+    ;; List — process element by element
+    (t (expand-backquote-list template))))
+
+(defun expand-backquote-list (lst)
+  "Expand a backquote list template. Handles splice and nested backquote."
+  (let ((segments nil)   ; list of (kind . form) — :list or :splice
+        (current nil))   ; accumulator for consecutive non-splice elements
+    ;; Process each element
+    (let ((remaining lst))
+      (loop while (consp remaining)
+            do (let ((elt (car remaining)))
+                 (cond
+                   ;; ,@x — splice
+                   ((and (bq-comma-p elt) (= (bq-comma-kind elt) 2))
+                    ;; Flush current accumulator
+                    (when current
+                      (push (cons :list (nreverse current)) segments)
+                      (setf current nil))
+                    (push (cons :splice (bq-comma-expr elt)) segments))
+                   ;; ,x — unquote
+                   ((bq-comma-p elt)
+                    (push (bq-comma-expr elt) current))
+                   ;; Nested backquote
+                   ((and (consp elt) (eq (car elt) 'sb-int:quasiquote))
+                    (push (expand-backquote (cadr elt)) current))
+                   ;; Nested list
+                   ((consp elt)
+                    (push (expand-backquote elt) current))
+                   ;; Literal atom
+                   (t
+                    (push (list 'quote elt) current))))
+                 (setf remaining (cdr remaining)))
+      ;; Handle dotted pair tail
+      (when remaining
+        ;; Dotted tail
+        (when current
+          (push (cons :list (nreverse current)) segments)
+          (setf current nil))
+        (if (bq-comma-p remaining)
+            (push (cons :tail (bq-comma-expr remaining)) segments)
+            (push (cons :tail (list 'quote remaining)) segments))))
+    ;; Flush final accumulator
+    (when current
+      (push (cons :list (nreverse current)) segments))
+    ;; Build result from segments (in reverse order)
+    (setf segments (nreverse segments))
+    ;; Optimize: single :list segment → just (list ...)
+    (cond
+      ((null segments) nil)
+      ((and (null (cdr segments))
+            (eq (caar segments) :list))
+       `(list ,@(cdar segments)))
+      (t
+       ;; Multiple segments → append them
+       (let ((parts (mapcar (lambda (seg)
+                              (case (car seg)
+                                (:list `(list ,@(cdr seg)))
+                                (:splice (cdr seg))
+                                (:tail (cdr seg))))
+                            segments)))
+         (if (null (cdr parts))
+             (car parts)
+             `(append ,@parts)))))))
+
 ;;; ------ Main Dispatch ------
 
 (defun compile-form (form env dest)
   "Compile FORM in environment ENV, placing result in register DEST.
    DEST is a virtual register number."
-  ;; Macro expand first
+  ;; Expand backquote before macro expansion
+  (let ((form (if (and (consp form) (eq (car form) 'sb-int:quasiquote))
+                  (expand-backquote (cadr form))
+                  form)))
+  ;; Macro expand
   (let ((form (macroexpand-mvm form)))
     (cond
       ;; NIL
@@ -358,9 +705,22 @@
       ((consp form)
        (compile-compound form env dest))
 
+      ;; Float literal → compile as 0 (bare metal has no floats)
+      ((floatp form)
+       (compile-integer 0 dest))
+
+      ;; Vector literal #(...) → (make-array-from elt0 elt1 ...)
+      ((and (vectorp form) (not (stringp form)))
+       (let ((n (length form)))
+         (compile-form `(let ((arr (make-array ,n)))
+                          ,@(loop for i from 0 below n
+                                  collect `(aset arr ,i ,(aref form i)))
+                          arr)
+                       env dest)))
+
       ;; Unrecognized
       (t
-       (error "MVM compiler: cannot compile ~S" form)))))
+       (error "MVM compiler: cannot compile ~S" form))))))
 
 ;;; ------ Self-Evaluating Literals ------
 
@@ -393,16 +753,36 @@
 (defun compile-variable-ref (name env dest)
   "Compile a variable reference, placing result in DEST"
   (let ((binding (env-lookup env name)))
-    (unless binding
-      (error "MVM compiler: undefined variable ~A" name))
-    (ecase (binding-location binding)
-      (:reg
-       (let ((src (binding-reg binding)))
-         (unless (= src dest)
-           (emit-ir :mov dest src))))
-      (:stack
-       ;; Load from stack slot: load [VFP - (slot+1)*8]
-       (emit-ir :stack-load dest (binding-stack-slot binding))))))
+    (cond
+      (binding
+       (ecase (binding-location binding)
+         (:reg
+          (let ((src (binding-reg binding)))
+            (unless (= src dest)
+              (emit-ir :mov dest src))))
+         (:stack
+          ;; Load from stack slot: load [VFP - (slot+1)*8]
+          (emit-ir :stack-load dest (binding-stack-slot binding)))))
+      ;; Compile-time constant: fold to literal
+      ((let ((const-val (gethash (normalize-name name) *constants* :not-found)))
+         (unless (eq const-val :not-found)
+           ;; Quote symbol constants to prevent them being treated as variables
+           (if (and (symbolp const-val)
+                    (not (null const-val))
+                    (not (eq const-val t))
+                    (not (keywordp const-val)))
+               (compile-form (list 'quote const-val) nil dest)
+               (compile-form const-val nil dest))
+           t)))
+      ;; Global variable: emit call to symbol-value with name hash
+      ((gethash (normalize-name name) *globals*)
+       (let ((hash (normalize-name name)))
+         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-ir :call "SYMBOL-VALUE" 1)
+         (unless (= dest +vreg-vr+)
+           (emit-ir :mov dest +vreg-vr+))))
+      (t
+       (error "MVM compiler: undefined variable ~A" name)))))
 
 ;;; ------ Compound Form Dispatch ------
 
@@ -411,127 +791,214 @@
   (let* ((op (car form))
          (op-name (and (symbolp op) (normalize-name op))))
     (cond
+      ;; Non-symbol operator (lambda call, etc.)
+      ((null op-name)
+       (compile-call op (cdr form) env dest))
       ;; --- Special Forms ---
-      ((string-equal op-name "QUOTE")    (compile-quote (cadr form) dest))
-      ((string-equal op-name "IF")       (compile-if (cdr form) env dest))
-      ((string-equal op-name "PROGN")    (compile-progn (cdr form) env dest))
-      ((string-equal op-name "LET")      (compile-let (cadr form) (cddr form) env dest))
-      ((string-equal op-name "LET*")     (compile-let* (cadr form) (cddr form) env dest))
-      ((string-equal op-name "SETQ")     (compile-setq (cadr form) (caddr form) env dest))
-      ((string-equal op-name "LAMBDA")   (compile-lambda (cadr form) (cddr form) env dest))
-      ((string-equal op-name "WHEN")     (compile-when (cdr form) env dest))
-      ((string-equal op-name "UNLESS")   (compile-unless (cdr form) env dest))
-      ((string-equal op-name "LOOP")     (compile-loop (cdr form) env dest))
-      ((string-equal op-name "RETURN")   (compile-return (cadr form) env dest))
-      ((string-equal op-name "BLOCK")    (compile-block (cadr form) (cddr form) env dest))
-      ((string-equal op-name "TAGBODY")  (compile-tagbody (cdr form) env dest))
-      ((string-equal op-name "GO")       (compile-go (cadr form) env dest))
-      ((string-equal op-name "DOTIMES")  (compile-dotimes (cadr form) (cddr form) env dest))
-      ((string-equal op-name "FUNCTION") (compile-function-ref (cadr form) env dest))
-      ((string-equal op-name "FUNCALL")  (compile-funcall (cdr form) env dest))
+      ((= op-name 518921307293258709)    (compile-quote (cadr form) dest))
+      ((= op-name 448736678201786992)       (compile-if (cdr form) env dest))
+      ((= op-name 87505416312042891)    (compile-progn (cdr form) env dest))
+      ((= op-name 347164158959663450)      (compile-let (cadr form) (cddr form) env dest))
+      ((= op-name 115433002357585904)     (compile-let* (cadr form) (cddr form) env dest))
+      ((= op-name 565254038635891948)     (compile-setq (cadr form) (caddr form) env dest))
+      ((= op-name 527981956251550024)   (compile-lambda (cadr form) (cddr form) env dest))
+      ((= op-name 89559098115627243)     (compile-when (cdr form) env dest))
+      ((= op-name 123360604517422061)   (compile-unless (cdr form) env dest))
+      ((= op-name 502185558679326091)     (compile-loop (cdr form) env dest))
+      ((= op-name 732905726022713733)   (compile-return (cadr form) env dest))
+      ((= op-name 1062346144843286510)    (compile-block (cadr form) (cddr form) env dest))
+      ((= op-name 54884900767456285)  (compile-tagbody (cdr form) env dest))
+      ((= op-name 609179962647778703)       (compile-go (cadr form) env dest))
+      ((= op-name 1080561289491153610)  (compile-dotimes (cadr form) (cddr form) env dest))
+      ((= op-name 113179339635393781) (compile-function-ref (cadr form) env dest))
+      ((= op-name 59431251605330656)  (compile-funcall (cdr form) env dest))
+      ;; FLET/LABELS — compile local functions as named lambdas
+      ((or (= op-name 230909053785822708) (= op-name 176230696681611090))
+       (compile-flet (cadr form) (cddr form) env dest))
+      ;; RETURN-FROM — treat as return (ignore block name)
+      ((= op-name 102326962717880022)
+       (compile-return (caddr form) env dest))
+      ;; HANDLER-CASE — compile body only, skip handler clauses
+      ((= op-name 362314411895974678)
+       (compile-form (cadr form) env dest))
+      ;; IGNORE-ERRORS — compile body only
+      ((= op-name 1140402238842668217)
+       (compile-progn (cdr form) env dest))
+      ;; MACROLET — register local macros, compile body, then unregister
+      ((= op-name 36999051998272136)
+       (let ((saved-macros nil)
+             (macro-defs (cadr form))
+             (body (cddr form)))
+         ;; Register macrolet macros
+         (dolist (mdef macro-defs)
+           (let* ((mname (normalize-name (car mdef)))
+                  (mparams (cadr mdef))
+                  (mbody (cddr mdef))
+                  (old (gethash mname *macro-table*))
+                  (expander (eval `(lambda (form)
+                                     (destructuring-bind (,@mparams) (cdr form)
+                                       ,@mbody)))))
+             (push (cons mname old) saved-macros)
+             (mvm-define-macro mname expander)))
+         ;; Compile body
+         (compile-progn body env dest)
+         ;; Restore previous macro bindings
+         (dolist (saved saved-macros)
+           (if (cdr saved)
+               (setf (gethash (car saved) *macro-table*) (cdr saved))
+               (remhash (car saved) *macro-table*)))))
+      ;; WITH-OPEN-FILE — compile as let binding stream var to nil, then body
+      ((= op-name 258734651587197007)
+       (let ((spec (cadr form))
+             (body (cddr form)))
+         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
+      ;; WITH-OUTPUT-TO-STRING — compile as let binding stream var to nil
+      ((= op-name 884158782725716889)
+       (let ((spec (cadr form))
+             (body (cddr form)))
+         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
+      ;; WITH-INPUT-FROM-STRING — compile as let binding stream var to nil
+      ((= op-name 778706583216373557)
+       (let ((spec (cadr form))
+             (body (cddr form)))
+         (compile-form `(let ((,(car spec) nil)) ,@body) env dest)))
+      ;; MULTIPLE-VALUE-BIND — compile as let* with car/cdr destructuring
+      ((= op-name 544225037749651317)
+       (let ((vars (cadr form))
+             (expr (caddr form))
+             (body (cdddr form)))
+         (let ((tmp (gensym "MVB")))
+           (compile-form `(let* ((,tmp ,expr)
+                                 ,@(loop for var in vars
+                                         for i from 0
+                                         collect (if (zerop i)
+                                                     `(,var (car ,tmp))
+                                                     `(,var (cdr ,tmp)))))
+                            ,@body)
+                         env dest))))
 
       ;; --- Arithmetic ---
-      ((string-equal op-name "+")        (compile-add (cdr form) env dest))
-      ((string-equal op-name "-")        (compile-sub (cdr form) env dest))
-      ((string-equal op-name "*")        (compile-mul (cdr form) env dest))
-      ((string-equal op-name "/")        (compile-div (cdr form) env dest))
-      ((string-equal op-name "1+")       (compile-1+ (cadr form) env dest))
-      ((string-equal op-name "1-")       (compile-1- (cadr form) env dest))
-      ((string-equal op-name "TRUNCATE") (compile-truncate (cdr form) env dest))
-      ((string-equal op-name "MOD")      (compile-mod (cdr form) env dest))
+      ((= op-name 829550095445217828)        (compile-add (cdr form) env dest))
+      ((= op-name 721461107543724402)        (compile-sub (cdr form) env dest))
+      ((= op-name 847564926404219517)        (compile-mul (cdr form) env dest))
+      ((= op-name 757490770535469248)        (compile-div (cdr form) env dest))
+      ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
+      ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
+      ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
+      ((= op-name 654425922550660137)      (compile-mod (cdr form) env dest))
 
       ;; --- Comparisons ---
-      ((string-equal op-name "<")        (compile-compare :blt (cdr form) env dest))
-      ((string-equal op-name ">")        (compile-compare :bgt (cdr form) env dest))
-      ((string-equal op-name "=")        (compile-compare :beq (cdr form) env dest))
-      ((string-equal op-name "<=")       (compile-compare :ble (cdr form) env dest))
-      ((string-equal op-name ">=")       (compile-compare :bge (cdr form) env dest))
-      ((string-equal op-name "EQ")       (compile-eq (cdr form) env dest))
+      ;; Handle 3-arg comparisons: (<= a b c) → (and (<= a b) (<= b c))
+      ((and (member op-name '(1027713239215462235 1063742901133465257 1009698407182718722 377678312869028470 305990259964713332))
+            (= (length (cdr form)) 3))
+       (let ((a (cadr form)) (b (caddr form)) (c (cadddr form)))
+         (compile-form `(and (,(car form) ,a ,b) (,(car form) ,b ,c)) env dest)))
+      ((= op-name 1027713239215462235)        (compile-compare :blt (cdr form) env dest))
+      ((= op-name 1063742901133465257)        (compile-compare :bgt (cdr form) env dest))
+      ((= op-name 1009698407182718722)        (compile-compare :beq (cdr form) env dest))
+      ((= op-name 377678312869028470)       (compile-compare :ble (cdr form) env dest))
+      ((= op-name 305990259964713332)       (compile-compare :bge (cdr form) env dest))
+      ((= op-name 644866047583222547)       (compile-eq (cdr form) env dest))
 
       ;; --- List Operations ---
-      ((string-equal op-name "CAR")      (compile-car (cadr form) env dest))
-      ((string-equal op-name "CDR")      (compile-cdr (cadr form) env dest))
-      ((string-equal op-name "CONS")     (compile-cons (cadr form) (caddr form) env dest))
-      ((string-equal op-name "SET-CAR")  (compile-set-car (cadr form) (caddr form) env dest))
-      ((string-equal op-name "SET-CDR")  (compile-set-cdr (cadr form) (caddr form) env dest))
-      ((string-equal op-name "CAAR")     (compile-caar (cadr form) env dest))
-      ((string-equal op-name "CADR")     (compile-cadr (cadr form) env dest))
-      ((string-equal op-name "CDAR")     (compile-cdar (cadr form) env dest))
-      ((string-equal op-name "CDDR")     (compile-cddr (cadr form) env dest))
+      ((= op-name 131620339109781567)      (compile-car (cadr form) env dest))
+      ((= op-name 960859484116883722)      (compile-cdr (cadr form) env dest))
+      ((= op-name 658831809041752574)     (compile-cons (cadr form) (caddr form) env dest))
+      ((= op-name 643626177239181368)  (compile-set-car (cadr form) (caddr form) env dest))
+      ((= op-name 680584020244584045)  (compile-set-cdr (cadr form) (caddr form) env dest))
+      ((= op-name 599790875489715846)     (compile-caar (cadr form) env dest))
+      ((= op-name 492519292879068819)     (compile-cadr (cadr form) env dest))
+      ((= op-name 779194256552149755)     (compile-cdar (cadr form) env dest))
+      ((= op-name 455511896952479694)     (compile-cddr (cadr form) env dest))
 
       ;; --- Bitwise Operations ---
-      ((string-equal op-name "LOGAND")   (compile-logand (cdr form) env dest))
-      ((string-equal op-name "LOGIOR")   (compile-logior (cdr form) env dest))
-      ((string-equal op-name "LOGXOR")   (compile-logxor (cdr form) env dest))
-      ((string-equal op-name "ASH")      (compile-ash (cadr form) (caddr form) env dest))
-      ((string-equal op-name "LDB")      (compile-ldb (cadr form) (caddr form) env dest))
+      ((= op-name 245376457710419216)   (compile-logand (cdr form) env dest))
+      ((= op-name 444641700551290191)   (compile-logior (cdr form) env dest))
+      ((= op-name 91997575206662710)   (compile-logxor (cdr form) env dest))
+      ((= op-name 498596602025227109)      (compile-ash (cadr form) (caddr form) env dest))
+      ((= op-name 707618725562015373)      (compile-ldb (cadr form) (caddr form) env dest))
 
       ;; --- Type Predicates ---
-      ((string-equal op-name "NULL")     (compile-null (cadr form) env dest))
-      ((string-equal op-name "NOT")      (compile-null (cadr form) env dest))
-      ((string-equal op-name "CONSP")    (compile-consp (cadr form) env dest))
-      ((string-equal op-name "FIXNUMP")  (compile-fixnump (cadr form) env dest))
-      ((string-equal op-name "ATOM")     (compile-atom-p (cadr form) env dest))
-      ((string-equal op-name "LISTP")    (compile-listp (cadr form) env dest))
-      ((string-equal op-name "BIGNUMP")  (compile-bignump (cadr form) env dest))
-      ((string-equal op-name "STRINGP")  (compile-stringp (cadr form) env dest))
-      ((string-equal op-name "ARRAYP")   (compile-arrayp (cadr form) env dest))
-      ((string-equal op-name "INTEGERP") (compile-integerp (cadr form) env dest))
-      ((string-equal op-name "ZEROP")    (compile-zerop (cadr form) env dest))
-      ((string-equal op-name "CHARACTERP") (compile-characterp (cadr form) env dest))
+      ((= op-name 1034692707450833644)     (compile-null (cadr form) env dest))
+      ((= op-name 791386596785250882)      (compile-null (cadr form) env dest))
+      ((= op-name 193192138738169214)    (compile-consp (cadr form) env dest))
+      ((= op-name 1084402973118869726)  (compile-fixnump (cadr form) env dest))
+      ((= op-name 105613410085771328)     (compile-atom-p (cadr form) env dest))
+      ((= op-name 197121891723777229)    (compile-listp (cadr form) env dest))
+      ((= op-name 1091515641497713485)  (compile-bignump (cadr form) env dest))
+      ((= op-name 1024588698656382250)  (compile-stringp (cadr form) env dest))
+      ((= op-name 959229030243575902)   (compile-arrayp (cadr form) env dest))
+      ((= op-name 467922512990154729) (compile-integerp (cadr form) env dest))
+      ((= op-name 641752649465622469)    (compile-zerop (cadr form) env dest))
+      ((= op-name 322465010757792166) (compile-characterp (cadr form) env dest))
 
       ;; --- Character Operations ---
-      ((string-equal op-name "CHAR-CODE") (compile-char-code (cadr form) env dest))
-      ((string-equal op-name "CODE-CHAR") (compile-code-char (cadr form) env dest))
+      ((= op-name 511431138979586071) (compile-char-code (cadr form) env dest))
+      ((= op-name 632535660519644111) (compile-code-char (cadr form) env dest))
+
+      ;; --- EQL (same as EQ for fixnums/chars/symbols) ---
+      ((= op-name 743927193407775751)      (compile-eq (cdr form) env dest))
+      ((= op-name 777630921077348411)    (compile-eq (cdr form) env dest))
+      ((= op-name 674674239141986683) (compile-call op (cdr form) env dest))
 
       ;; --- Memory Operations ---
-      ((string-equal op-name "MEM-REF")  (compile-mem-ref (cadr form) (caddr form) env dest))
-      ((string-equal op-name "SETF")     (compile-setf (cadr form) (caddr form) env dest))
+      ((= op-name 900047298083458158)  (compile-mem-ref (cadr form) (caddr form) env dest))
+      ((= op-name 61397303667544258) (compile-setf (cadr form) (caddr form) env dest))
 
       ;; --- I/O Port Operations ---
-      ((string-equal op-name "IO-OUT-BYTE")  (compile-io-out-byte (cadr form) (caddr form) env dest))
-      ((string-equal op-name "IO-IN-BYTE")   (compile-io-in-byte (cadr form) env dest))
-      ((string-equal op-name "IO-OUT-DWORD") (compile-io-out-dword (cadr form) (caddr form) env dest))
-      ((string-equal op-name "IO-IN-DWORD")  (compile-io-in-dword (cadr form) env dest))
+      ((= op-name 951008440734391765)  (compile-io-out-byte (cadr form) (caddr form) env dest))
+      ((= op-name 64505486828081420)   (compile-io-in-byte (cadr form) env dest))
+      ((= op-name 402197317922113957) (compile-io-out-dword (cadr form) (caddr form) env dest))
+      ((= op-name 157364223757942884)  (compile-io-in-dword (cadr form) env dest))
 
       ;; --- Serial Console ---
-      ((string-equal op-name "WRITE-CHAR-SERIAL") (compile-write-char-serial (cdr form) env dest))
-      ((string-equal op-name "READ-CHAR-SERIAL")  (compile-read-char-serial dest))
+      ((= op-name 821056500804198866) (compile-write-char-serial (cdr form) env dest))
+      ((= op-name 602746553318600181)  (compile-read-char-serial dest))
+
+      ;; --- Memory Barrier ---
+      ((= op-name 1082210422183761822) (compile-memory-barrier dest))
 
       ;; --- System Registers ---
-      ((string-equal op-name "GET-ALLOC-PTR")   (compile-get-alloc-ptr dest))
-      ((string-equal op-name "GET-ALLOC-LIMIT") (compile-get-alloc-limit dest))
-      ((string-equal op-name "SET-ALLOC-PTR")   (compile-set-alloc-ptr (cadr form) env dest))
-      ((string-equal op-name "SET-ALLOC-LIMIT") (compile-set-alloc-limit (cadr form) env dest))
-      ((string-equal op-name "UNTAG")           (compile-untag (cadr form) env dest))
+      ((= op-name 756709414635220786)   (compile-get-alloc-ptr dest))
+      ((= op-name 1055755022150105225) (compile-get-alloc-limit dest))
+      ((= op-name 193475663400074726)   (compile-set-alloc-ptr (cadr form) env dest))
+      ((= op-name 831645445086829693) (compile-set-alloc-limit (cadr form) env dest))
+      ((= op-name 541448696650310846)           (compile-untag (cadr form) env dest))
 
       ;; --- Actor/Context Primitives ---
-      ((string-equal op-name "SAVE-CONTEXT")    (compile-save-context (cadr form) env dest))
-      ((string-equal op-name "RESTORE-CONTEXT") (compile-restore-context (cadr form) env dest))
-      ((string-equal op-name "CALL-NATIVE")     (compile-call-native (cdr form) env dest))
+      ((= op-name 746185050329267356)    (compile-save-context (cadr form) env dest))
+      ((= op-name 876713729717888613) (compile-restore-context (cadr form) env dest))
+      ((= op-name 949162595018862897)     (compile-call-native (cdr form) env dest))
 
       ;; --- SMP Primitives ---
-      ((string-equal op-name "XCHG-MEM") (compile-xchg-mem (cadr form) (caddr form) env dest))
-      ((string-equal op-name "PAUSE")    (compile-pause dest))
-      ((string-equal op-name "MFENCE")   (compile-mfence dest))
-      ((string-equal op-name "HLT")      (compile-hlt dest))
-      ((string-equal op-name "WRMSR")    (compile-wrmsr (cdr form) env dest))
-      ((string-equal op-name "STI")      (compile-sti dest))
-      ((string-equal op-name "CLI")      (compile-cli dest))
-      ((string-equal op-name "STI-HLT")  (compile-sti-hlt dest))
+      ((= op-name 64976006036515571) (compile-xchg-mem (cadr form) (caddr form) env dest))
+      ((= op-name 133047071382386485)    (compile-pause dest))
+      ((= op-name 532818990203984097)   (compile-mfence dest))
+      ((= op-name 930330168574267847)      (compile-hlt dest))
+      ((= op-name 637964639327971374)    (compile-wrmsr (cdr form) env dest))
+      ((= op-name 2665441512406489)      (compile-sti dest))
+      ((= op-name 295712735144528609)      (compile-cli dest))
+      ((= op-name 535690985964426756)  (compile-sti-hlt dest))
 
       ;; --- Per-CPU Data ---
-      ((string-equal op-name "PERCPU-REF")       (compile-percpu-ref (cadr form) env dest))
-      ((string-equal op-name "PERCPU-SET")       (compile-percpu-set (cadr form) (caddr form) env dest))
-      ((string-equal op-name "SWITCH-IDLE-STACK") (compile-switch-idle-stack dest))
-      ((string-equal op-name "SET-RSP")          (compile-set-rsp (cadr form) env dest))
-      ((string-equal op-name "LIDT")             (compile-lidt (cadr form) env dest))
+      ((= op-name 1049169163874840266)       (compile-percpu-ref (cadr form) env dest))
+      ((= op-name 815670105998589857)       (compile-percpu-set (cadr form) (caddr form) env dest))
+      ((= op-name 76399844366031519) (compile-switch-idle-stack dest))
+      ((= op-name 796316490043394273)          (compile-set-rsp (cadr form) env dest))
+      ((= op-name 1011033367071895394)             (compile-lidt (cadr form) env dest))
 
       ;; --- Jump ---
-      ((string-equal op-name "JUMP-TO-ADDRESS")  (compile-jump-to-address (cadr form) env dest))
+      ((= op-name 659104475066268328)  (compile-jump-to-address (cadr form) env dest))
 
       ;; --- Function Address ---
-      ((string-equal op-name "FN-ADDR")          (compile-fn-addr (cadr form) dest))
+      ((= op-name 532864888570260201)          (compile-fn-addr (cadr form) dest))
+
+      ;; --- Array Operations ---
+      ((= op-name 686483400154579705)       (compile-make-array (cadr form) env dest))
+      ((= op-name 568601634040735695)             (compile-aref (cadr form) (caddr form) env dest))
+      ((= op-name 216456113736582507)            (compile-aref (cadr form) (caddr form) env dest))
+      ((= op-name 416706424900304020)             (compile-aset (cadr form) (caddr form) (cadddr form) env dest))
+      ((= op-name 728795624198454423)     (compile-array-length (cadr form) env dest))
 
       ;; --- Function Call (default) ---
       (t (compile-call op (cdr form) env dest)))))
@@ -591,12 +1058,16 @@
   "Compile (progn form*). Result of last form goes to DEST."
   (if (null forms)
       (compile-nil dest)
-      (loop for (form . rest) on forms
-            do (if rest
-                   ;; Not the last form: compile for effect, result discarded
-                   (compile-form form env dest)
-                   ;; Last form: result goes to DEST
-                   (compile-form form env dest)))))
+      (let ((remaining forms))
+        (loop while remaining
+              do (let ((form (car remaining))
+                       (rest (cdr remaining)))
+                   (if rest
+                       ;; Not the last form: compile for effect, result discarded
+                       (compile-form form env dest)
+                       ;; Last form: result goes to DEST
+                       (compile-form form env dest))
+                   (setq remaining rest))))))
 
 ;;; ============================================================
 ;;; Let / Let*
@@ -605,7 +1076,8 @@
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
-  (let ((n-bindings (length bindings))
+  (let ((body (strip-declares body))
+        (n-bindings (length bindings))
         (new-env env)
         (save-temps nil))
     ;; Phase 1: Evaluate all values in original env, store to temp regs
@@ -614,26 +1086,29 @@
       ;; Allocate stack frame space for local variables
       (emit-ir :frame-alloc n-bindings))
     ;; Evaluate each binding value and store it to a stack slot
-    (loop for (var val) in bindings
-          for i from 0
-          do (let ((temp (alloc-temp-reg)))
-               (compile-form val env temp)
-               ;; Store to stack slot
-               (let ((slot (+ (compile-env-stack-depth env) i)))
-                 (emit-ir :stack-store temp slot))
-               (free-temp-reg)))
+    (let ((i 0))
+      (dolist (binding bindings)
+        (let ((val (if (consp binding) (cadr binding) nil))
+              (temp (alloc-temp-reg)))
+          (compile-form val env temp)
+          (let ((slot (+ (compile-env-stack-depth env) i)))
+            (emit-ir :stack-store temp slot))
+          (free-temp-reg)
+          (setq i (+ i 1)))))
     ;; Phase 2: Build new environment with stack bindings
-    (loop for (var val) in bindings
-          for i from 0
-          do (setf new-env
-                   (make-compile-env
-                    :bindings (cons (make-binding
-                                     :name var
-                                     :location :stack
-                                     :stack-slot (+ (compile-env-stack-depth env) i))
-                                   (compile-env-bindings new-env))
-                    :stack-depth (+ (compile-env-stack-depth env) n-bindings)
-                    :parent (compile-env-parent new-env))))
+    (let ((i 0))
+      (dolist (binding bindings)
+        (let ((var (if (consp binding) (car binding) binding)))
+          (setq new-env
+                (make-compile-env
+                 :bindings (cons (make-binding
+                                  :name var
+                                  :location :stack
+                                  :stack-slot (+ (compile-env-stack-depth env) i))
+                                (compile-env-bindings new-env))
+                 :stack-depth (+ (compile-env-stack-depth env) n-bindings)
+                 :parent (compile-env-parent new-env)))
+          (setq i (+ i 1)))))
     ;; Fix stack-depth in the final env
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
@@ -646,28 +1121,32 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
-  (let ((n-bindings (length bindings))
+  (let ((body (strip-declares body))
+        (n-bindings (length bindings))
         (new-env env))
     (when (> n-bindings 0)
       (emit-ir :frame-alloc n-bindings))
     ;; Evaluate sequentially, extending env each time
-    (loop for (var val) in bindings
-          for i from 0
-          do (let ((temp (alloc-temp-reg))
-                   (slot (+ (compile-env-stack-depth env) i)))
-               (compile-form val new-env temp)
-               (emit-ir :stack-store temp slot)
-               (free-temp-reg)
-               ;; Extend environment with this new binding
-               (setf new-env
-                     (make-compile-env
-                      :bindings (cons (make-binding
-                                        :name var
-                                        :location :stack
-                                        :stack-slot slot)
-                                      (compile-env-bindings new-env))
-                      :stack-depth (+ (compile-env-stack-depth env) (1+ i))
-                      :parent (compile-env-parent new-env)))))
+    (let ((i 0))
+      (dolist (binding bindings)
+        (let ((var (if (consp binding) (car binding) binding))
+              (val (if (consp binding) (cadr binding) nil))
+              (temp (alloc-temp-reg))
+              (slot (+ (compile-env-stack-depth env) i)))
+          (compile-form val new-env temp)
+          (emit-ir :stack-store temp slot)
+          (free-temp-reg)
+          ;; Extend environment with this new binding
+          (setq new-env
+                (make-compile-env
+                 :bindings (cons (make-binding
+                                  :name var
+                                  :location :stack
+                                  :stack-slot slot)
+                                (compile-env-bindings new-env))
+                 :stack-depth (+ (compile-env-stack-depth env) (+ i 1))
+                 :parent (compile-env-parent new-env)))
+          (setq i (+ i 1)))))
     ;; Final env has correct stack depth
     (setf (compile-env-stack-depth new-env)
           (+ (compile-env-stack-depth env) n-bindings))
@@ -685,14 +1164,27 @@
   "Compile (setq var val)"
   (compile-form val env dest)
   (let ((binding (env-lookup env var)))
-    (unless binding
-      (error "MVM compiler: undefined variable ~A in setq" var))
-    (ecase (binding-location binding)
-      (:reg
-       (unless (= (binding-reg binding) dest)
-         (emit-ir :mov (binding-reg binding) dest)))
-      (:stack
-       (emit-ir :stack-store dest (binding-stack-slot binding))))))
+    (cond
+      (binding
+       (ecase (binding-location binding)
+         (:reg
+          (unless (= (binding-reg binding) dest)
+            (emit-ir :mov (binding-reg binding) dest)))
+         (:stack
+          (emit-ir :stack-store dest (binding-stack-slot binding)))))
+      ;; Global variable: emit call to set-symbol-value
+      ((gethash (normalize-name var) *globals*)
+       (let ((hash (normalize-name var)))
+         ;; Push value, load hash into V0, pop value into V1
+         (emit-ir :push dest)
+         (emit-ir :li +vreg-v0+ (ash hash +fixnum-shift+))
+         (emit-ir :pop +vreg-v1+)
+         (emit-ir :call "SET-SYMBOL-VALUE" 2)
+         ;; Result is in VR, move back to dest if needed
+         (unless (= dest +vreg-vr+)
+           (emit-ir :mov dest +vreg-vr+))))
+      (t
+       (error "MVM compiler: undefined variable ~A in setq" var)))))
 
 ;;; ============================================================
 ;;; Lambda
@@ -700,16 +1192,35 @@
 
 (defun compile-lambda (params body env dest)
   "Compile (lambda (params) body*).
-   Creates a closure-like function. For now, compiles as a nested function
-   reference (full closures would need heap allocation for captured vars)."
-  (declare (ignore env))
-  (let* ((lambda-name (format nil "~A$$LAMBDA~D"
+   Creates a closure-like function. Passes outer environment through
+   so closure variables can be resolved (they'll reference outer stack slots)."
+  (let* ((pp (preprocess-params params body))
+         (lambda-name (format nil "~A$$LAMBDA~D"
                                (or *current-function-name* "ANON")
                                (make-compiler-label)))
-         (fn-info (mvm-compile-function-internal lambda-name params body)))
+         (fn-info (mvm-compile-function-internal lambda-name (car pp) (cdr pp) env)))
     ;; Load function reference into dest
     ;; This will be resolved to a bytecode offset during linking
     (emit-ir :li-func dest lambda-name)))
+
+;;; ============================================================
+;;; Flet / Labels
+;;; ============================================================
+
+(defun compile-flet (defs body env dest)
+  "Compile (flet ((name (params) body) ...) body).
+   Each local function is compiled as a named global function.
+   The local name is used for calls within the body."
+  (dolist (def defs)
+    (let ((name (car def))
+          (params (cadr def))
+          (fbody (cddr def)))
+      (let ((pp (preprocess-params params fbody)))
+        (mvm-compile-function-internal
+         (if (symbolp name) (symbol-name name) (string name))
+         (car pp) (cdr pp) env))))
+  ;; Compile body in same environment
+  (compile-progn (strip-declares body) env dest))
 
 ;;; ============================================================
 ;;; When / Unless
@@ -731,21 +1242,426 @@
 ;;; Loop / Return
 ;;; ============================================================
 
+(defun cl-loop-keyword-p (sym)
+  "Check if SYM is a CL loop keyword"
+  (and (symbolp sym)
+       (member (normalize-name sym)
+               '(861144843042936108 1113883427174140325 468563938978316688
+                 666095121438175797 32547421316216284 942546142429891564
+                 204640710178503481 1066799008902276193
+                 579297982844014476 820203232253031873 647934184416839188
+                 146808687552856964 891107942385378521 646649243001235175
+                 676158121401459048 264837417035531413 89559098115627243
+                 123360604517422061 448736678201786992 732905726022713733
+                 744661507158602198 340376721697683628 1091564327776232814
+                 870389735836749037 212607784983936827
+                 195734683635763289 682179722204096129
+                 876035653932002648 1018827631117520136))))
+
+
 (defun compile-loop (body env dest)
-  "Compile (loop forms...) - infinite loop with (return val) to exit"
-  (let* ((loop-label (make-compiler-label))
-         (exit-label (make-compiler-label))
-         (*loop-exit-label* exit-label))
-    ;; Loop entry
-    (emit-ir-label loop-label)
-    ;; Compile loop body
-    (compile-progn body env dest)
-    ;; Yield/preemption check
-    (emit-ir :yield)
-    ;; Jump back to loop start
-    (emit-ir :br loop-label)
-    ;; Exit label (target of return)
-    (emit-ir-label exit-label)))
+  "Compile (loop forms...) - either simple infinite loop or CL-style loop"
+  (if (and (consp body) (cl-loop-keyword-p (car body)))
+      ;; CL-style loop: expand to basic forms, then compile
+      (compile-form (expand-cl-loop body) env dest)
+      ;; Simple infinite loop
+      (let* ((loop-label (make-compiler-label))
+             (exit-label (make-compiler-label))
+             (*loop-exit-label* exit-label))
+        ;; Loop entry
+        (emit-ir-label loop-label)
+        ;; Compile loop body
+        (compile-progn body env dest)
+        ;; Yield/preemption check
+        (emit-ir :yield)
+        ;; Jump back to loop start
+        (emit-ir :br loop-label)
+        ;; Exit label (target of return)
+        (emit-ir-label exit-label))))
+
+;;; ============================================================
+;;; CL-Style Loop Expansion
+;;; ============================================================
+;;;
+;;; Expands (loop for/while/collect ...) to basic forms using
+;;; let, block, tagbody, go, and return-from.
+;;;
+;;; Supported patterns:
+;;;   (loop for VAR from START [to|below] END [by STEP] do BODY...)
+;;;   (loop for VAR in LIST do BODY...)
+;;;   (loop for VAR across ARRAY do BODY...)
+;;;   (loop while COND do BODY...)
+;;;   (loop for VAR = INIT then STEP [until COND] do BODY...)
+;;;   (loop for VAR on LIST do BODY...)
+;;;   (loop ... collect EXPR)
+;;;   (loop ... sum EXPR)
+;;;   (loop ... count EXPR)
+;;;   (loop ... when COND do BODY)
+;;;   (loop ... finally EXPR)
+;;;   (loop ... return EXPR)
+
+(defun expand-cl-loop (body)
+  "Expand a CL-style loop body into basic Lisp forms."
+  (let ((state (parse-cl-loop body)))
+    (generate-loop-code state)))
+
+(defstruct loop-state
+  ;; Iteration variables: list of (var init step test)
+  (iterations nil)
+  ;; Body forms
+  (body-forms nil)
+  ;; Accumulator: nil or (:collect var) or (:sum var) or (:count var)
+  (accumulator nil)
+  ;; Finally forms
+  (finally-forms nil)
+  ;; With-bindings: list of (var init)
+  (with-bindings nil))
+
+(defstruct loop-iter
+  kind            ; :from, :in, :across, :on, :general, :while, :repeat
+  var             ; iteration variable
+  init-form       ; initial value
+  step-form       ; step expression
+  end-form        ; end value (for :from)
+  end-test        ; :to, :below, :above, :downto (for :from)
+  by-form         ; step amount (for :from)
+  list-var)       ; internal temp var (for :in, :on, :across)
+
+(defun parse-cl-loop (body)
+  "Parse loop clauses into a loop-state struct."
+  (let ((state (make-loop-state))
+        (rest body))
+    (loop while rest do
+      (let ((kw (normalize-name (car rest))))
+        (cond
+          ;; FOR var FROM start [TO|BELOW end] [BY step]
+          ((or (= kw 861144843042936108) (= kw 1113883427174140325))
+           (let ((var (cadr rest)))
+             (setf rest (cddr rest))
+             (let ((iter-kw (normalize-name (car rest))))
+               (cond
+                 ;; FOR var FROM start ...
+                 ((= iter-kw 355693237506394641)
+                  (setf rest (cdr rest))
+                  (let* ((start-form (car rest))
+                         (end-form nil) (end-test :to) (by-form nil))
+                    (setf rest (cdr rest))
+                    ;; Parse optional TO/BELOW/DOWNTO/ABOVE and BY
+                    (loop while (and rest (symbolp (car rest))
+                                    (member (normalize-name (car rest))
+                                            '(611742951095832940 708656842296756988
+                                              962879967384500096 223271319558938470
+                                              934319717393949980)))
+                          do (let ((sub-kw (normalize-name (car rest))))
+                               (cond
+                                 ((= sub-kw 611742951095832940)
+                                  (setf end-test :to end-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 708656842296756988)
+                                  (setf end-test :below end-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 962879967384500096)
+                                  (setf end-test :above end-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 223271319558938470)
+                                  (setf end-test :downto end-form (cadr rest) rest (cddr rest)))
+                                 ((= sub-kw 934319717393949980)
+                                  (setf by-form (cadr rest) rest (cddr rest))))))
+                    (push (make-loop-iter :kind :from :var var
+                                          :init-form start-form
+                                          :end-form end-form
+                                          :end-test end-test
+                                          :by-form by-form)
+                          (loop-state-iterations state))))
+
+                 ;; FOR var IN list
+                 ((= iter-kw 592855328021284152)
+                  (setf rest (cdr rest))
+                  (let ((list-form (car rest))
+                        (tmp (gensym "LI")))
+                    (setf rest (cdr rest))
+                    (push (make-loop-iter :kind :in :var var
+                                          :init-form list-form
+                                          :list-var tmp)
+                          (loop-state-iterations state))))
+
+                 ;; FOR var ACROSS array
+                 ((= iter-kw 1027666347502942664)
+                  (setf rest (cdr rest))
+                  (let ((array-form (car rest))
+                        (idx (gensym "LI"))
+                        (arr (gensym "LA")))
+                    (setf rest (cdr rest))
+                    (push (make-loop-iter :kind :across :var var
+                                          :init-form array-form
+                                          :list-var idx
+                                          :step-form arr)
+                          (loop-state-iterations state))))
+
+                 ;; FOR var ON list
+                 ((= iter-kw 16092538585173950)
+                  (setf rest (cdr rest))
+                  (let ((list-form (car rest)))
+                    (setf rest (cdr rest))
+                    (push (make-loop-iter :kind :on :var var
+                                          :init-form list-form)
+                          (loop-state-iterations state))))
+
+                 ;; FOR var = init [THEN step]
+                 ((= iter-kw 1009698407182718722)
+                  (setf rest (cdr rest))
+                  (let ((init (car rest))
+                        (step nil))
+                    (setf rest (cdr rest))
+                    (when (and rest (symbolp (car rest))
+                               (= (normalize-name (car rest)) 712293789701165160))
+                      (setf step (cadr rest) rest (cddr rest)))
+                    (push (make-loop-iter :kind :general :var var
+                                          :init-form init
+                                          :step-form (or step init))
+                          (loop-state-iterations state))))
+
+                 (t (error "MVM loop: unknown FOR clause ~A" iter-kw))))))
+
+          ;; WHILE condition
+          ((= kw 468563938978316688)
+           (push (make-loop-iter :kind :while :init-form (cadr rest))
+                 (loop-state-iterations state))
+           (setf rest (cddr rest)))
+
+          ;; UNTIL condition
+          ((= kw 666095121438175797)
+           (push (make-loop-iter :kind :until :init-form (cadr rest))
+                 (loop-state-iterations state))
+           (setf rest (cddr rest)))
+
+          ;; REPEAT n
+          ((= kw 676158121401459048)
+           (let ((n-form (cadr rest))
+                 (counter (gensym "RC")))
+             (push (make-loop-iter :kind :repeat :var counter
+                                    :init-form n-form)
+                   (loop-state-iterations state))
+             (setf rest (cddr rest))))
+
+          ;; WITH var = init
+          ((= kw 264837417035531413)
+           (let ((var (cadr rest)))
+             (setf rest (cddr rest))
+             ;; Skip optional =
+             (when (and rest (symbolp (car rest))
+                        (= (normalize-name (car rest)) 1009698407182718722))
+               (setf rest (cdr rest))
+               (push (list var (car rest)) (loop-state-with-bindings state))
+               (setf rest (cdr rest)))))
+
+          ;; DO body...
+          ((or (= kw 32547421316216284) (= kw 942546142429891564))
+           (setf rest (cdr rest))
+           ;; Collect body forms until next loop keyword
+           (loop while (and rest (not (and (symbolp (car rest))
+                                           (cl-loop-keyword-p (car rest)))))
+                 do (push (car rest) (loop-state-body-forms state))
+                    (setf rest (cdr rest))))
+
+          ;; COLLECT expr
+          ((or (= kw 204640710178503481) (= kw 1066799008902276193))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :collect expr))
+             (setf rest (cddr rest))))
+
+          ;; SUM expr
+          ((or (= kw 579297982844014476) (= kw 820203232253031873))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :sum expr))
+             (setf rest (cddr rest))))
+
+          ;; COUNT expr
+          ((or (= kw 647934184416839188) (= kw 146808687552856964))
+           (let ((expr (cadr rest)))
+             (setf (loop-state-accumulator state) (list :count expr))
+             (setf rest (cddr rest))))
+
+          ;; WHEN/IF cond DO body | COLLECT expr
+          ((or (= kw 89559098115627243) (= kw 448736678201786992))
+           (let ((cond-form (cadr rest)))
+             (setf rest (cddr rest))
+             ;; Next should be DO or COLLECT
+             (let ((action-kw (and rest (normalize-name (car rest)))))
+               (cond
+                 ((or (= action-kw 32547421316216284) (= action-kw 942546142429891564))
+                  (setf rest (cdr rest))
+                  (let ((action-form (car rest)))
+                    (push `(when ,cond-form ,action-form) (loop-state-body-forms state))
+                    (setf rest (cdr rest))))
+                 ((or (= action-kw 204640710178503481) (= action-kw 1066799008902276193))
+                  (let ((expr (cadr rest)))
+                    (setf (loop-state-accumulator state) (list :collect-when cond-form expr))
+                    (setf rest (cddr rest))))
+                 (t
+                  ;; Bare when: the next form is the body
+                  (push `(when ,cond-form ,(car rest)) (loop-state-body-forms state))
+                  (setf rest (cdr rest)))))))
+
+          ;; FINALLY form...
+          ((= kw 744661507158602198)
+           (setf rest (cdr rest))
+           (loop while (and rest (not (and (symbolp (car rest))
+                                           (cl-loop-keyword-p (car rest)))))
+                 do (push (car rest) (loop-state-finally-forms state))
+                    (setf rest (cdr rest))))
+
+          ;; RETURN expr
+          ((= kw 732905726022713733)
+           (push `(return ,(cadr rest)) (loop-state-body-forms state))
+           (setf rest (cddr rest)))
+
+          ;; Unknown keyword — treat as body form
+          (t
+           (push (car rest) (loop-state-body-forms state))
+           (setf rest (cdr rest))))))
+
+    ;; Reverse accumulated lists
+    (setf (loop-state-iterations state) (nreverse (loop-state-iterations state)))
+    (setf (loop-state-body-forms state) (nreverse (loop-state-body-forms state)))
+    (setf (loop-state-finally-forms state) (nreverse (loop-state-finally-forms state)))
+    (setf (loop-state-with-bindings state) (nreverse (loop-state-with-bindings state)))
+    state))
+
+(defun generate-loop-code (state)
+  "Generate Lisp code from a parsed loop-state."
+  (let* ((iters (loop-state-iterations state))
+         (body (loop-state-body-forms state))
+         (acc (loop-state-accumulator state))
+         (finally (loop-state-finally-forms state))
+         (with-binds (loop-state-with-bindings state))
+         (acc-var (when acc (gensym "ACC")))
+         (bindings nil)
+         (init-stmts nil)
+         (test-forms nil)
+         (step-stmts nil))
+
+    ;; WITH bindings
+    (dolist (wb with-binds)
+      (push wb bindings))
+
+    ;; Accumulator binding
+    (when acc
+      (push (list acc-var (case (car acc)
+                            (:collect nil)
+                            (:collect-when nil)
+                            (:sum 0)
+                            (:count 0)
+                            (t nil)))
+            bindings))
+
+    ;; Process iterations
+    (dolist (iter iters)
+      (ecase (loop-iter-kind iter)
+        (:from
+         (let ((var (loop-iter-var iter))
+               (by (or (loop-iter-by-form iter) 1)))
+           (push (list var (loop-iter-init-form iter)) bindings)
+           (when (loop-iter-end-form iter)
+             (let ((end-var (gensym "END")))
+               (push (list end-var (loop-iter-end-form iter)) bindings)
+               (push (ecase (loop-iter-end-test iter)
+                       (:to    `(if (> ,var ,end-var) (return nil)))
+                       (:below `(if (>= ,var ,end-var) (return nil)))
+                       (:downto `(if (< ,var ,end-var) (return nil)))
+                       (:above `(if (<= ,var ,end-var) (return nil))))
+                     test-forms)))
+           (if (and (loop-iter-end-test iter)
+                    (member (loop-iter-end-test iter) '(:downto :above)))
+               (push `(setq ,var (- ,var ,by)) step-stmts)
+               (push `(setq ,var (+ ,var ,by)) step-stmts))))
+
+        (:in
+         (let ((var (loop-iter-var iter))
+               (tmp (loop-iter-list-var iter)))
+           (push (list tmp (loop-iter-init-form iter)) bindings)
+           (push (list var nil) bindings)
+           (push `(if (null ,tmp) (return nil)) test-forms)
+           (push `(setq ,var (car ,tmp)) init-stmts)
+           (push `(setq ,tmp (cdr ,tmp)) step-stmts)))
+
+        (:on
+         (let ((var (loop-iter-var iter)))
+           (push (list var (loop-iter-init-form iter)) bindings)
+           (push `(if (null ,var) (return nil)) test-forms)
+           (push `(setq ,var (cdr ,var)) step-stmts)))
+
+        (:across
+         (let ((var (loop-iter-var iter))
+               (idx (loop-iter-list-var iter))
+               (arr (loop-iter-step-form iter)))
+           (push (list arr (loop-iter-init-form iter)) bindings)
+           (push (list idx 0) bindings)
+           (push (list var nil) bindings)
+           (push `(if (>= ,idx (array-length ,arr)) (return nil)) test-forms)
+           (push `(setq ,var (aref ,arr ,idx)) init-stmts)
+           (push `(setq ,idx (1+ ,idx)) step-stmts)))
+
+        (:general
+         (let ((var (loop-iter-var iter)))
+           (push (list var (loop-iter-init-form iter)) bindings)
+           (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))
+
+        (:while
+         (push `(if (null ,(loop-iter-init-form iter)) (return nil)) test-forms))
+
+        (:until
+         (push `(if ,(loop-iter-init-form iter) (return nil)) test-forms))
+
+        (:repeat
+         (let ((var (loop-iter-var iter)))
+           (push (list var (loop-iter-init-form iter)) bindings)
+           (push `(if (<= ,var 0) (return nil)) test-forms)
+           (push `(setq ,var (1- ,var)) step-stmts)))))
+
+    ;; Build accumulation body
+    (let ((acc-body
+            (when acc
+              (case (car acc)
+                (:collect
+                 (list `(setq ,acc-var (cons ,(cadr acc) ,acc-var))))
+                (:collect-when
+                 (list `(when ,(cadr acc)
+                          (setq ,acc-var (cons ,(caddr acc) ,acc-var)))))
+                (:sum
+                 (list `(setq ,acc-var (+ ,acc-var ,(cadr acc)))))
+                (:count
+                 (list `(when ,(cadr acc)
+                          (setq ,acc-var (+ ,acc-var 1)))))))))
+
+      ;; Construct the final form
+      ;; (let* (bindings...)
+      ;;   (loop
+      ;;     tests...
+      ;;     init-stmts...
+      ;;     body...
+      ;;     acc-body...
+      ;;     step-stmts...
+      ;;   )
+      ;;   finally...
+      ;;   acc-var or nil)
+      (let* ((loop-body (append (nreverse test-forms)
+                                (nreverse init-stmts)
+                                body
+                                acc-body
+                                (nreverse step-stmts)))
+             (inner `(loop ,@loop-body))
+             (result (cond
+                       ;; Collect returns reversed list (nreverse in prelude)
+                       ((and acc (member (car acc) '(:collect :collect-when)))
+                        `(progn ,inner ,@finally (nreverse ,acc-var)))
+                       ;; Sum/count returns accumulator
+                       ((and acc (member (car acc) '(:sum :count)))
+                        `(progn ,inner ,@finally ,acc-var))
+                       ;; No accumulator
+                       (finally
+                        `(progn ,inner ,@finally nil))
+                       (t inner))))
+        (if bindings
+            `(let* ,(nreverse bindings) ,result)
+            result)))))
 
 (defun compile-return (value env dest)
   "Compile (return value) - exit from enclosing loop or function.
@@ -825,7 +1741,7 @@
   "Compile (function fname) - return function address as tagged value"
   (declare (ignore env))
   ;; Emit a load-function-ref IR that will be resolved during linking
-  (emit-ir :li-func dest (normalize-name name)))
+  (emit-ir :li-func dest (if (symbolp name) (symbol-name name) (string name))))
 
 (defun compile-funcall (args env dest)
   "Compile (funcall f arg1 arg2 ...) - indirect function call"
@@ -1511,23 +2427,23 @@
 
 (defun memory-width-code (type-form)
   "Convert a type keyword to an MVM memory width code.
-   Returns (values width-code needs-tag-p)"
+   Returns (cons width-code needs-tag-p)"
   (let ((actual-type (if (and (consp type-form)
                                (name-eq (car type-form) "QUOTE"))
                           (cadr type-form)
                           type-form)))
     (cond
       ((or (eq actual-type :u8)  (name-eq actual-type "U8"))
-       (values +width-u8+ t))
+       (cons +width-u8+ t))
       ((or (eq actual-type :u16) (name-eq actual-type "U16"))
-       (values +width-u16+ t))
+       (cons +width-u16+ t))
       ((or (eq actual-type :u32) (name-eq actual-type "U32"))
-       (values +width-u32+ t))
+       (cons +width-u32+ t))
       ((or (eq actual-type :u64) (name-eq actual-type "U64"))
-       (values +width-u64+ nil))
+       (cons +width-u64+ nil))
       (t
        ;; Default: u64, no tagging (raw pointer)
-       (values +width-u64+ nil)))))
+       (cons +width-u64+ nil)))))
 
 (defun compile-mem-ref (addr-form type-form env dest)
   "Compile (mem-ref addr type) - raw memory read.
@@ -1536,7 +2452,9 @@
   ;; Untag address: sar by 1
   (emit-ir :sar dest dest +fixnum-shift+)
   ;; Load from memory
-  (multiple-value-bind (width needs-tag) (memory-width-code type-form)
+  (let* ((wt (memory-width-code type-form))
+         (width (car wt))
+         (needs-tag (cdr wt)))
     (emit-ir :load dest dest width)
     ;; Tag result as fixnum if needed (u8/u16/u32)
     (when needs-tag
@@ -1549,7 +2467,9 @@
     ((and (consp place) (name-eq (car place) "MEM-REF"))
      (let ((addr-form (cadr place))
            (type-form (caddr place)))
-       (multiple-value-bind (width needs-untag) (memory-width-code type-form)
+       (let* ((wt2 (memory-width-code type-form))
+              (width (car wt2))
+              (needs-untag (cdr wt2)))
          (let ((addr-reg (alloc-temp-reg)))
            ;; Compile value first
            (compile-form value-form env dest)
@@ -1704,7 +2624,7 @@
 (defun compile-fn-addr (name dest)
   "Compile (fn-addr name) - load tagged native function address.
    Resolves function name at link time via FN-ADDR opcode."
-  (let ((fn-name (normalize-name name)))
+  (let ((fn-name (if (symbolp name) (symbol-name name) (string name))))
     (emit-ir :fn-addr dest fn-name)))
 
 ;;; ============================================================
@@ -1756,6 +2676,14 @@
    Uses TRAP #x0301; result is a tagged fixnum char code in V0."
   (emit-ir :trap #x0301)
   (emit-ir :mov dest +vreg-v0+))
+
+(defun compile-memory-barrier (dest)
+  "Compile (memory-barrier) — full system DSB.
+   On AArch64 without MMU, peripheral registers are Normal Non-cacheable,
+   so writes to different 4KB pages can be reordered by the write buffer.
+   This forces all pending writes to complete before proceeding."
+  (emit-ir :trap #x0302)
+  (emit-ir :li dest 0))
 
 (defun compile-sti (dest)
   "Compile (sti) - enable interrupts. Returns 0."
@@ -1833,6 +2761,79 @@
   (emit-ir :li dest 0))
 
 ;;; ============================================================
+;;; Array Operations
+;;; ============================================================
+
+(defun compile-make-array (size-form env dest)
+  "Compile (make-array size).
+   Constant size: ALLOC-OBJ with imm16 element count.
+   Variable size: compile size, untag, ALLOC-ARRAY."
+  (if (integerp size-form)
+      ;; Constant size — emit ALLOC-OBJ directly
+      ;; imm16 = element count, translator computes allocation size
+      (emit-ir :alloc-obj dest size-form +subtag-array+)
+      ;; Variable size — compile size expr, untag fixnum, emit ALLOC-ARRAY
+      (progn
+        (compile-form size-form env dest)
+        (emit-ir :sar dest dest +fixnum-shift+)
+        (emit-ir :alloc-array dest dest))))
+
+(defun compile-aref (arr-form idx-form env dest)
+  "Compile (aref array index).
+   Constant index uses OBJ-REF; variable index uses AREF opcode."
+  (if (integerp idx-form)
+      ;; Constant index — use OBJ-REF
+      (let ((arr-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (emit-ir :obj-ref dest arr-reg idx-form)
+        (free-temp-reg))
+      ;; Variable index — use AREF opcode
+      (let ((arr-reg (alloc-temp-reg))
+            (idx-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (compile-form idx-form env idx-reg)
+        ;; Untag index (tagged fixnum → raw integer)
+        (emit-ir :sar idx-reg idx-reg +fixnum-shift+)
+        (emit-ir :aref dest arr-reg idx-reg)
+        (free-temp-reg)
+        (free-temp-reg))))
+
+(defun compile-aset (arr-form idx-form val-form env dest)
+  "Compile (aset array index value).
+   Constant index uses OBJ-SET; variable index uses ASET opcode."
+  (if (integerp idx-form)
+      ;; Constant index — use OBJ-SET
+      (let ((arr-reg (alloc-temp-reg))
+            (val-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (compile-form val-form env val-reg)
+        (emit-ir :obj-set arr-reg idx-form val-reg)
+        (emit-ir :mov dest val-reg)
+        (free-temp-reg)
+        (free-temp-reg))
+      ;; Variable index — use ASET opcode
+      (let ((arr-reg (alloc-temp-reg))
+            (idx-reg (alloc-temp-reg)))
+        (compile-form arr-form env arr-reg)
+        (compile-form idx-form env idx-reg)
+        ;; Untag index
+        (emit-ir :sar idx-reg idx-reg +fixnum-shift+)
+        ;; Save arr and idx across value eval
+        (emit-ir :push arr-reg)
+        (emit-ir :push idx-reg)
+        (compile-form val-form env dest)
+        (emit-ir :pop idx-reg)
+        (emit-ir :pop arr-reg)
+        (emit-ir :aset arr-reg idx-reg dest)
+        (free-temp-reg)
+        (free-temp-reg))))
+
+(defun compile-array-length (arr-form env dest)
+  "Compile (array-length array). Extracts element count from header."
+  (compile-form arr-form env dest)
+  (emit-ir :array-len dest dest))
+
+;;; ============================================================
 ;;; Function Call
 ;;; ============================================================
 
@@ -1869,7 +2870,7 @@
     (cond
       ;; Direct call to named function
       ((symbolp fn)
-       (let ((fn-name (normalize-name fn)))
+       (let ((fn-name (symbol-name fn)))
          (emit-ir :call fn-name nargs)))
       ;; Other callable expression (rare in this system)
       (t
@@ -1890,14 +2891,78 @@
         (free-temp-reg)))))
 
 ;;; ============================================================
+;;; Parameter List Preprocessing
+;;; ============================================================
+;;;
+;;; Transforms &optional and &key parameter lists into simple required params
+;;; with default value initialization code prepended to the body.
+
+(defun preprocess-params (params body)
+  "Transform a CL parameter list with &optional/&key into simple required params.
+   Returns (cons new-params new-body)."
+  (let ((mode :required)
+        (required nil)
+        (optional nil)
+        (keys nil))
+    ;; Parse parameter list
+    (dolist (p params)
+      (cond
+        ((eq p '&optional) (setq mode :optional))
+        ((eq p '&key)      (setq mode :key))
+        ((eq p '&rest)     (setq mode :rest))
+        ((eq p '&body)     (setq mode :rest))
+        ((eq p '&allow-other-keys) nil) ; skip
+        ((eq mode :required) (push p required))
+        ((eq mode :optional)
+         (if (consp p)
+             (push (list (car p) (cadr p)) optional)
+             (push (list p nil) optional)))
+        ((eq mode :key)
+         (if (consp p)
+             (push (list (car p) (cadr p)) keys)
+             (push (list p nil) keys)))
+        ((eq mode :rest)
+         ;; &rest param — just treat as regular param for now
+         (push p required))))
+    (setf required (nreverse required))
+    (setf optional (nreverse optional))
+    (setf keys (nreverse keys))
+    ;; If no &optional or &key, return unchanged
+    (if (and (null optional) (null keys))
+        (cons params body)
+        ;; Build new parameter list: required + optional param names
+        (let ((new-params (append required (mapcar #'car optional)))
+              (new-body body))
+          ;; For &key params, add key params as regular params
+          (when keys
+            (dolist (k keys)
+              (push (car k) new-params)))
+          ;; Prepend default value checks for optional params
+          (let ((defaults nil))
+            (dolist (opt optional)
+              (when (cadr opt)
+                (push `(when (null ,(car opt))
+                         (setq ,(car opt) ,(cadr opt)))
+                      defaults)))
+            (dolist (k keys)
+              (when (cadr k)
+                (push `(when (null ,(car k))
+                         (setq ,(car k) ,(cadr k)))
+                      defaults)))
+            (when defaults
+              (setf new-body (append (nreverse defaults) body))))
+          (cons new-params new-body)))))
+
+;;; ============================================================
 ;;; Phase 2.5: Internal Function Compilation
 ;;; ============================================================
 ;;;
 ;;; Compiles a single function's body, producing IR instructions.
 
-(defun mvm-compile-function-internal (name params body)
+(defun mvm-compile-function-internal (name params body &optional parent-env)
   "Compile a single function into IR. Returns function-info.
-   Does NOT produce bytecode; that happens in phase 3."
+   Does NOT produce bytecode; that happens in phase 3.
+   PARENT-ENV, if provided, allows closure variable references."
   (let* ((*ir-buffer* nil)
          (*current-function-name* (if (symbolp name) (symbol-name name)
                                       (string name)))
@@ -1914,7 +2979,7 @@
     (let* ((nreg-params (min (length params) +max-reg-args+))
            (env (make-compile-env :stack-depth nreg-params
                                   :bindings nil
-                                  :parent nil)))
+                                  :parent parent-env)))
       ;; Save register params to stack and build environment
       (loop for param in params
             for i from 0
@@ -1937,8 +3002,8 @@
                      (compile-env-bindings env))
                (setf (compile-env-stack-depth env) (1+ i)))
 
-      ;; Compile body, result goes to VR
-      (compile-progn body env +vreg-vr+))
+      ;; Compile body (strip any declarations), result goes to VR
+      (compile-progn (strip-declares body) env +vreg-vr+))
 
     ;; Function return label (for early return via (return value))
     (emit-ir-label return-label)
@@ -2007,8 +3072,19 @@
       (:test  3)
       (:obj-tag 3)
       (:obj-subtag 3)
+      (:array-len 3)
+      (:alloc-array 3)  ;; 2-reg: 1 opcode + 2 regs = 3 bytes
+
+      ;; Object allocation: 1 opcode + 1 reg + 2 imm16 + 1 imm8 = 5 bytes
+      (:alloc-obj 5)
+
+      ;; Object slot access (immediate index): 1 opcode + 2 regs + 1 imm8 = 4 bytes
+      (:obj-ref 4)
+      (:obj-set 4)
 
       ;; 3-reg instructions: 1 opcode + 3 regs = 4 bytes
+      (:aref  4)
+      (:aset  4)
       (:add   4)
       (:sub   4)
       (:mul   4)
@@ -2118,10 +3194,7 @@
    BUF is an mvm-buffer. LABEL-POSITIONS maps label-id -> byte offset."
   (let ((current-offset 0))
     (dolist (insn ir-list)
-      (when (eq (car insn) :label)
-        ;; Labels emit nothing
-        (go next))
-
+      (unless (eq (car insn) :label)
       (let ((op (car insn)))
         (case op
           ;; ---- No-operand instructions ----
@@ -2183,6 +3256,29 @@
            (mvm-obj-tag buf (second insn) (third insn)))
           (:obj-subtag
            (mvm-obj-subtag buf (second insn) (third insn)))
+          (:array-len
+           (mvm-array-len buf (second insn) (third insn)))
+          (:alloc-array
+           (mvm-alloc-array buf (second insn) (third insn)))
+
+          ;; ---- Object allocation and slot access ----
+          (:alloc-obj
+           ;; (alloc-obj dest size subtag)
+           (mvm-alloc-obj buf (second insn) (third insn) (fourth insn)))
+          (:obj-ref
+           ;; (obj-ref dest obj idx)
+           (mvm-obj-ref buf (second insn) (third insn) (fourth insn)))
+          (:obj-set
+           ;; (obj-set obj idx src)
+           (mvm-obj-set buf (second insn) (third insn) (fourth insn)))
+
+          ;; ---- Variable-index array access ----
+          (:aref
+           ;; (aref dest obj idx)
+           (mvm-aref buf (second insn) (third insn) (fourth insn)))
+          (:aset
+           ;; (aset obj idx src)
+           (mvm-aset buf (second insn) (third insn) (fourth insn)))
 
           ;; ---- 3-reg instructions ----
           (:add
@@ -2387,9 +3483,8 @@
            (mvm-nop buf))))
 
       ;; Advance offset
-      (incf current-offset (ir-instruction-size insn))
+      (incf current-offset (ir-instruction-size insn))))))
 
-      next)))
 
 ;;; ============================================================
 ;;; Top-Level API
@@ -2406,31 +3501,81 @@
       (setf (gethash (function-info-name info) *functions*) info)
       (push info *function-table*)
       ;; Return the info and IR for later bytecode emission
-      (values info ir))))
+      (cons info ir))))
 
 (defun mvm-compile-toplevel (form)
   "Compile a top-level form.
    Handles defun, defvar, defconstant, defmacro, and bare expressions."
+  ;; Macro-expand top-level forms first
+  (let ((expanded (macroexpand-mvm form)))
+    (unless (eq expanded form)
+      (return-from mvm-compile-toplevel (mvm-compile-toplevel expanded))))
   (cond
+    ;; (progn form*) at top level — process each sub-form
+    ((and (consp form) (name-eq (car form) "PROGN"))
+     (let ((last-result nil))
+       (dolist (sub-form (cdr form))
+         (let ((result (mvm-compile-toplevel sub-form)))
+           (when result (setf last-result result))))
+       last-result))
+
     ;; (defun name (params) body...)
     ((and (consp form) (name-eq (car form) "DEFUN"))
      (destructuring-bind (name params &body body) (cdr form)
-       (mvm-compile-function name params body)))
+       (let ((pp (preprocess-params params body)))
+         (mvm-compile-function name (car pp) (cdr pp)))))
 
     ;; (defvar name &optional value)
     ((and (consp form) (name-eq (car form) "DEFVAR"))
-     (let ((name (cadr form))
-           (value (caddr form)))
+     (let* ((name (cadr form))
+            (value (caddr form))
+            (name-hash (normalize-name name)))
+       ;; Register as global variable
+       (setf (gethash name-hash *globals*) t)
        ;; Compile as a thunk that initializes the variable
        (when value
          (mvm-compile-function
-          (format nil "INIT-~A" (normalize-name name))
+          (format nil "INIT-~A" (symbol-name name))
           nil
-          (list value)))))
+          (list `(set-symbol-value ,(ash name-hash +fixnum-shift+)
+                                   ,value))))))
+
+    ;; (defparameter name value) — same as defvar
+    ((and (consp form) (name-eq (car form) "DEFPARAMETER"))
+     (let* ((name (cadr form))
+            (value (caddr form))
+            (name-hash (normalize-name name)))
+       ;; Register as global variable
+       (setf (gethash name-hash *globals*) t)
+       (when value
+         (mvm-compile-function
+          (format nil "INIT-~A" (symbol-name name))
+          nil
+          (list `(set-symbol-value ,(ash name-hash +fixnum-shift+)
+                                   ,value))))))
+
+    ;; (defpackage ...) — skip, package system is SBCL-side only
+    ((and (consp form) (name-eq (car form) "DEFPACKAGE"))
+     nil)
+
+    ;; (in-package ...) — skip, package system is SBCL-side only
+    ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
+     nil)
 
     ;; (defconstant name value)
     ((and (consp form) (name-eq (car form) "DEFCONSTANT"))
-     ;; Constants are folded at compile time, no runtime code needed
+     ;; Fold constants at compile time: evaluate the value and store.
+     ;; Also define in host environment so dependent defconstants can eval.
+     (let ((name (cadr form))
+           (value-form (caddr form)))
+       (when value-form
+         (let ((value (eval value-form)))
+           (setf (gethash (normalize-name name) *constants*) value)
+           ;; Make available for subsequent eval calls (skip if already a constant)
+           (when (and (symbolp name)
+                      (not (constantp name)))
+             (proclaim `(special ,name))
+             (set name value)))))
      nil)
 
     ;; (defmacro name (params) body...)
@@ -2446,6 +3591,107 @@
          (mvm-define-macro (normalize-name name) expander))
        nil))
 
+    ;; (defstruct name slot1 slot2 ...)
+    ;; Generates constructor (make-name), accessors (name-slot), setters (set-name-slot)
+    ((and (consp form) (name-eq (car form) "DEFSTRUCT"))
+     (let* ((struct-name (cadr form))
+            (struct-str (symbol-name struct-name))
+            (raw-slots (cddr form))
+            ;; Parse slot specs: plain symbol or (symbol default)
+            (slot-names (mapcar (lambda (s)
+                                  (if (consp s) (car s) s))
+                                raw-slots))
+            (slot-defaults (mapcar (lambda (s)
+                                     (if (consp s) (cadr s) nil))
+                                   raw-slots))
+            (nslots (length slot-names))
+            ;; Generate all defun forms
+            (forms-to-compile nil))
+       ;; Constructor: takes keyword-value pairs as flat args
+       ;; e.g., (make-foo :bar 1 :baz 2) → called with args (:bar 1 :baz 2)
+       ;; We generate a function that creates an array and fills slots
+       ;; But since MVM doesn't support &rest, we generate a fixed-arity
+       ;; constructor with (* 2 nslots) args (key1 val1 key2 val2 ...)
+       (let ((ctor-name (format nil "MAKE-~A" struct-str))
+             (internal-ctor-name (format nil "%MAKE-~A" struct-str))
+             (ctor-params nil)
+             (ctor-body nil))
+         ;; Positional constructor with internal name to avoid macro recursion
+         (setf ctor-params (loop for s in slot-names
+                                 collect (intern (format nil "P-~A" (symbol-name s))
+                                                 :modus64.mvm)))
+         (setf ctor-body
+               `(let ((obj (make-array ,nslots)))
+                  ,@(loop for i from 0
+                          for p in ctor-params
+                          collect `(aset obj ,i ,p))
+                  obj))
+         (push `(defun ,(intern internal-ctor-name :modus64.mvm)
+                    ,ctor-params
+                  ,ctor-body)
+               forms-to-compile)
+
+         ;; Register macro that expands (make-name ...) to (%make-name ...)
+         ;; with keyword args reordered to positional
+         (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
+               (defaults slot-defaults)
+               (internal-ctor-sym (intern internal-ctor-name :modus64.mvm)))
+           (mvm-define-macro ctor-name
+             (lambda (form)
+               (let ((args (cdr form))
+                     (positional (make-list nslots :initial-element nil)))
+                 ;; Fill defaults
+                 (loop for i from 0 for d in defaults
+                       do (setf (nth i positional) d))
+                 ;; Parse keyword args
+                 (loop while args
+                       do (let ((key (car args))
+                                (val (cadr args)))
+                            (let ((idx (position (normalize-name key)
+                                                 slot-kw-names
+                                                 :test #'=)))
+                              (when idx
+                                (setf (nth idx positional) val)))
+                            (setf args (cddr args))))
+                 `(,internal-ctor-sym ,@positional))))))
+
+       ;; Accessors
+       (loop for slot in slot-names
+             for i from 0
+             do (let ((acc-name (format nil "~A-~A" struct-str (symbol-name slot))))
+                  (push `(defun ,(intern acc-name :modus64.mvm) (obj)
+                           (aref obj ,i))
+                        forms-to-compile)
+                  ;; Register SETF handler for this accessor
+                  (let ((setter-name (format nil "SET-~A-~A" struct-str (symbol-name slot))))
+                    (push `(defun ,(intern setter-name :modus64.mvm) (obj val)
+                             (aset obj ,i val)
+                             val)
+                          forms-to-compile)
+                    ;; Register setf macro: (setf (foo-bar x) v) → (set-foo-bar x v)
+                    (let ((setter-sym (intern setter-name :modus64.mvm)))
+                      (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
+                        (mvm-define-macro setf-key
+                          (lambda (form)
+                            (declare (ignore form))
+                            nil))
+                        ;; Add to SETF expansion table
+                        (setf (gethash setf-key *macro-table*)
+                              setter-sym))))))
+
+       ;; Type predicate (name-p) — always returns t for any array (simple check)
+       (let ((pred-name (format nil "~A-P" struct-str)))
+         (push `(defun ,(intern pred-name :modus64.mvm) (obj)
+                  (arrayp obj))
+               forms-to-compile))
+
+       ;; Compile all generated forms
+       (let ((last-result nil))
+         (dolist (gen-form (nreverse forms-to-compile))
+           (let ((result (mvm-compile-toplevel gen-form)))
+             (when result (setf last-result result))))
+         last-result)))
+
     ;; Other top-level forms: wrap in anonymous function
     (t
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
@@ -2459,7 +3705,9 @@
         (*function-table* nil)
         (*constant-table* nil)
         (*label-counter* 0)
-        (*macro-table* (make-hash-table :test 'equal))
+        (*macro-table* (make-hash-table :test 'eql))
+        (*globals* (make-hash-table :test 'eql))
+        (*constants* (make-hash-table :test 'eql))
         (*loop-exit-label* nil)
         (*block-labels* nil)
         (*tagbody-tags* nil)
@@ -2470,7 +3718,9 @@
 
     ;; Phase 1 & 2: Compile all forms to IR
     (dolist (form forms)
-      (multiple-value-bind (info ir) (mvm-compile-toplevel form)
+      (let* ((result (mvm-compile-toplevel form))
+             (info (car result))
+             (ir (cdr result)))
         (when (and info ir)
           (push (cons info ir) all-ir))))
 
@@ -2508,7 +3758,7 @@
 
       ;; Build module
       (make-compiled-module
-       :bytecode (mvm-buffer-bytes buf)
+       :bytecode (mvm-buffer-used-bytes buf)
        :function-table (nreverse *function-table*)
        :constant-table (nreverse *constant-table*)))))
 
@@ -2544,12 +3794,12 @@
           for i from 0
           do (format t "  [~D] ~S~%" i const))))
 
-(defun dump-ir (ir-list &optional (stream *standard-output*))
+(defun dump-ir (ir-list)
   "Print IR instructions in a human-readable format for debugging"
   (dolist (insn ir-list)
     (if (eq (car insn) :label)
-        (format stream "L~D:~%" (second insn))
-        (format stream "  ~{~A~^ ~}~%" insn))))
+        (format t "L~D:~%" (second insn))
+        (format t "  ~{~A~^ ~}~%" insn))))
 
 ;;; ============================================================
 ;;; Testing

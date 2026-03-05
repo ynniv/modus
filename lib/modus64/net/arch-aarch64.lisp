@@ -205,3 +205,31 @@
         (write-byte 100) (write-byte 117)
         (write-byte 115) (write-byte 54)
         (write-byte 52) (write-byte 62) (write-byte 32))))
+
+;; ============================================================
+;; Actor system address hooks (QEMU virt memory layout)
+;; ============================================================
+;;
+;; Memory layout (RAM at 0x40000000):
+;;   0x41200000  Per-CPU data (8 CPUs x 64 bytes = 512 bytes)
+;;   0x41200200  Locks: +0x00 scheduler, +0x08 pool, +0x10 actor-table
+;;   0x41210000  Actor table (64 x 128 bytes = 8KB)
+;;   0x41212000  Scheduler state
+;;   0x41220000  Actor stacks (64 x 64KB = 4MB)
+;;   0x41620000  Mailbox pool (128KB = 8192 x 16-byte cells)
+;;   0x41640000  Pool state
+;;   0x41700000  Staging buffers (64 x 16KB = 1MB)
+;;   0x46000000  Per-actor heaps (64 x 4MB = 256MB)
+
+(defun percpu-data-base ()   #x41200000)
+(defun sched-lock-addr ()    #x41200200)
+(defun actor-table-base ()   #x41210000)
+(defun sched-state-base ()   #x41212000)
+(defun scratch-addr ()       #x41212050)
+(defun decode-ptr-addr ()    #x41212058)
+(defun actor-stack-base ()   #x41220000)
+(defun mailbox-pool-base ()  #x41620000)
+(defun mailbox-pool-limit () #x41640000)
+(defun pool-state-base ()    #x41640000)
+(defun staging-base-addr ()  #x41700000)
+(defun actor-heap-base ()    #x46000000)

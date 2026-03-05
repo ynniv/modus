@@ -127,16 +127,18 @@
 ;;; ============================================================
 
 (defstruct ppc-buffer
-  (words (make-array 2048 :element-type '(unsigned-byte 32)
-                          :adjustable t :fill-pointer 0))
+  (words (make-array 32768))            ; fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)      ; list of (word-index label-id type)
-  (position 0))     ; byte position (always word-aligned)
+  (position 0)      ; byte position (always word-aligned)
+  (word-count 0))   ; word index (position / 4)
 
 (defun ppc-emit-word (buf word)
   "Emit a 32-bit PPC instruction word."
-  (vector-push-extend (logand word #xFFFFFFFF) (ppc-buffer-words buf))
-  (incf (ppc-buffer-position buf) 4))
+  (let ((idx (ppc-buffer-word-count buf)))
+    (setf (aref (ppc-buffer-words buf) idx) (logand word #xFFFFFFFF))
+    (setf (ppc-buffer-word-count buf) (+ idx 1))
+    (incf (ppc-buffer-position buf) 4)))
 
 (defun ppc-current-offset (buf)
   "Current byte offset in the code buffer."
@@ -150,7 +152,7 @@
 (defun ppc-emit-fixup (buf label-id fixup-type)
   "Record a fixup for later resolution.
    FIXUP-TYPE is :branch14 (conditional) or :branch24 (unconditional) or :branch-hi/lo."
-  (push (list (1- (fill-pointer (ppc-buffer-words buf))) label-id fixup-type)
+  (push (list (1- (ppc-buffer-word-count buf)) label-id fixup-type)
         (ppc-buffer-fixups buf)))
 
 (defun ppc-fixup-labels (buf)
@@ -181,8 +183,8 @@
 
 (defun ppc-buffer-to-bytes (buf)
   "Convert the PPC word buffer to a big-endian byte vector."
-  (let* ((nwords (fill-pointer (ppc-buffer-words buf)))
-         (bytes (make-array (* nwords 4) :element-type '(unsigned-byte 8))))
+  (let* ((nwords (ppc-buffer-word-count buf))
+         (bytes (make-array (* nwords 4))))
     (dotimes (i nwords bytes)
       (let ((w (aref (ppc-buffer-words buf) i)))
         ;; Big-endian: MSB first
@@ -1662,8 +1664,10 @@
 
     ;; First pass: scan for branch targets and create labels
     (loop while (< pc len)
-          do (multiple-value-bind (opcode operands new-pc)
-                 (decode-instruction bc pc)
+          do (let* ((decoded (decode-instruction bc pc))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pc (cddr decoded)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -1707,8 +1711,10 @@
                (let ((label (gethash pc label-map)))
                  (when label
                    (ppc-emit-label buf label)))
-               (multiple-value-bind (opcode operands new-pc)
-                   (decode-instruction bc pc)
+               (let* ((decoded (decode-instruction bc pc))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pc (cddr decoded)))
                  ;; Compute branch target PCs relative to end of instruction
                  (ppc-translate-insn buf opcode operands new-pc label-map function-table)
                  (setf pc new-pc))))
@@ -1727,7 +1733,7 @@
   "Print a hex dump of PPC64 native code for debugging.
    Each line shows one 32-bit instruction word (big-endian)."
   (let* ((words (ppc-buffer-words buf))
-         (limit (or end (fill-pointer words))))
+         (limit (or end (ppc-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~8,'0X~%" (* i 4) (aref words i)))))
 

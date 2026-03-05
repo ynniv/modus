@@ -87,20 +87,20 @@
 ;;; ============================================================
 
 (defstruct rv-buffer
-  (bytes (make-array 8192 :element-type '(unsigned-byte 8)
-                          :adjustable t :fill-pointer 0))
+  (bytes (make-array 131072))           ; fixed-size, position tracks fill
   (position 0)
   (labels (make-hash-table :test 'eql))
   (fixups nil))    ; list of (byte-position label-id type)
 
 (defun rv-emit-u32 (buf word)
   "Emit a 32-bit instruction word (little-endian) to the RISC-V code buffer."
-  (let ((bytes (rv-buffer-bytes buf)))
-    (vector-push-extend (logand word #xFF) bytes)
-    (vector-push-extend (logand (ash word -8) #xFF) bytes)
-    (vector-push-extend (logand (ash word -16) #xFF) bytes)
-    (vector-push-extend (logand (ash word -24) #xFF) bytes)
-    (incf (rv-buffer-position buf) 4)))
+  (let ((bytes (rv-buffer-bytes buf))
+        (pos (rv-buffer-position buf)))
+    (setf (aref bytes pos)       (logand word #xFF))
+    (setf (aref bytes (+ pos 1)) (logand (ash word -8) #xFF))
+    (setf (aref bytes (+ pos 2)) (logand (ash word -16) #xFF))
+    (setf (aref bytes (+ pos 3)) (logand (ash word -24) #xFF))
+    (setf (rv-buffer-position buf) (+ pos 4))))
 
 (defun rv-current-offset (buf)
   "Return the current emission offset in bytes."
@@ -1307,8 +1307,10 @@
     ;; ---- Decode pass: collect all instructions ----
     (let ((pos 0))
       (loop while (< pos mvm-len)
-            do (multiple-value-bind (opcode operands new-pos)
-                   (decode-instruction bytecode pos)
+            do (let* ((decoded (decode-instruction bytecode pos))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pos (cddr decoded)))
                  (push (list pos opcode operands new-pos) insns)
                  (setf pos new-pos))))
     (setf insns (nreverse insns))
@@ -1373,16 +1375,16 @@
 (defun rv-buffer-to-bytes (buf)
   "Convert a RISC-V code buffer to a simple byte vector."
   (let* ((raw (rv-buffer-bytes buf))
-         (len (fill-pointer raw))
-         (result (make-array len :element-type '(unsigned-byte 8))))
-    (replace result raw)
-    result))
+         (len (rv-buffer-position buf))
+         (result (make-array len)))
+    (dotimes (i len result)
+      (setf (aref result i) (aref raw i)))))
 
 (defun riscv-disassemble-native (buf &key (start 0) (end nil))
   "Print a hex dump of RISC-V native code for debugging.
    Each line shows one 32-bit instruction word."
   (let* ((raw (rv-buffer-bytes buf))
-         (limit (or end (fill-pointer raw))))
+         (limit (or end (rv-buffer-position buf))))
     (loop for pos from start below limit by 4
           do (let ((w (logior (aref raw pos)
                               (ash (aref raw (+ pos 1)) 8)

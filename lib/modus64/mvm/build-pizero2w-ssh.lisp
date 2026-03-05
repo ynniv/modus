@@ -65,16 +65,16 @@
   (merge-pathnames "net/" *modus-base*))
 
 ;; Load: arch-raspi3b (adapter) + dwc2-device (USB gadget NIC)
-;; + ip + crypto + ssh + overrides
-;; Note: dwc2.lisp, usb.lisp, cdc-ether.lisp NOT loaded —
-;; dwc2-device.lisp provides the same NIC interface in USB device mode
+;; + ip + crypto + ssh + http + overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2-device.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "http.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
           (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
 
 ;;; ============================================================
@@ -100,6 +100,8 @@
                          "(defun kernel-main ()"
                          ;; Clear SSH IPC flags — uninitialized memory may suppress serial output
                          "  (setf (mem-ref #x01100014 :u32) 0)"
+                         ;; Clear eval globals pointer — uninitialized RAM on real hardware causes hang
+                         "  (setf (mem-ref (+ (ssh-ipc-base) #x60000) :u64) 0)"
                          ;; === Set GPIO14=ALT5 (mini UART TX), GPIO15=ALT5 (mini UART RX) ===
                          ;; GPFSEL1: GPIO14 bits[14:12]=010(ALT5), GPIO15 bits[17:15]=010(ALT5)
                          "  (setf (mem-ref #x3F200004 :u32) #x12000)"
@@ -125,19 +127,24 @@
                          "  (write-byte 84) (write-byte 10)"
                          ;; Initialize USB gadget + CDC-ECM Ethernet
                          "  (cdc-ether-init)"
+                         ;; Set DNS server to 8.8.8.8 (works with host NAT)
+                         "  (setf (mem-ref (+ (e1000-state-base) #x58) :u32) #x08080808)"
                          "  (write-byte 91) (write-byte 49) (write-byte 93)"
                          "  (sha256-init)"
                          "  (write-byte 91) (write-byte 50) (write-byte 93)"
                          "  (sha512-init)"
                          "  (write-byte 91) (write-byte 51) (write-byte 93)"
+                         ;; Clear ed25519 init flag — uninitialized RAM on real hardware
+                         ;; may be non-zero, causing ed25519-init to skip initialization
+                         "  (setf (mem-ref (+ (e1000-state-base) #x5D0) :u32) 0)"
                          "  (ed25519-init)"
                          "  (write-byte 91) (write-byte 52) (write-byte 93)"
                          "  (ssh-seed-random)"
                          "  (write-byte 91) (write-byte 53) (write-byte 93)"
-                         ;; No DHCP — static IP 10.0.0.2 set in cdc-ether-init
-                         "  (ssh-seed-random)"
-                         "  (ssh-init-strings)"
-                         ;; Embed pre-computed Ed25519 host key
+                         ;; Ed25519 self-test: sign empty message with zero key, verify
+                         "  (ed25519-test)"
+                         "  (write-byte 91) (write-byte 54) (write-byte 93)"
+                         ;; Host key inline
                          "  (let ((state (e1000-state-base)))"
                          "    (setf (mem-ref (+ state #x710) :u64) 0)"
                          "    (setf (mem-ref (+ state #x718) :u64) 0)"
@@ -152,6 +159,11 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
+                         "  (write-byte 91) (write-byte 57) (write-byte 93)"
+                         ;; Pre-compute ed25519 host key derivatives (s, prefix)
+                         ;; This saves ~5s of crypto during SSH key exchange
+                         "  (pre-compute-host-sign)"
+                         "  (write-byte 91) (write-byte 66) (write-byte 93)"
                          "  (write-byte 83) (write-byte 83) (write-byte 72)"
                          "  (write-byte 58) (print-dec 22) (write-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
@@ -160,7 +172,13 @@
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
-                         "  (net-actor-main))")))
+                         "  (write-byte 91) (write-byte 65) (write-byte 93)"
+                         ;; Pre-compute server ephemeral X25519 key pair
+                         ;; Must be after conn-base clear and ssh-seed-random
+                         "  (pre-compute-server-eph (conn-ssh 0))"
+                         "  (write-byte 91) (write-byte 67) (write-byte 93)"
+                         "  (net-actor-main))"
+)))
        (combined-source (concatenate 'string
                                       ssh-main
                                       cl-user::*net-source*

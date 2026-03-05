@@ -126,16 +126,30 @@
 ;;;
 ;;; Interleaves E1000 polling (inbound) with checking mailbox for
 ;;; outbound messages from handler actors. Uses try-receive (non-blocking).
+;;;
+;;; Message types (distinguished by car):
+;;;   (cons conn-index data-array) — outbound TCP data (conn 0-3)
+;;;   (cons 255 (cons sender-id (cons url url-len))) — HTTP fetch request
 
 (defun net-actor-main ()
   (loop
     (io-delay)
-    ;; Check for outbound messages from handler actors
+    ;; Check for messages from handler actors
     (let ((msg (try-receive)))
       (when (not (zerop msg))
-        (let ((conn (car msg))
-              (data (cdr msg)))
-          (tcp-send-segment-conn (conn-base conn) 24 data (array-length data)))))
+        (let ((tag (car msg)))
+          (if (eq tag 255)
+              ;; HTTP fetch request
+              (let ((inner (cdr msg)))
+                (let ((sender (car inner))
+                      (url-info (cdr inner)))
+                  (let ((url (car url-info))
+                        (url-len (cdr url-info)))
+                    (let ((result (http-fetch-impl url url-len)))
+                      (send sender result)))))
+              ;; Outbound TCP data
+              (let ((data (cdr msg)))
+                (tcp-send-segment-conn (conn-base tag) 24 data (array-length data)))))))
     ;; Poll E1000 for inbound packets
     (let ((pkt-len (e1000-receive)))
       (if (zerop pkt-len)
@@ -149,6 +163,11 @@
                         (when (eq arp-op 1)
                           (arp-reply buf)))
                       (when (eq et-lo 0)
+                        ;; Learn source MAC as gateway MAC (fixes broadcast dst on real hardware)
+                        (let ((st (e1000-state-base)))
+                          (dotimes (m 6)
+                            (setf (mem-ref (+ st (+ #x28 m)) :u8)
+                                  (mem-ref (+ buf (+ 6 m)) :u8))))
                         (let ((proto (mem-ref (+ buf 23) :u8)))
                           (if (eq proto 1)
                               (icmp-handle buf 14)

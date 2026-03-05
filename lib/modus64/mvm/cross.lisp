@@ -133,12 +133,8 @@
        (handler-case
            (ecase name
              (:riscv64
-              ;; rv-buffer has bytes slot with fill-pointer
-              (let* ((raw (rv-buffer-bytes buf))
-                     (len (fill-pointer raw))
-                     (result (make-array len :element-type '(unsigned-byte 8))))
-                (replace result raw)
-                result))
+              ;; rv-buffer has bytes slot with position tracking fill
+              (rv-buffer-to-bytes buf))
              (:aarch64  (a64-buffer-to-bytes buf))
              ((:ppc64 :ppc32) (ppc-buffer-to-bytes buf))
              (:i386     (modus64.mvm.i386:i386-buffer-to-bytes buf))
@@ -147,10 +143,10 @@
              (:x86-64
               ;; x64 translator uses code-buffer from modus64.asm
               (let* ((raw (modus64.asm:code-buffer-bytes buf))
-                     (len (fill-pointer raw))
-                     (result (make-array len :element-type '(unsigned-byte 8))))
-                (replace result raw)
-                result)))
+                     (len (modus64.asm:code-buffer-position buf))
+                     (result (make-array len)))
+                (dotimes (i len result)
+                  (setf (aref result i) (aref raw i))))))
          (error (e)
            (declare (ignore e))
            (make-array 0 :element-type '(unsigned-byte 8))))))))
@@ -182,7 +178,7 @@
          (if (= word-size 8)
              (mvm-emit-u64 buf 0)
              (mvm-emit-u32 buf 0)))))
-    (mvm-buffer-bytes buf)))
+    (mvm-buffer-used-bytes buf)))
 
 (defun build-nfn-table (module target)
   "Build the NFN (Name-to-Function-Number) table.
@@ -202,7 +198,7 @@
             (progn
               (mvm-emit-u32 buf (mvm-function-info-name-hash fn-info))
               (mvm-emit-u32 buf (mvm-function-info-native-offset fn-info))))))
-    (mvm-buffer-bytes buf)))
+    (mvm-buffer-used-bytes buf)))
 
 (defun embed-source-blob (source-text target)
   "Prepare the source text for embedding in the kernel image.
@@ -217,7 +213,7 @@
     ;; Align to word boundary
     (loop while (/= 0 (mod (mvm-buffer-position buf) (target-word-size target)))
           do (mvm-emit-byte buf 0))
-    (mvm-buffer-bytes buf)))
+    (mvm-buffer-used-bytes buf)))
 
 ;;; ============================================================
 ;;; ELF Wrappers (for QEMU -kernel loading)
@@ -303,7 +299,7 @@
     (emit-elf-be32 buf #x1000)
     ;; ---- Raw image data ----
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
-    (mvm-buffer-bytes buf)))
+    (mvm-buffer-used-bytes buf)))
 
 (defun wrap-in-elf64-be (raw-bytes load-addr e-machine &optional (e-flags 0))
   "Wrap raw image bytes in a minimal big-endian ELF64 executable."
@@ -364,7 +360,7 @@
     (emit-elf-be64 buf #x1000)
     ;; ---- Raw image data ----
     (loop for b across raw-bytes do (mvm-emit-byte buf b))
-    (mvm-buffer-bytes buf)))
+    (mvm-buffer-used-bytes buf)))
 
 ;;; ============================================================
 ;;; Image Assembly
@@ -397,7 +393,7 @@
           ;; Generic entry-fn (RISC-V, AArch64)
           (when entry-fn (funcall entry-fn boot-buf)))
         (setf (kernel-image-boot-code image)
-              (mvm-buffer-bytes boot-buf))))
+              (mvm-buffer-used-bytes boot-buf))))
     ;; Find kernel-main entry point
     (dolist (fn-info (mvm-module-function-table module))
       (when (string-equal (string (mvm-function-info-name fn-info)) "KERNEL-MAIN")
@@ -438,7 +434,7 @@
                                         (length source-blob) 8))
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
-      (let ((raw-bytes (mvm-buffer-bytes final-buf)))
+      (let ((raw-bytes (mvm-buffer-used-bytes final-buf)))
         ;; Wrap in ELF if target requires it (for QEMU -kernel loading)
         (setf (kernel-image-image-bytes image)
               (if boot-descriptor
@@ -464,6 +460,7 @@
    Board-specific targets (e.g. :rpi) map to their base architecture."
   (case target
     (:rpi :aarch64)
+    (:turducken :aarch64)
     (otherwise target)))
 
 (defun build-image (&key (target :x86-64) (source nil) (source-text nil))
@@ -525,6 +522,7 @@
     (:arm32   (arm32-boot-descriptor))
     (:armv7   (armv7-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
+    (:turducken (aarch64-turducken-boot-descriptor))
     (otherwise nil)))
 
 (defun write-kernel-image (image pathname)

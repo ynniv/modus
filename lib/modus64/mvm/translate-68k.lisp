@@ -105,16 +105,18 @@
 ;;; and converts to big-endian bytes at the end.
 
 (defstruct m68k-buffer
-  (words (make-array 4096 :element-type '(unsigned-byte 16)
-                          :adjustable t :fill-pointer 0))
+  (words (make-array 65536))            ; fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)      ; list of (word-index label-id fixup-type)
-  (position 0))     ; byte position
+  (position 0)      ; byte position
+  (word-count 0))   ; word index (position / 2)
 
 (defun m68k-emit-word (buf word)
   "Emit a 16-bit instruction word."
-  (vector-push-extend (logand word #xFFFF) (m68k-buffer-words buf))
-  (incf (m68k-buffer-position buf) 2))
+  (let ((idx (m68k-buffer-word-count buf)))
+    (setf (aref (m68k-buffer-words buf) idx) (logand word #xFFFF))
+    (setf (m68k-buffer-word-count buf) (+ idx 1))
+    (incf (m68k-buffer-position buf) 2)))
 
 (defun m68k-emit-long (buf val)
   "Emit a 32-bit value as two 16-bit words (big-endian: high word first)."
@@ -132,7 +134,7 @@
 
 (defun m68k-emit-fixup (buf label-id fixup-type)
   "Record a fixup. FIXUP-TYPE is :disp16 or :disp32."
-  (push (list (1- (fill-pointer (m68k-buffer-words buf)))
+  (push (list (1- (m68k-buffer-word-count buf))
               label-id fixup-type
               (m68k-buffer-position buf))
         (m68k-buffer-fixups buf)))
@@ -169,8 +171,8 @@
 
 (defun m68k-buffer-to-bytes (buf)
   "Convert the 68k word buffer to a big-endian byte vector."
-  (let* ((nwords (fill-pointer (m68k-buffer-words buf)))
-         (bytes (make-array (* nwords 2) :element-type '(unsigned-byte 8))))
+  (let* ((nwords (m68k-buffer-word-count buf))
+         (bytes (make-array (* nwords 2))))
     (dotimes (i nwords bytes)
       (let ((w (aref (m68k-buffer-words buf) i)))
         ;; Big-endian: MSB first
@@ -1805,8 +1807,10 @@
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
-          do (multiple-value-bind (opcode operands new-pc)
-                 (decode-instruction bc pc)
+          do (let* ((decoded (decode-instruction bc pc))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pc (cddr decoded)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -1846,8 +1850,10 @@
                (let ((label (gethash pc label-map)))
                  (when label
                    (m68k-emit-label buf label)))
-               (multiple-value-bind (opcode operands new-pc)
-                   (decode-instruction bc pc)
+               (let* ((decoded (decode-instruction bc pc))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pc (cddr decoded)))
                  (m68k-translate-insn buf opcode operands new-pc label-map function-table)
                  (setf pc new-pc))))
 
@@ -1865,7 +1871,7 @@
   "Print a hex dump of 68k native code for debugging.
    Each line shows one 16-bit word (big-endian)."
   (let* ((words (m68k-buffer-words buf))
-         (limit (or end (fill-pointer words))))
+         (limit (or end (m68k-buffer-word-count buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~4,'0X~%" (* i 2) (aref words i)))))
 

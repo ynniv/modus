@@ -330,6 +330,103 @@
   (eval-sexp form nil (ssh-get-globals)))
 
 ;;; ============================================================
+;;; Pre-computed crypto (avoid >5s USB polling gap)
+;;; ============================================================
+
+;; Pre-compute Ed25519 host key derivatives for fast signing.
+;; Stores clamped scalar s at state+0x680, prefix at state+0x6A0.
+;; Must be called AFTER ed25519-init and host key setup.
+(defun pre-compute-host-sign ()
+  (let ((state (e1000-state-base)))
+    (sha512-init)
+    ;; Load host private key from state+0x710
+    (let ((privkey (make-array 32)))
+      (dotimes (i 32)
+        (aset privkey i (mem-ref (+ state (+ #x710 i)) :u8)))
+      ;; SHA-512(privkey) → 64-byte hash
+      (let ((hash (sha512 privkey)))
+        ;; Clamp first 32 bytes → scalar s → store at state+0x680
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x680 i)) :u8) (aref hash i)))
+        (setf (mem-ref (+ state #x680) :u8)
+              (logand (mem-ref (+ state #x680) :u8) #xF8))
+        (let ((b31 (mem-ref (+ state #x69F) :u8)))
+          (setf (mem-ref (+ state #x69F) :u8)
+                (logior (logand b31 #x7F) #x40)))
+        ;; Second 32 bytes → prefix → store at state+0x6A0
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x6A0 i)) :u8) (aref hash (+ i 32))))
+        ;; Mark as pre-computed
+        (setf (mem-ref (+ state #x6C0) :u32) 1)))))
+
+;; Pre-compute X25519 server ephemeral key pair.
+;; Stores private key at state+0x6C4, public key at state+0x6E4.
+(defun pre-compute-server-eph (ssh)
+  (let ((state (e1000-state-base)))
+    ;; Generate random private key
+    (let ((priv (make-array 32)))
+      (dotimes (i 32) (aset priv i (ssh-random ssh)))
+      ;; Store private key at state+0x6C4
+      (dotimes (i 32)
+        (setf (mem-ref (+ state (+ #x6C4 i)) :u8) (aref priv i)))
+      ;; Compute and store public key at state+0x6E4
+      (let ((pub (x25519-public-key priv)))
+        (dotimes (i 32)
+          (setf (mem-ref (+ state (+ #x6E4 i)) :u8) (aref pub i)))))))
+
+;; Fast Ed25519 sign using pre-computed s, prefix, and host public key.
+;; Saves one ed-base-mult and one SHA-512 compared to ed25519-sign.
+(defun ed25519-sign-fast (message msg-len)
+  (let ((state (e1000-state-base)))
+    ;; Load pre-computed s and prefix
+    (let ((s (make-array 32)))
+      (dotimes (i 32)
+        (aset s i (mem-ref (+ state (+ #x680 i)) :u8)))
+      (let ((prefix (make-array 32)))
+        (dotimes (i 32)
+          (aset prefix i (mem-ref (+ state (+ #x6A0 i)) :u8)))
+        ;; Load pre-computed host public key (a-enc) from state+0x730
+        (let ((a-enc (make-array 32)))
+          (dotimes (i 32)
+            (aset a-enc i (mem-ref (+ state (+ #x730 i)) :u8)))
+          ;; r = SHA-512(prefix || message) mod L
+          (let ((r-input (concat-bytes prefix 32 message msg-len)))
+            (let ((r (ed-reduce-scalar (sha512 r-input))))
+              ;; R = r*B (the one remaining expensive operation)
+              (let ((r-enc (ed-encode-point (ed-base-mult r))))
+                ;; k = SHA-512(R || A || message) mod L
+                (let ((k-input (concat3-bytes r-enc 32 a-enc 32 message msg-len)))
+                  (let ((k (ed-reduce-scalar (sha512 k-input))))
+                    ;; S = (r + k*s) mod L
+                    (let ((ks (ed-scalar-mult-mod-l k s)))
+                      (let ((sig-s (ed-scalar-add r ks)))
+                        (let ((signature (make-array 64)))
+                          (dotimes (i 32)
+                            (aset signature i (aref r-enc i))
+                            (aset signature (+ i 32) (aref sig-s i)))
+                          signature)))))))))))))
+
+;; USB keep-alive: poll USB to prevent host NETDEV WATCHDOG timeout
+(defun usb-keepalive ()
+  (let ((i 0))
+    (loop
+      (when (>= i 100) (return 0))
+      (io-delay)
+      (let ((pkt-len (e1000-receive)))
+        (when (not (zerop pkt-len))
+          (let ((buf (e1000-rx-buf)))
+            (let ((et-hi (mem-ref (+ buf 12) :u8)))
+              (when (eq et-hi #x08)
+                (let ((et-lo (mem-ref (+ buf 13) :u8)))
+                  (if (eq et-lo #x06)
+                      (let ((arp-op (buf-read-u16-mem buf 20)))
+                        (when (eq arp-op 1) (arp-reply buf)))
+                      (when (eq et-lo 0)
+                        (let ((proto (mem-ref (+ buf 23) :u8)))
+                          (when (eq proto 1) (icmp-handle buf 14)))))))))))
+      (setq i (+ i 1)))))
+
+;;; ============================================================
 ;;; Network overrides (single-threaded)
 ;;; ============================================================
 
@@ -384,6 +481,8 @@
   (let ((ssh (conn-ssh conn))
         (cb (conn-base conn)))
     (ssh-handle-connection ssh)
+    ;; Regenerate server ephemeral X25519 key pair for next connection
+    (pre-compute-server-eph ssh)
     (tcp-close-conn cb)
     (conn-free conn)))
 
@@ -436,9 +535,30 @@
           (when (not (zerop want-reply))
             (ssh-send-channel-success ssh
              (mem-ref (+ ssh #x18) :u32)))
+          ;; "shell" (rtype_len=5, 's'=115) → send prompt, enter interactive
           (when (eq rtype-len 5)
             (when (eq (aref payload 9) 115)
-              (ssh-send-prompt ssh))))))
+              (ssh-send-prompt ssh)))
+          ;; "exec" (rtype_len=4, 'e'=101) → execute command, send result
+          (when (eq rtype-len 4)
+            (when (eq (aref payload 9) 101)
+              (let ((cmd-off (+ 10 rtype-len)))
+                (let ((cmd-len (ssh-get-u32 payload cmd-off)))
+                  (let ((cmd (make-array cmd-len)))
+                    (dotimes (i cmd-len)
+                      (aset cmd i (aref payload (+ cmd-off 4 i))))
+                    (ssh-eval-line ssh cmd cmd-len)
+                    ;; Send EOF + CLOSE after exec
+                    (let ((cli-chan (mem-ref (+ ssh #x18) :u32)))
+                      (let ((eof-msg (make-array 5)))
+                        (aset eof-msg 0 96)
+                        (ssh-put-u32 eof-msg 1 cli-chan)
+                        (ssh-send-payload ssh eof-msg 5))
+                      (let ((close-msg (make-array 5)))
+                        (aset close-msg 0 97)
+                        (ssh-put-u32 close-msg 1 cli-chan)
+                        (ssh-send-payload ssh close-msg 5)))
+                    (setf (mem-ref flag-addr :u32) 0)))))))))
     (when (eq msg-type 94)
       (ssh-handle-channel-data ssh payload plen))
     (when (eq msg-type 97)
@@ -490,27 +610,35 @@
   (let ((conn (conn-alloc)))
     (when (not (= conn (- 0 1)))
       (conn-init conn dst-port src-port src-ip)
+      ;; Clear protocol type (uninitialized RAM on real hardware)
+      (setf (mem-ref (+ (conn-base conn) #x1C) :u32) 0)
+      ;; Set protocol type: port 80 → HTTP (1), else SSH (0)
+      (when (eq dst-port 80)
+        (setf (mem-ref (+ (conn-base conn) #x1C) :u32) 1))
       (let ((their-seq (buf-read-u32-mem buf 38)))
         (setf (mem-ref (+ (conn-base conn) #x014) :u32) (+ their-seq 1)))
-      ;; Init SSH recv buffer BEFORE net-wait-ack so piggybacked data works
+      ;; Init recv buffer BEFORE net-wait-ack so piggybacked data works
       (let ((ssh (conn-ssh conn)))
         (setf (mem-ref (+ ssh #x6D4) :u32) 0))
       (tcp-send-segment-conn (conn-base conn) 18 (make-array 0) 0)
       (net-wait-ack conn)
       (when (eq (mem-ref (conn-base conn) :u32) 2)
-        (ssh-copy-host-key conn)
-        (let ((ssh (conn-ssh conn)))
-          (setf (mem-ref ssh :u32) 0)
-          (setf (mem-ref (+ ssh #x04) :u32) 0)
-          (setf (mem-ref (+ ssh #x08) :u32) 0)
-          (setf (mem-ref (+ ssh #x0C) :u32) 0)
-          (setf (mem-ref (+ ssh #x10) :u32) 0)
-          ;; Don't reset 0x6D4 - may already have data from ACK packet
-          (setf (mem-ref (+ ssh #x28) :u32) 0)
-          (setf (mem-ref (+ ssh #x150) :u32) 0)
-          (setf (mem-ref (+ ssh #x154) :u32) 0)
-          (setf (mem-ref (+ ssh #x2C) :u32)
-                (+ src-port (* src-ip 7))))
-        (setf (mem-ref (+ (ssh-ipc-base) #x60448) :u32) conn)
-        ;; Single-threaded: handle connection directly
-        (ssh-connection-handler conn)))))
+        (if (eq (mem-ref (+ (conn-base conn) #x1C) :u32) 1)
+            ;; HTTP: handle directly (no SSH state needed)
+            (http-connection-handler conn)
+            ;; SSH: init state and handle
+            (progn
+              (ssh-copy-host-key conn)
+              (let ((ssh (conn-ssh conn)))
+                (setf (mem-ref ssh :u32) 0)
+                (setf (mem-ref (+ ssh #x04) :u32) 0)
+                (setf (mem-ref (+ ssh #x08) :u32) 0)
+                (setf (mem-ref (+ ssh #x0C) :u32) 0)
+                (setf (mem-ref (+ ssh #x10) :u32) 0)
+                (setf (mem-ref (+ ssh #x28) :u32) 0)
+                (setf (mem-ref (+ ssh #x150) :u32) 0)
+                (setf (mem-ref (+ ssh #x154) :u32) 0)
+                (setf (mem-ref (+ ssh #x2C) :u32)
+                      (+ src-port (* src-ip 7))))
+              (setf (mem-ref (+ (ssh-ipc-base) #x60448) :u32) conn)
+              (ssh-connection-handler conn)))))))

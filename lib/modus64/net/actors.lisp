@@ -137,6 +137,63 @@
     0))
 
 ;;; ============================================================
+;;; Per-CPU accessors (standardized layout across all architectures)
+;;; ============================================================
+;;;
+;;; AArch64 per-CPU layout (via TPIDR_EL1):
+;;;   +0x00 self-ptr       +0x08 reduction
+;;;   +0x10 cpu-id         +0x18 current-actor
+;;;   +0x20 idle-flag      +0x28 obj-alloc
+;;;   +0x30 obj-limit      +0x38 idle-stack-top
+
+(defun get-current-actor () (percpu-ref 24))
+(defun set-current-actor (val) (percpu-set 24 val))
+(defun get-idle-flag () (percpu-ref 32))
+(defun set-idle-flag (val) (percpu-set 32 val))
+
+;;; ============================================================
+;;; SMP initialization (single CPU, parameterized addresses)
+;;; ============================================================
+
+(defun smp-init ()
+  ;; TPIDR_EL1 already set by boot code
+  ;; Initialize per-CPU data for BSP (CPU 0)
+  (let ((base (percpu-data-base)))
+    (setf (mem-ref base :u64) base)
+    (setf (mem-ref (+ base 8) :u64) 0)
+    (setf (mem-ref (+ base 16) :u64) 0)
+    (setf (mem-ref (+ base 24) :u64) 0)
+    (setf (mem-ref (+ base 32) :u64) 0)
+    ;; idle stack top for CPU 0: percpu-data-base + 0x2000
+    (setf (mem-ref (+ base 56) :u64) (+ (percpu-data-base) #x2000)))
+  ;; Zero lock variables
+  (setf (mem-ref (sched-lock-addr) :u64) 0)
+  (let ((lk2 (+ (sched-lock-addr) 8)))
+    (setf (mem-ref lk2 :u64) 0))
+  (let ((lk3 (+ (sched-lock-addr) 16)))
+    (setf (mem-ref lk3 :u64) 0))
+  ;; CPU count = 1 (single CPU)
+  (let ((cc (+ (sched-state-base) #x20)))
+    (setf (mem-ref cc :u64) 1))
+  1)
+
+;;; ============================================================
+;;; IPI / Wake (stubs for single CPU, override for SMP)
+;;; ============================================================
+
+(defun send-ipi-to-idle (target-cpu) 0)
+(defun wake-idle-ap () 0)
+
+;;; ============================================================
+;;; Shutdown
+;;; ============================================================
+
+(defun shutdown ()
+  ;; Print "Bye\n" then halt
+  (write-byte 66) (write-byte 121) (write-byte 101) (write-byte 10)
+  (loop (halt)))
+
+;;; ============================================================
 ;;; Actor init
 ;;; ============================================================
 

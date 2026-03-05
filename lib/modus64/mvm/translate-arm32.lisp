@@ -127,19 +127,21 @@
 ;;; Buffer stores instruction words; converted to LE bytes at end.
 
 (defstruct arm32-buffer
-  (code (make-array 2048 :element-type '(unsigned-byte 32)
-                         :adjustable t :fill-pointer 0))
+  (code (make-array 32768))             ; fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)
-  (div-label nil))    ; label ID for software divide routine
+  (div-label nil)    ; label ID for software divide routine
+  (position 0))      ; current instruction index (word count)
 
 (defun arm32-emit (buf word)
   "Emit a 32-bit ARM instruction."
-  (vector-push-extend (logand word #xFFFFFFFF) (arm32-buffer-code buf)))
+  (let ((pos (arm32-buffer-position buf)))
+    (setf (aref (arm32-buffer-code buf) pos) (logand word #xFFFFFFFF))
+    (setf (arm32-buffer-position buf) (+ pos 1))))
 
 (defun arm32-current-index (buf)
   "Current instruction index (word count)."
-  (fill-pointer (arm32-buffer-code buf)))
+  (arm32-buffer-position buf))
 
 (defun arm32-emit-label (buf label-id)
   "Record that LABEL-ID is at the current code position."
@@ -153,8 +155,8 @@
 
 (defun arm32-buffer-to-bytes (buf)
   "Convert ARM32 word buffer to little-endian byte vector."
-  (let* ((nwords (fill-pointer (arm32-buffer-code buf)))
-         (bytes (make-array (* nwords 4) :element-type '(unsigned-byte 8))))
+  (let* ((nwords (arm32-buffer-position buf))
+         (bytes (make-array (* nwords 4))))
     (dotimes (i nwords bytes)
       (let ((w (aref (arm32-buffer-code buf) i)))
         ;; Little-endian: LSB first
@@ -626,7 +628,7 @@
                                           0))
                               #xFFFFFFFF)))
         (when (<= rotated 255)
-          (return-from arm32-encode-imm (values rot (logand rotated #xFF))))))
+          (return-from arm32-encode-imm (cons rot (logand rotated #xFF))))))
     nil))
 
 (defun arm32-load-imm32 (buf rd value)
@@ -635,15 +637,19 @@
    ARMv7: MOV if encodable, else MOVW + optional MOVT (1-2 instructions)."
   (let ((val (logand value #xFFFFFFFF)))
     ;; Try direct MOV (1 instruction, works on all ARM)
-    (multiple-value-bind (rot imm) (arm32-encode-imm val)
-      (when rot
-        (arm32-mov-imm buf rd rot imm)
-        (return-from arm32-load-imm32)))
+    (let ((enc (arm32-encode-imm val)))
+      (when enc
+        (let ((rot (car enc))
+              (imm (cdr enc)))
+          (arm32-mov-imm buf rd rot imm)
+          (return-from arm32-load-imm32))))
     ;; Try MVN (1 instruction, works on all ARM)
-    (multiple-value-bind (rot imm) (arm32-encode-imm (logand (lognot val) #xFFFFFFFF))
-      (when rot
-        (arm32-dp-imm buf +arm-dp-mvn+ rd 0 rot imm)
-        (return-from arm32-load-imm32)))
+    (let ((enc (arm32-encode-imm (logand (lognot val) #xFFFFFFFF))))
+      (when enc
+        (let ((rot (car enc))
+              (imm (cdr enc)))
+          (arm32-dp-imm buf +arm-dp-mvn+ rd 0 rot imm)
+          (return-from arm32-load-imm32))))
     ;; Multi-instruction path diverges by mode
     (if *arm32-v7*
         ;; ARMv7: MOVW + MOVT (always <= 2 instructions)
@@ -1078,9 +1084,11 @@
              (arm32-lsr-imm buf +arm-r12+ ps (logand pos 31))
              ;; AND r12, r12, #((1<<size)-1)
              (let ((mask (1- (ash 1 size))))
-               (multiple-value-bind (rot imm) (arm32-encode-imm mask)
-                 (if rot
-                     (arm32-and-imm buf +arm-r12+ +arm-r12+ rot imm)
+               (let ((enc (arm32-encode-imm mask)))
+                 (if enc
+                     (let ((rot (car enc))
+                           (imm (cdr enc)))
+                       (arm32-and-imm buf +arm-r12+ +arm-r12+ rot imm))
                      (progn
                        (arm32-load-imm32 buf +arm-lr+ mask)
                        (arm32-and-r buf +arm-r12+ +arm-r12+ +arm-lr+)))))
@@ -1242,9 +1250,11 @@
            ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
            ;; Align to 16 bytes to keep cons alloc pointer aligned
            (let ((total (logand (+ (* (1+ size) 4) 15) (lognot 15))))
-             (multiple-value-bind (rot imm) (arm32-encode-imm total)
-               (if rot
-                   (arm32-add-imm buf +arm-r9+ +arm-r9+ rot imm)
+             (let ((enc (arm32-encode-imm total)))
+               (if enc
+                   (let ((rot (car enc))
+                         (imm (cdr enc)))
+                     (arm32-add-imm buf +arm-r9+ +arm-r9+ rot imm))
                    (progn
                      (arm32-load-imm32 buf +arm-lr+ total)
                      (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))))))
@@ -1502,8 +1512,10 @@
 
     ;; First pass: scan for branch targets
     (loop while (< pc len)
-          do (multiple-value-bind (opcode operands new-pc)
-                 (decode-instruction bc pc)
+          do (let* ((decoded (decode-instruction bc pc))
+                    (opcode (car decoded))
+                    (operands (cadr decoded))
+                    (new-pc (cddr decoded)))
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
@@ -1540,8 +1552,10 @@
                (let ((label (gethash pc label-map)))
                  (when label
                    (arm32-emit-label buf label)))
-               (multiple-value-bind (opcode operands new-pc)
-                   (decode-instruction bc pc)
+               (let* ((decoded (decode-instruction bc pc))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pc (cddr decoded)))
                  (arm32-translate-insn buf opcode operands new-pc label-map function-table)
                  (setf pc new-pc))))
 

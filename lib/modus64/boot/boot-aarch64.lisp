@@ -339,3 +339,271 @@
         :stack-top +aarch64-stack-top+
         :cons-base +aarch64-cons-base+
         :general-base +aarch64-general-base+))
+
+;;; ============================================================
+;;; Turducken Boot: MMU with VA=PA-0x40000000 offset mapping
+;;; ============================================================
+;;;
+;;; The turducken proves the MVM compiler is a fixed point across
+;;; architectures. For the runtime's build-image (with hardcoded x64
+;;; addresses like 0x08000000, 0x330000, 0x4FF080) to work on AArch64,
+;;; we set up page tables mapping low VAs to DRAM:
+;;;
+;;;   VA 0x00000000-0x1FFFFFFF → PA 0x40000000-0x5FFFFFFF (DRAM, normal)
+;;;   VA 0x20000000-0x201FFFFF → PA 0x09000000-0x091FFFFF (UART, device)
+;;;   VA 0x40000000-0x7FFFFFFF → PA 0x40000000-0x7FFFFFFF (identity, boot)
+;;;
+;;; This means:
+;;;   VA 0x100000 → PA 0x40100000 (kernel code, same as load address)
+;;;   VA 0x08000000 → PA 0x48000000 (image buffer, in DRAM)
+;;;   VA 0x330000 → PA 0x40330000 (NFN table, in DRAM)
+;;;   VA 0x4FF080 → PA 0x44FF080 (metadata, in DRAM)
+;;;   VA 0x10000000 → PA 0x50000000 (alloc region, in DRAM)
+;;;   VA 0x20000000 → PA 0x09000000 (PL011 UART, device memory)
+
+(defconstant +tdk-page-table-pa+ #x40010000)  ; L1 table in DRAM
+(defconstant +tdk-l2-table-pa+   #x40011000)  ; L2 table in DRAM
+(defconstant +tdk-dram-base-pa+  #x40000000)  ; QEMU virt DRAM start
+(defconstant +tdk-uart-pa+       #x09000000)  ; PL011 UART physical
+
+;; VA addresses for turducken runtime (same as x64)
+(defconstant +tdk-stack-va+      #x00200000)  ; Stack top
+(defconstant +tdk-cons-base-va+  #x04000000)  ; Cons alloc
+(defconstant +tdk-cons-limit-va+ #x05000000)  ; Cons limit
+(defconstant +tdk-uart-va+       #x20000000)  ; UART via page tables
+(defconstant +tdk-percpu-va+     #x00360000)  ; Per-CPU data (same as x64)
+
+(defun emit-aarch64-load-imm64 (buf rd value)
+  "Load a 64-bit immediate into Xd using MOVZ + up to 3 MOVK."
+  (emit-aarch64-movz buf rd (logand value #xFFFF) 0)
+  (let ((hw1 (logand (ash value -16) #xFFFF))
+        (hw2 (logand (ash value -32) #xFFFF))
+        (hw3 (logand (ash value -48) #xFFFF)))
+    (when (not (zerop hw1))
+      (emit-aarch64-movk buf rd hw1 16))
+    (when (not (zerop hw2))
+      (emit-aarch64-movk buf rd hw2 32))
+    (when (not (zerop hw3))
+      (emit-aarch64-movk buf rd hw3 48))))
+
+(defun emit-aarch64-str-x (buf rt rn &optional (imm12 0))
+  "STR Xt, [Xn, #imm12*8]  (64-bit store, unsigned offset scaled by 8)"
+  (emit-aarch64-u32 buf (logior (ash #b11 30)      ; size=11 (64-bit)
+                                (ash #b111001 24)   ; STR
+                                (ash 0 22)          ; opc=00
+                                (ash imm12 10)      ; imm12 (scaled by 8)
+                                (ash rn 5)
+                                rt)))
+
+(defun emit-aarch64-str-w (buf rt rn &optional (imm12 0))
+  "STR Wt, [Xn, #imm12*4]  (32-bit store, unsigned offset scaled by 4)"
+  (emit-aarch64-u32 buf (logior (ash #b10 30)      ; size=10 (32-bit)
+                                (ash #b111001 24)   ; STR
+                                (ash 0 22)          ; opc=00
+                                (ash imm12 10)      ; imm12 (scaled by 4)
+                                (ash rn 5)
+                                rt)))
+
+(defun emit-aarch64-turducken-entry (buf)
+  "Emit AArch64 turducken kernel entry with MMU page tables.
+   QEMU virt loads raw binary at PA 0x40000000. Boot code runs at PA,
+   sets up page tables for VA=PA-0x40000000 offset, enables MMU,
+   then branches to native code via offset-mapped VA."
+  (let ((sp 31)
+        (x0 0) (x1 1) (x2 2) (x3 3) (x4 4)
+        (x16 16) (x17 17)
+        (x24 24) (x25 25) (x26 26))
+
+    ;; ================================================================
+    ;; Phase A: Pre-MMU setup (running at PA 0x40000000+)
+    ;; ================================================================
+
+    ;; 1. Temporary stack in DRAM (for early init, won't be used much)
+    (emit-aarch64-movz buf x16 #x4040 16)     ; x16 = 0x40400000
+    (emit-aarch64-mov-sp buf sp x16)           ; SP = PA 0x40400000
+
+    ;; ================================================================
+    ;; Phase B: Build page tables at PA 0x40010000
+    ;; ================================================================
+
+    ;; 2. Zero L1 table (4KB = 512 entries × 8 bytes) at PA 0x40010000
+    (emit-aarch64-load-imm64 buf x0 +tdk-page-table-pa+)  ; x0 = L1 base
+    (emit-aarch64-movz buf x1 0 0)              ; x1 = 0 (zero value)
+    (emit-aarch64-movz buf x2 512 0)            ; x2 = 512 (entries)
+    ;; loop: str xzr, [x0], #8; sub x2, x2, #1; cbnz x2, loop
+    (let ((zero-loop-pos (mvm-buffer-position buf)))
+      ;; STR XZR, [X0], #8  (post-index)
+      ;; Encoding: 11 111000 00 0 000001000 01 00000 11111
+      (emit-aarch64-u32 buf #xF800841F)         ; STR XZR, [X0], #8
+      ;; SUB X2, X2, #1
+      (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+      ;; CBNZ X2, loop  (back 2 instructions = -8 bytes = -2 words)
+      (let ((offset (/ (- zero-loop-pos (mvm-buffer-position buf)) 4)))
+        (emit-aarch64-u32 buf (logior (ash #b10110101 24) ; CBNZ (64-bit)
+                                      (ash (logand offset #x7FFFF) 5)
+                                      x2))))
+
+    ;; 3. Zero L2 table (4KB) at PA 0x40011000
+    (emit-aarch64-load-imm64 buf x0 +tdk-l2-table-pa+)
+    (emit-aarch64-movz buf x2 512 0)
+    (let ((zero-loop2-pos (mvm-buffer-position buf)))
+      (emit-aarch64-u32 buf #xF800841F)         ; STR XZR, [X0], #8
+      (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+      (let ((offset (/ (- zero-loop2-pos (mvm-buffer-position buf)) 4)))
+        (emit-aarch64-u32 buf (logior (ash #b10110101 24)
+                                      (ash (logand offset #x7FFFF) 5)
+                                      x2))))
+
+    ;; 4. L1[0] = table descriptor → L2 at PA 0x40011000
+    ;;    entry = PA | 0x3 (valid + table)
+    (emit-aarch64-load-imm64 buf x0 +tdk-page-table-pa+)  ; x0 = L1 base
+    (emit-aarch64-load-imm64 buf x1 (logior +tdk-l2-table-pa+ #x3))
+    (emit-aarch64-str-x buf x1 x0 0)            ; L1[0] = table desc
+
+    ;; 5. L1[1] = 1GB block descriptor, identity map DRAM
+    ;;    PA 0x40000000, normal memory, AF=1, SH=inner, AttrIndx=0
+    ;;    entry = 0x40000000 | (1<<10) | (3<<8) | 0b01 = 0x40000701
+    (emit-aarch64-load-imm64 buf x1 #x40000701)
+    (emit-aarch64-str-x buf x1 x0 1)            ; L1[1] (offset 8)
+
+    ;; 6. Fill L2[0..255] = 2MB blocks, VA 0x00-0x1FF → PA 0x400-0x5FF
+    ;;    Each entry: (0x40000000 + i*0x200000) | 0x701
+    (emit-aarch64-load-imm64 buf x0 +tdk-l2-table-pa+)  ; x0 = L2 base
+    (emit-aarch64-load-imm64 buf x1 #x40000701)         ; x1 = first entry
+    (emit-aarch64-movz buf x2 256 0)                     ; x2 = count
+    (emit-aarch64-load-imm64 buf x3 #x200000)           ; x3 = 2MB step
+    (let ((fill-loop-pos (mvm-buffer-position buf)))
+      ;; STR X1, [X0], #8
+      (emit-aarch64-u32 buf #xF8008401)
+      ;; ADD X1, X1, X3  (next PA)
+      ;; sf=1 op=0 S=0 01011 shift=00 0 Rm=X3 imm6=0 Rn=X1 Rd=X1
+      (emit-aarch64-u32 buf #x8B030021)
+      ;; SUB X2, X2, #1
+      (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+      ;; CBNZ X2, fill_loop
+      (let ((offset (/ (- fill-loop-pos (mvm-buffer-position buf)) 4)))
+        (emit-aarch64-u32 buf (logior (ash #b10110101 24)
+                                      (ash (logand offset #x7FFFF) 5)
+                                      x2))))
+
+    ;; 7. L2[256] = 2MB block, device memory for UART
+    ;;    VA 0x20000000 → PA 0x09000000, AttrIndx=1
+    ;;    entry = 0x09000000 | (1<<10) | (3<<8) | (1<<2) | 0b01 = 0x09000705
+    ;;    L2 entry 256 is at L2_base + 256*8 = L2_base + 0x800
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 256 8)))
+    (emit-aarch64-load-imm64 buf x1 #x09000705)
+    (emit-aarch64-str-x buf x1 x0 0)
+
+    ;; ================================================================
+    ;; Phase C: Configure system registers and enable MMU
+    ;; ================================================================
+
+    ;; 8. MAIR_EL1: attr0=0xFF (Normal WB RWA), attr1=0x00 (Device nGnRnE)
+    ;;    MAIR_EL1 = 0x00FF
+    (emit-aarch64-movz buf x0 #x00FF 0)
+    (emit-aarch64-u32 buf #xD518A200)            ; MSR MAIR_EL1, X0
+
+    ;; 9. TCR_EL1: T0SZ=25 (39-bit VA), TG0=0 (4KB), SH0=3, ORGN0=1, IRGN0=1
+    ;;    IPS=2 (40-bit PA) at bits [34:32]
+    ;;    TCR = 0x19 | (3<<12) | (1<<10) | (1<<8) | (2<<32)
+    ;;        = 0x0000000200003519
+    (emit-aarch64-load-imm64 buf x0 #x0000000200003519)
+    (emit-aarch64-u32 buf #xD5182040)            ; MSR TCR_EL1, X0
+
+    ;; 10. TTBR0_EL1 = PA 0x40010000 (L1 table)
+    (emit-aarch64-load-imm64 buf x0 +tdk-page-table-pa+)
+    (emit-aarch64-u32 buf #xD5182000)            ; MSR TTBR0_EL1, X0
+
+    ;; 11. DSB ISH (ensure page table writes are visible)
+    (emit-aarch64-u32 buf #xD5033B9F)            ; DSB ISH
+
+    ;; 12. ISB (synchronize context)
+    (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
+
+    ;; 13. Enable MMU: SCTLR_EL1 |= M (bit 0) | C (bit 2) | I (bit 12)
+    ;;     Read SCTLR_EL1, OR with 0x1005, write back
+    (emit-aarch64-u32 buf #xD5381000)            ; MRS X0, SCTLR_EL1
+    (emit-aarch64-load-imm64 buf x1 #x1005)
+    ;; ORR X0, X0, X1
+    ;; sf=1 opc=01 01010 shift=00 N=0 Rm=X1 imm6=0 Rn=X0 Rd=X0
+    (emit-aarch64-u32 buf #xAA010000)
+    (emit-aarch64-u32 buf #xD5181000)            ; MSR SCTLR_EL1, X0
+
+    ;; 14. ISB (ensure MMU is active for next instruction)
+    (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
+
+    ;; ================================================================
+    ;; Phase D: Post-MMU setup (now running at VA via identity map)
+    ;; CPU is at VA 0x4000xxxx (identity map). We set up VA-space
+    ;; resources and then branch to native code via offset map.
+    ;; ================================================================
+
+    ;; 15. Set stack pointer to VA 0x200000 (→ PA 0x40200000)
+    (emit-aarch64-load-imm64 buf x16 +tdk-stack-va+)
+    (emit-aarch64-mov-sp buf sp x16)
+
+    ;; 16. Initialize PL011 UART at VA 0x20000000 (→ PA 0x09000000)
+    (emit-aarch64-load-imm64 buf x17 +tdk-uart-va+)
+    ;; UARTCR = 0x0301 (enable UART + TX + RX) at [x17 + 0x30]
+    (emit-aarch64-movz buf x0 #x0301 0)
+    (emit-aarch64-str-w buf x0 x17 12)           ; +0x30/4 = 12
+    ;; UARTLCR_H = 0x70 (8-bit, FIFO) at [x17 + 0x2C]
+    (emit-aarch64-movz buf x0 #x70 0)
+    (emit-aarch64-str-w buf x0 x17 11)           ; +0x2C/4 = 11
+    ;; UARTIBRD = 13 at [x17 + 0x24]
+    (emit-aarch64-movz buf x0 13 0)
+    (emit-aarch64-str-w buf x0 x17 9)            ; +0x24/4 = 9
+    ;; UARTFBRD = 1 at [x17 + 0x28]
+    (emit-aarch64-movz buf x0 1 0)
+    (emit-aarch64-str-w buf x0 x17 10)           ; +0x28/4 = 10
+    ;; Re-enable UART
+    (emit-aarch64-movz buf x0 #x0301 0)
+    (emit-aarch64-str-w buf x0 x17 12)
+
+    ;; 17. Set allocation registers (VA addresses)
+    (emit-aarch64-load-imm64 buf x24 +tdk-cons-base-va+)   ; cons alloc
+    (emit-aarch64-load-imm64 buf x25 +tdk-cons-limit-va+)  ; cons limit
+    (emit-aarch64-movz buf x26 0 0)                         ; NIL = 0
+
+    ;; 18. Set TPIDR_EL1 = per-CPU data VA
+    (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)
+    (emit-aarch64-u32 buf #xD518D090)            ; MSR TPIDR_EL1, X16
+
+    ;; 19. Set VBAR_EL1 for minimal exception vectors
+    ;; We'll point to a spin-loop vector at the start of the image (VA 0x800)
+    ;; But first we need to emit vectors. For now, point to a safe address.
+    ;; Vectors will be emitted at a known offset.
+    (emit-aarch64-movz buf x16 #x0800 0)         ; x16 = VA 0x800
+    (emit-aarch64-u32 buf #xD518C010)            ; MSR VBAR_EL1, X16
+    (emit-aarch64-u32 buf #xD5033FDF)            ; ISB
+
+    ;; 20. Branch to native code via offset-mapped VA
+    ;; Native code starts at offset 0x1000 in the image = VA 0x1000
+    ;; (Boot preamble occupies offsets 0x000-0x7FF, vectors at 0x800-0xFFF)
+    ;; We need to branch from identity-mapped VA (0x4000xxxx) to offset VA (0x1000)
+    (let* ((current-insn (/ (mvm-buffer-position buf) 4))
+           (native-start-insn 1024)               ; instruction 1024 = offset 0x1000
+           (skip (- native-start-insn current-insn)))
+      ;; B forward to native code at offset 0x1000
+      (emit-aarch64-u32 buf (logior (ash #b000101 26) (logand skip #x3FFFFFF)))
+      ;; Pad with NOPs to offset 0x800 (instruction 512)
+      (let ((pad (- 512 (/ (mvm-buffer-position buf) 4))))
+        (dotimes (i pad)
+          (emit-aarch64-u32 buf #xD503201F))))
+
+    ;; 21. Exception vector table at offset 0x800 (= VA 0x800)
+    (emit-aarch64-exception-vectors buf)
+
+    ;; Native code follows at offset 0x1000 (= VA 0x1000)
+    ))
+
+(defun aarch64-turducken-boot-descriptor ()
+  "Return the AArch64 boot descriptor for turducken builds.
+   Uses MMU with offset page tables so x64-compatible addresses work."
+  (list :arch :aarch64
+        :entry-fn #'emit-aarch64-turducken-entry
+        :serial-base +tdk-uart-va+
+        :load-addr +tdk-dram-base-pa+
+        :stack-top +tdk-stack-va+
+        :cons-base +tdk-cons-base-va+
+        :general-base (+ +tdk-cons-limit-va+ #x01000000)))

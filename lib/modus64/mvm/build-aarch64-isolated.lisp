@@ -68,25 +68,25 @@
   (merge-pathnames "net/" *modus-base*))
 
 ;; Source load order (isolated actor-aware):
-;;  1. arch-aarch64.lisp        - PCI, E1000, alloc primitives, actor stubs
-;;  2. actors-aarch64.lisp      - AArch64 address hooks (before actors.lisp)
-;;  3. actors.lisp               - shared actor system (overrides stubs from #1)
-;;  4. e1000.lisp                - E1000 driver
-;;  5. ip.lisp                   - ARP/IP/TCP/DHCP
-;;  6. crypto.lisp               - SHA, ChaCha20, Poly1305, X25519, Ed25519
-;;  7. ssh.lisp                  - SSH server
-;;  8. aarch64-overrides.lisp    - line editor, buffer reader, SSH overrides
-;;  9. actors-net-overrides.lisp - actor-aware receive/spawn/exit + mailbox-receive alias
-;; 10. isolated-net.lisp         - Qubes-like isolation overrides (LOADED LAST)
+;;  1. arch-aarch64.lisp        - PCI, E1000, alloc primitives, actor address hooks
+;;  2. actors.lisp               - shared actor system (per-CPU, smp-init, scheduling)
+;;  3. e1000.lisp                - E1000 driver
+;;  4. ip.lisp                   - ARP/IP/TCP/DHCP
+;;  5. crypto.lisp               - SHA, ChaCha20, Poly1305, X25519, Ed25519
+;;  6. ssh.lisp                  - SSH server
+;;  7. aarch64-overrides.lisp    - line editor, buffer reader, SSH overrides
+;;  8. actors-net-overrides.lisp - actor-aware receive/spawn/exit + mailbox-receive alias
+;;  9. isolated-net.lisp         - Qubes-like isolation overrides (LOADED LAST)
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-aarch64.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "actors-aarch64.lisp" *net-dir*))
           (read-file-text (merge-pathnames "actors.lisp" *net-dir*))
           (read-file-text (merge-pathnames "e1000.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "http.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
           (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
           (read-file-text (merge-pathnames "actors-net-overrides.lisp" *net-dir*))
           (read-file-text (merge-pathnames "isolated-net.lisp" *net-dir*))))
@@ -99,12 +99,17 @@
 
 (install-aarch64-translator)
 
+;; Set scheduler lock address for RESTORE-CONTEXT unlock sequence
+(setf *aarch64-sched-lock-addr* #x41200200)
+
 ;; kernel-main: init SMP + actors, spawn net-actor-main, idle yield loop
 (let* ((ssh-main (format nil "~{~A~%~}"
                         (list
                          "(defun kernel-main ()"
                          "  (smp-init)"
                          "  (actor-init)"
+                         ;; Clear eval globals pointer — uninitialized RAM causes hang
+                         "  (setf (mem-ref (+ (ssh-ipc-base) #x60000) :u64) 0)"
                          "  (pci-assign-bars)"
                          "  (e1000-probe)"
                          "  (write-byte 91) (write-byte 49) (write-byte 93)"
@@ -135,6 +140,8 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
+                         ;; Pre-compute ed25519 host key derivatives (s, prefix)
+                         "  (pre-compute-host-sign)"
                          "  (write-byte 83) (write-byte 83) (write-byte 72)"
                          "  (write-byte 58) (print-dec 22) (write-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
@@ -143,6 +150,8 @@
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
+                         ;; Pre-compute server ephemeral X25519 key pair
+                         "  (pre-compute-server-eph (conn-ssh 0))"
                          ;; Spawn net-actor-main as actor 2
                          "  (actor-spawn (fn-addr net-actor-main))"
                          ;; Primordial actor: idle yield loop

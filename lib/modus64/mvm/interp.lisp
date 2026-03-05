@@ -629,7 +629,7 @@
     (loop for i from nargs below 4 do (mvm-li buf i 0))
     (mvm-call buf function-index)
     (mvm-halt buf)
-    (let* ((prefix (mvm-buffer-bytes buf))
+    (let* ((prefix (mvm-buffer-used-bytes buf))
            (plen (length prefix))
            (combined (make-array (+ plen (length bytecode))
                                  :element-type '(unsigned-byte 8)))
@@ -660,7 +660,7 @@
          (run2 (name expected emit-fn)
            (let ((buf (make-mvm-buffer)))
              (funcall emit-fn buf) (mvm-halt buf)
-             (check name expected (mvm-interpret (mvm-buffer-bytes buf))))))
+             (check name expected (mvm-interpret (mvm-buffer-used-bytes buf))))))
 
       (format t "~%MVM Interpreter Tests~%======================~%")
 
@@ -773,11 +773,11 @@
       ;; Function CALL/RET
       (let ((fb (make-mvm-buffer)) (mb (make-mvm-buffer)))
         (mvm-add fb +vreg-vr+ +vreg-v0+ +vreg-v1+) (mvm-ret fb)
-        (let* ((fv (mvm-buffer-bytes fb)) (fl (length fv)) (ft (vector 0)))
+        (let* ((fv (mvm-buffer-used-bytes fb)) (fl (length fv)) (ft (vector 0)))
           (mvm-li mb +vreg-v0+ (tag-fixnum 3))
           (mvm-li mb +vreg-v1+ (tag-fixnum 4))
           (mvm-call mb 0) (mvm-halt mb)
-          (let* ((mv (mvm-buffer-bytes mb))
+          (let* ((mv (mvm-buffer-used-bytes mb))
                  (c (make-array (+ fl (length mv)) :element-type '(unsigned-byte 8))))
             (replace c fv) (replace c mv :start1 fl)
             (check "CALL/RET: add(3,4)=7" (tag-fixnum 7)
@@ -787,7 +787,7 @@
       (let ((buf (make-mvm-buffer)))
         (mvm-mul buf +vreg-vr+ +vreg-v0+ +vreg-v1+) (mvm-ret buf)
         (check "mvm-run-function: mul(6,7)=42" 42
-               (mvm-run-function (mvm-buffer-bytes buf) (vector 0) 0 6 7)))
+               (mvm-run-function (mvm-buffer-used-bytes buf) (vector 0) 0 6 7)))
 
       ;; Tail call: iterative V1+V0
       (let ((buf (make-mvm-buffer)))
@@ -795,12 +795,12 @@
         (mvm-cmp buf +vreg-v0+ +vreg-v4+)
         (mvm-bne buf 4) (mvm-mov buf +vreg-vr+ +vreg-v1+) (mvm-ret buf)
         (mvm-dec buf +vreg-v0+) (mvm-inc buf +vreg-v1+) (mvm-tailcall buf 0)
-        (let* ((fv (mvm-buffer-bytes buf)) (fl (length fv))
+        (let* ((fv (mvm-buffer-used-bytes buf)) (fl (length fv))
                (ft (vector 0)) (mb (make-mvm-buffer)))
           (mvm-li mb +vreg-v0+ (tag-fixnum 5))
           (mvm-li mb +vreg-v1+ (tag-fixnum 10))
           (mvm-call mb 0) (mvm-halt mb)
-          (let* ((mv (mvm-buffer-bytes mb))
+          (let* ((mv (mvm-buffer-used-bytes mb))
                  (c (make-array (+ fl (length mv)) :element-type '(unsigned-byte 8))))
             (replace c fv) (replace c mv :start1 fl)
             (check "TAILCALL: add(5,10)=15" (tag-fixnum 15)
@@ -812,7 +812,7 @@
         (mvm-io-write buf 0 +vreg-v0+ 0)
         (mvm-li buf +vreg-vr+ (tag-fixnum 0)) (mvm-halt buf)
         (format t "  I/O port 0 output: ")
-        (mvm-interpret (mvm-buffer-bytes buf))
+        (mvm-interpret (mvm-buffer-used-bytes buf))
         (format t "~%")
         (check "IO-WRITE port 0" t t))
 

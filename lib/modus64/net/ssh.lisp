@@ -115,27 +115,21 @@
 ;; "SSH-2.0-Modus64_1.0" = 20 bytes
 ;; Stored at e1000-state-base + 0x1000
 (defun ssh-init-strings ()
-  ;; Server version: "SSH-2.0-Modus64_1.0"
-  (setf (mem-ref (+ (e1000-state-base) #x1000) :u8) 83)   ; S
-  (setf (mem-ref (+ (e1000-state-base) #x1001) :u8) 83)   ; S
-  (setf (mem-ref (+ (e1000-state-base) #x1002) :u8) 72)   ; H
-  (setf (mem-ref (+ (e1000-state-base) #x1003) :u8) 45)   ; -
-  (setf (mem-ref (+ (e1000-state-base) #x1004) :u8) 50)   ; 2
-  (setf (mem-ref (+ (e1000-state-base) #x1005) :u8) 46)   ; .
-  (setf (mem-ref (+ (e1000-state-base) #x1006) :u8) 48)   ; 0
-  (setf (mem-ref (+ (e1000-state-base) #x1007) :u8) 45)   ; -
-  (setf (mem-ref (+ (e1000-state-base) #x1008) :u8) 77)   ; M
-  (setf (mem-ref (+ (e1000-state-base) #x1009) :u8) 111)  ; o
-  (setf (mem-ref (+ (e1000-state-base) #x100A) :u8) 100)  ; d
-  (setf (mem-ref (+ (e1000-state-base) #x100B) :u8) 117)  ; u
-  (setf (mem-ref (+ (e1000-state-base) #x100C) :u8) 115)  ; s
-  (setf (mem-ref (+ (e1000-state-base) #x100D) :u8) 54)   ; 6
-  (setf (mem-ref (+ (e1000-state-base) #x100E) :u8) 52)   ; 4
-  (setf (mem-ref (+ (e1000-state-base) #x100F) :u8) 95)   ; _
-  (setf (mem-ref (+ (e1000-state-base) #x1010) :u8) 49)   ; 1
-  (setf (mem-ref (+ (e1000-state-base) #x1011) :u8) 46)   ; .
-  (setf (mem-ref (+ (e1000-state-base) #x1012) :u8) 48)   ; 0
-  (setf (mem-ref (+ (e1000-state-base) #x1013) :u32) 19)  ; version len
+  ;; Server version: "SSH-2.0-Modus64_1.0" (19 bytes)
+  ;; Using u32 stores to reduce setf count (MVM codegen issue with 20+ setf calls)
+  (let ((b (e1000-state-base)))
+    (let ((b1 (+ b #x1000)))
+      (setf (mem-ref b1 :u32) #x2D485353))        ;; SSH-
+    (let ((b2 (+ b #x1004)))
+      (setf (mem-ref b2 :u32) #x2D302E32))        ;; 2.0-
+    (let ((b3 (+ b #x1008)))
+      (setf (mem-ref b3 :u32) #x75646F4D))        ;; Modu
+    (let ((b4 (+ b #x100C)))
+      (setf (mem-ref b4 :u32) #x5F343673))        ;; s64_
+    (let ((b5 (+ b #x1010)))
+      (setf (mem-ref b5 :u32) #x00302E31))        ;; 1.0\0
+    (let ((b6 (+ b #x1013)))
+      (setf (mem-ref b6 :u32) 19)))                ;; version len
   )
 
 ;; Build KEXINIT payload (returns array + length via cons)
@@ -637,53 +631,65 @@
   ;; Enable encryption
   (setf (mem-ref (+ ssh #x0C) :u32) 1))
 
+;; Build and send KEX_ECDH_REPLY packet (split out to reduce nesting depth)
+;; ssh = per-connection SSH state base
+(defun ssh-send-kex-reply (ssh sig srv-eph)
+  ;; Build signature blob: string("ssh-ed25519") + string(sig)
+  (let ((algo (make-array 11)))
+    (aset algo 0 115)
+    (aset algo 1 115) (aset algo 2 104) (aset algo 3 45)
+    (aset algo 4 101) (aset algo 5 100) (aset algo 6 50) (aset algo 7 53)
+    (aset algo 8 53) (aset algo 9 49) (aset algo 10 57)
+    (let ((algo-str (ssh-make-str algo 11)))
+      (let ((sig-str (ssh-make-str sig 64)))
+        (let ((sig-blob (ssh-concat2 algo-str (array-length algo-str)
+                                      sig-str (array-length sig-str))))
+          ;; Build reply: type(1) + host-key + server-eph + sig-blob
+          (let ((hk-enc (ssh-encode-host-key ssh)))
+            (let ((hk-str (ssh-make-str hk-enc (array-length hk-enc))))
+              (let ((se-str (ssh-make-str srv-eph 32)))
+                (let ((sb-str (ssh-make-str sig-blob (array-length sig-blob))))
+                  ;; Message type 31 = KEX_ECDH_REPLY
+                  (let ((msg-type (make-array 1)))
+                    (aset msg-type 0 31)
+                    (let ((p1 (ssh-concat2 msg-type 1
+                                            hk-str (array-length hk-str))))
+                      (let ((p2 (ssh-concat2 p1 (array-length p1)
+                                              se-str (array-length se-str))))
+                        (let ((reply (ssh-concat2 p2 (array-length p2)
+                                                  sb-str (array-length sb-str))))
+                          (ssh-send-payload ssh reply (array-length reply))
+                          1)))))))))))))
+
 ;; Handle KEX_ECDH_INIT and send KEX_ECDH_REPLY
 ;; ssh = per-connection SSH state base
+;; Split: compute+sign (7 let levels) + ssh-send-kex-reply (12 let levels)
+;; to avoid 18+ nested lets that trigger MVM compiler stack issues.
 (defun ssh-handle-kex (ssh kex-init-payload kex-init-len)
   ;; Parse client's ephemeral public key at offset 1 (skip msg type)
-  (let ((cli-eph-len (ssh-get-u32 kex-init-payload 1))
-        (cli-eph (make-array 32)))
+  (let ((cli-eph (make-array 32)))
     (dotimes (i 32) (aset cli-eph i (aref kex-init-payload (+ 5 i))))
-    ;; Generate server ephemeral key pair
-    (let ((srv-priv (make-array 32)))
-      (dotimes (i 32) (aset srv-priv i (ssh-random ssh)))
-      (let ((srv-eph (x25519-public-key srv-priv)))
-        (let ((shared (x25519 srv-priv cli-eph)))
-          (ssh-mem-store (+ ssh #x070) shared 32)
-          (let ((h (ssh-compute-exchange-hash ssh cli-eph srv-eph shared)))
-            (ssh-mem-store (+ ssh #x050) h 32)
-            (when (zerop (mem-ref ssh :u32))
-              (ssh-mem-store (+ ssh #x030) h 32)
-              (setf (mem-ref ssh :u32) 1))
-            (let ((host-priv (make-array 32)))
-              (ssh-mem-load host-priv (+ ssh #x110) 32)
-              (let ((sig (ed25519-sign host-priv h 32)))
-                ;; Build signature blob: string("ssh-ed25519") + string(sig)
-                (let ((algo (make-array 11)))
-                  (aset algo 0 115)
-                  (aset algo 1 115) (aset algo 2 104) (aset algo 3 45)
-                  (aset algo 4 101) (aset algo 5 100) (aset algo 6 50) (aset algo 7 53)
-                  (aset algo 8 53) (aset algo 9 49) (aset algo 10 57)
-                  (let ((algo-str (ssh-make-str algo 11)))
-                    (let ((sig-str (ssh-make-str sig 64)))
-                    (let ((sig-blob (ssh-concat2 algo-str (array-length algo-str)
-                                                  sig-str (array-length sig-str))))
-                      ;; Build reply: type(1) + host-key + server-eph + sig-blob
-                      (let ((hk-enc (ssh-encode-host-key ssh)))
-                        (let ((hk-str (ssh-make-str hk-enc (array-length hk-enc))))
-                          (let ((se-str (ssh-make-str srv-eph 32)))
-                            (let ((sb-str (ssh-make-str sig-blob (array-length sig-blob))))
-                          ;; Message type 31 = KEX_ECDH_REPLY
-                          (let ((msg-type (make-array 1)))
-                            (aset msg-type 0 31)
-                            (let ((p1 (ssh-concat2 msg-type 1
-                                                    hk-str (array-length hk-str))))
-                              (let ((p2 (ssh-concat2 p1 (array-length p1)
-                                                      se-str (array-length se-str))))
-                                (let ((reply (ssh-concat2 p2 (array-length p2)
-                                                          sb-str (array-length sb-str))))
-                                  (ssh-send-payload ssh reply (array-length reply))
-                                  1))))))))))))))))))))
+    ;; Use pre-computed server ephemeral key pair (from state+0x6C4/0x6E4)
+    (let ((state (e1000-state-base)))
+      (let ((srv-priv (make-array 32)))
+        (dotimes (i 32)
+          (aset srv-priv i (mem-ref (+ state (+ #x6C4 i)) :u8)))
+        (let ((srv-eph (make-array 32)))
+          (dotimes (i 32)
+            (aset srv-eph i (mem-ref (+ state (+ #x6E4 i)) :u8)))
+          (let ((shared (x25519 srv-priv cli-eph)))
+            ;; USB keep-alive after first scalar mult
+            (usb-keepalive)
+            (ssh-mem-store (+ ssh #x070) shared 32)
+            (let ((h (ssh-compute-exchange-hash ssh cli-eph srv-eph shared)))
+              (ssh-mem-store (+ ssh #x050) h 32)
+              (when (zerop (mem-ref ssh :u32))
+                (ssh-mem-store (+ ssh #x030) h 32)
+                (setf (mem-ref ssh :u32) 1))
+              (usb-keepalive)
+              (let ((sig (ed25519-sign-fast h 32)))
+                (usb-keepalive)
+                (ssh-send-kex-reply ssh sig srv-eph)))))))))
 
 ;; Send NEWKEYS message
 (defun ssh-send-newkeys (ssh)
@@ -778,6 +784,8 @@
 ;; Use default test key (all-zero private key)
 (defun ssh-use-default-key ()
   (let ((pk (make-array 32)))
+    ;; Zero private key (make-array doesn't zero on real hardware)
+    (dotimes (i 32) (aset pk i 0))
     (ssh-set-host-key pk)))
 
 ;; Handle a single SSH connection

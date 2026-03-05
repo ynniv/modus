@@ -46,6 +46,11 @@
    Mini UART: '(#x14 5 :tbz) — LSR at base+0x14, bit 5 = TX empty, wait while clear.
    PL011:     '(#x18 5 :tbnz) — UARTFR at base+0x18, bit 5 = TXFF, wait while set.")
 
+(defvar *aarch64-sched-lock-addr* nil
+  "Scheduler lock address for RESTORE-CONTEXT unlock. Nil = skip (no actors).
+   Set to the sched-lock-addr value for actor builds (e.g. #x41200200 for QEMU virt,
+   #x02000200 for RPi). Non-actor builds get zero overhead.")
+
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
 ;;; ============================================================
@@ -122,16 +127,16 @@
 ;;; Branch fixups are resolved in a second pass.
 
 (defstruct a64-buffer
-  (code (make-array 1024 :element-type '(unsigned-byte 32)
-                         :adjustable t :fill-pointer 0))
+  (code (make-array 524288))                  ; 512K entries, position tracks fill
   (labels (make-hash-table :test 'eql))      ; label-id → instruction index
   (fixups nil)                                ; (index label-id type)
   (position 0))                               ; current instruction index
 
 (defun a64-emit (buf word)
   "Emit a single 32-bit instruction word."
-  (vector-push-extend (logand word #xFFFFFFFF) (a64-buffer-code buf))
-  (incf (a64-buffer-position buf)))
+  (let ((pos (a64-buffer-position buf)))
+    (setf (aref (a64-buffer-code buf) pos) (logand word #xFFFFFFFF))
+    (setf (a64-buffer-position buf) (+ pos 1))))
 
 (defun a64-current-index (buf)
   "Return the current instruction index (next emission slot)."
@@ -192,8 +197,8 @@
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."
   (let* ((code (a64-buffer-code buf))
-         (n (length code))
-         (bytes (make-array (* n 4) :element-type '(unsigned-byte 8))))
+         (n (a64-buffer-position buf))
+         (bytes (make-array (* n 4))))
     (dotimes (i n bytes)
       (let ((w (aref code i))
             (base (* i 4)))
@@ -1034,8 +1039,10 @@
         (insns nil))
     (loop while (< pos limit)
           do (let ((ipos pos))
-               (multiple-value-bind (opcode operands new-pos)
-                   (decode-instruction bytes pos)
+               (let* ((decoded (decode-instruction bytes pos))
+                      (opcode (car decoded))
+                      (operands (cadr decoded))
+                      (new-pos (cddr decoded)))
                  (push (make-decoded-mvm-insn
                         :offset ipos
                         :opcode opcode
@@ -1149,6 +1156,11 @@
                 (a64-ldr-width buf +a64-x0+ +a64-x17+ 0 0)
                 ;; tag as fixnum: lsl x0, x0, #1
                 (a64-lsl-imm buf +a64-x0+ +a64-x0+ 1))
+               ((= code #x0302)
+                ;; DSB SY barrier: force all previous memory accesses to complete
+                ;; Required on AArch64 with MMU off (Normal Non-cacheable) to
+                ;; prevent write buffer reordering between peripheral pages
+                (a64-dsb buf :option #xF))  ;; SY = full system
                ((= code #x0303)
                 ;; Jump to address: untag V0 (ASR 1), BR x0
                 (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)
@@ -1588,21 +1600,22 @@
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
-          ;; ---- ALLOC-OBJ Vd, size:imm16, subtag:imm8 ----
-          ;; Allocate size bytes from the bump allocator, write header
-          ;; Header word: [subtag:8 | size:16 | ...]
+          ;; ---- ALLOC-OBJ Vd, count:imm16, subtag:imm8 ----
+          ;; Allocate object with COUNT element slots from bump allocator
+          ;; Header word: [element-count:48 | unused:8 | subtag:8]
+          ;; = (count << 16) | subtag
           ((= op +op-alloc-obj+)
            (let* ((vd (vr 0))
-                  (size (vr 1))
+                  (count (vr 1))
                   (subtag (vr 2))
-                  ;; Align total size to 16 bytes so cons alloc pointer
-                  ;; stays 16-byte aligned (cons tag uses low 4 bits)
-                  (total-size (logand (+ 8 size 15) (lognot 15)))
+                  ;; Total bytes = 8 (header) + count * 8 (data slots)
+                  ;; Aligned to 16 bytes for cons pointer tag safety
+                  (data-bytes (* count 8))
+                  (total-size (logand (+ 8 data-bytes 15) (lognot 15)))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Build header in x16: (subtag << 56) | (size << 40)
-             ;; Simplified: store subtag and size in header word
+             ;; Build header: (count << 16) | subtag
              (a64-movz buf +a64-x16+ subtag :hw 0)
-             (a64-movk buf +a64-x16+ size :hw 1)
+             (a64-movk buf +a64-x16+ count :hw 1)
              ;; Store header at alloc pointer
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
              ;; Result = alloc pointer + 8 (skip header) + object tag (2)
@@ -1689,6 +1702,76 @@
              (a64-ldur buf +a64-x17+ ps -10)
              (a64-movz buf +a64-x16+ #xFF)
              (a64-and-reg buf pd +a64-x17+ +a64-x16+)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- AREF Vd, Vobj, Vidx ----
+          ;; Variable-index array load: Vd = obj[idx]
+          ;; Vidx is raw (untagged) index, Vobj is tagged object pointer
+          ((= op +op-aref+)
+           (let* ((vd (vr 0))
+                  (pobj (ensure-src (vr 1) +a64-x16+))
+                  (pidx (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Compute address: x16 = (Vobj - 2) + Vidx * 8
+             (a64-sub-imm buf +a64-x16+ pobj 2)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 3)
+             ;; Load from computed address
+             (a64-ldur buf pd +a64-x16+ 0)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ASET Vobj, Vidx, Vs ----
+          ;; Variable-index array store: obj[idx] = Vs
+          ((= op +op-aset+)
+           (let* ((pobj (ensure-src (vr 0) +a64-x16+))
+                  (pidx (ensure-src (vr 1) +a64-x17+)))
+             ;; Compute address: x16 = (Vobj - 2) + Vidx * 8
+             (a64-sub-imm buf +a64-x16+ pobj 2)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 3)
+             ;; Reload value into x17 (safe — done with idx)
+             (let ((ps (ensure-src (vr 2) +a64-x17+)))
+               (a64-stur buf ps +a64-x16+ 0))))
+
+          ;; ---- ARRAY-LEN Vd, Vobj ----
+          ;; Extract element count from object header, return as tagged fixnum
+          ;; Header at [Vobj - 10], element-count = header >> 16
+          ((= op +op-array-len+)
+           (let* ((vd (vr 0))
+                  (ps (ensure-src (vr 1) +a64-x16+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Load header: at Vobj - 2 (tag) - 8 (header size) = Vobj - 10
+             (a64-ldur buf +a64-x17+ ps -10)
+             ;; Extract element count: LSR by 16, then tag as fixnum (LSL 1)
+             ;; Combined: LSR by 15 then clear low bit
+             ;; Simpler: two shifts
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 16)
+             (a64-lsl-imm buf pd +a64-x17+ 1)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ALLOC-ARRAY Vd, Vcount ----
+          ;; Dynamic array allocation: count is in a register (raw, untagged)
+          ;; Header: (count << 16) | #x32 (array subtag)
+          ;; Allocate 8 + count*8 bytes, aligned to 16
+          ((= op +op-alloc-array+)
+           (let* ((vd (vr 0))
+                  (pcount (ensure-src (vr 1) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; Build header: x16 = (count << 16) | #x32
+             (a64-lsl-imm buf +a64-x16+ pcount 16)
+             (a64-movk buf +a64-x16+ #x32 :hw 0)
+             ;; Store header at alloc pointer
+             (a64-stur buf +a64-x16+ +a64-x24+ 0)
+             ;; Compute aligned allocation: floor((count+2)/2) * 16
+             ;; This equals (8 + count*8) rounded up to 16
+             (a64-add-imm buf +a64-x17+ pcount 2)
+             (a64-lsr-imm buf +a64-x17+ +a64-x17+ 1)
+             (a64-lsl-imm buf +a64-x17+ +a64-x17+ 4)
+             ;; Result = alloc_ptr + 10 (8 header + 2 tag)
+             (a64-add-imm buf pd +a64-x24+ 10)
+             ;; Bump alloc pointer
+             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1864,12 +1947,13 @@
              (a64-add-imm buf +a64-sp+ +a64-x0+ 0)     ; MOV SP, x0
              ;; Release scheduler lock (MUST be after SP switch to prevent
              ;; another CPU from dequeuing this actor while on its stack)
-             (a64-load-imm64 buf +a64-x0+ #x41200200)   ; scheduler lock addr
-             (a64-str-unsigned buf +a64-xzr+ +a64-x0+ 0) ; store 0 → unlock
-             ;; Memory barrier — ensure lock release visible to other CPUs
-             (a64-dmb buf :option #xB)
-             ;; Enable interrupts
-             (a64-msr-daifclr buf #x3)
+             (when *aarch64-sched-lock-addr*
+               (a64-load-imm64 buf +a64-x0+ *aarch64-sched-lock-addr*)
+               (a64-str-unsigned buf +a64-xzr+ +a64-x0+ 0) ; store 0 → unlock
+               ;; Memory barrier — ensure lock release visible to other CPUs
+               (a64-dmb buf :option #xB)
+               ;; Enable interrupts
+               (a64-msr-daifclr buf #x3))
              ;; Jump to continuation (save-ctx's resume entry point)
              (a64-br buf +a64-x17+)))
 
@@ -1884,26 +1968,28 @@
            (a64-wfe buf))
 
           ;; ---- ATOMIC-XCHG Vd, Vaddr, Vs ----
-          ;; LDXR/STXR loop for atomic exchange
+          ;; LDXR/STXR loop for atomic exchange.
+          ;; STXR Ws, Xt, [Xn] requires Ws ≠ Xt and Ws ≠ Xn (ARM spec).
+          ;; Pick status register that doesn't conflict with pa or ps.
           ((= op +op-atomic-xchg+)
            (let* ((vd (vr 0))
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (ps (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+))
+                  ;; Status reg must differ from ps (Xt) and pa (Xn)
+                  (status (cond ((/= ps +a64-x17+) +a64-x17+)
+                                ((/= pa 15) 15)     ; x15
+                                (t +a64-x0+)))
                   (loop-idx (a64-current-index buf)))
              ;; loop: LDXR Xd, [Vaddr]
              (a64-ldxr buf pd pa)
-             ;; STXR W17, Vs, [Vaddr]  (use x17 lower 32 bits as status)
-             ;; But we need ps in a non-x17 register if pd is x16...
-             ;; Use x17 for status only if ps != x17
-             (a64-stxr buf +a64-x17+ ps pa)
-             ;; CBNZ W17, loop  → use B.NE
-             ;; Actually STXR status is in W-reg. Test with CBNZ:
-             ;; CBNZ: 0|011010|1|imm19|Rt  (32-bit variant, sf=0)
+             ;; STXR Ws, Vs, [Vaddr]
+             (a64-stxr buf status ps pa)
+             ;; CBNZ Ws, loop (32-bit variant, sf=0)
              (let ((back-offset (- loop-idx (a64-current-index buf))))
-               (a64-emit buf (logior #x35000000   ; CBNZ (32-bit)
+               (a64-emit buf (logior #x35000000
                                      (ash (logand back-offset #x7FFFF) 5)
-                                     +a64-x17+)))
+                                     status)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -2085,9 +2171,10 @@
     (a64-emit-prologue buf)
     ;; Translate the body
     (let* ((body-buf (translate-mvm-to-aarch64 bytecode nil))
-           (body-code (a64-buffer-code body-buf)))
+           (body-code (a64-buffer-code body-buf))
+           (body-len (a64-buffer-position body-buf)))
       ;; Copy body instructions into our buffer
-      (dotimes (i (length body-code))
+      (dotimes (i body-len)
         (a64-emit buf (aref body-code i))))
     ;; Emit epilogue
     (a64-emit-epilogue buf)
@@ -2198,7 +2285,7 @@
 (defun a64-disassemble-buffer (buf &key (start 0) (end nil))
   "Print a hex dump of the AArch64 instruction buffer for debugging."
   (let* ((code (a64-buffer-code buf))
-         (limit (or end (length code))))
+         (limit (or end (a64-buffer-position buf))))
     (loop for i from start below limit
           do (format t "  ~4,'0X: ~8,'0X~%" (* i 4) (aref code i)))))
 
