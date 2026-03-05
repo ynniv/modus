@@ -1,0 +1,257 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>modus — a new bare metal lisp</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=IBM+Plex+Sans:wght@300;400;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  :root {
+    --bg: #0a0a0a;
+    --fg: #e8e8e8;
+    --accent: #6fda6f;
+    --dim: #666;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--fg);
+    font-family: 'IBM Plex Sans', sans-serif;
+    overflow: hidden;
+    height: 100vh;
+    width: 100vw;
+  }
+
+  .slide {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 2vw;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.5s ease;
+  }
+
+  .slide.active {
+    opacity: 1;
+    pointer-events: auto;
+  }
+
+  .slide h1 {
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: clamp(2rem, 5vw, 4.5rem);
+    font-weight: 600;
+    text-align: center;
+    line-height: 1.2;
+    max-width: 900px;
+    color: var(--accent);
+  }
+
+  .slide p {
+    font-size: clamp(1.2rem, 2.8vw, 2.2rem);
+    font-weight: 300;
+    text-align: center;
+    line-height: 1.5;
+    max-width: 800px;
+    margin-top: 1em;
+  }
+
+  .slide img {
+    max-width: 92vw;
+    max-height: 70vh;
+    object-fit: contain;
+    border-radius: 6px;
+    margin-top: 1.5rem;
+    box-shadow: 0 4px 40px rgba(0,0,0,0.6);
+  }
+
+  .slide.title-slide h1 {
+    font-size: clamp(3rem, 7vw, 6rem);
+  }
+  .slide.title-slide p {
+    color: var(--dim);
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: clamp(0.9rem, 1.5vw, 1.3rem);
+    margin-top: 1.5em;
+  }
+
+  .slide.text-only p {
+    font-size: clamp(1.5rem, 3.5vw, 3rem);
+    max-width: 750px;
+  }
+
+  .slide .arch-list {
+    font-family: 'IBM Plex Mono', monospace;
+    color: var(--accent);
+    font-size: clamp(1rem, 2.2vw, 1.8rem);
+    margin-top: 1.5em;
+  }
+
+  .slide.closing h1 {
+    font-size: clamp(1.8rem, 4vw, 3.5rem);
+    color: var(--fg);
+  }
+  .slide.closing .accent {
+    color: var(--accent);
+  }
+
+  /* Progress bar */
+  #progress {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    height: 3px;
+    background: var(--accent);
+    transition: width 0.4s ease;
+    z-index: 100;
+  }
+
+  /* Slide counter */
+  #counter {
+    position: fixed;
+    bottom: 12px;
+    right: 20px;
+    font-family: 'IBM Plex Mono', monospace;
+    font-size: 0.75rem;
+    color: var(--dim);
+    z-index: 100;
+  }
+</style>
+</head>
+<body>
+
+<!-- Slide 0: Title -->
+<div class="slide title-slide">
+  <h1>modus</h1>
+  <p>a new bare metal lisp</p>
+  <img src="lisperati-logo.png" alt="modus">
+</div>
+
+<!-- Slide 1 -->
+<div class="slide">
+  <p>lisp is not new</p>
+  <img src="john-mccarthy-creator-of-lisp-l.jpg" alt="John McCarthy, creator of Lisp">
+</div>
+
+<!-- Slide 2 -->
+<div class="slide">
+  <p>people once made machines that were only lisp</p>
+  <img src="LISP_machine.jpg" alt="LISP machine">
+</div>
+
+<!-- Slide 3 -->
+<div class="slide">
+  <p>nothing is more powerful than lisp</p>
+  <img src="Lisp_machines_in_Computer_History_Museum.jpg" alt="Lisp machines at the Computer History Museum">
+</div>
+
+<!-- Slide 4 -->
+<div class="slide">
+  <p>some of them looked like black and white versions of the tools we use today</p>
+  <img src="debugger.gif" alt="Lisp machine debugger">
+</div>
+
+<!-- Slide 5 -->
+<div class="slide text-only">
+  <p>what's notable about them is that they're inspectable down to the chips</p>
+</div>
+
+<!-- Slide 6 -->
+<div class="slide">
+  <p>modern stacks are complex — at best you can see into the app</p>
+  <img src="mixed-arch.png" alt="Modern mixed architecture">
+</div>
+
+<!-- Slide 7 -->
+<div class="slide">
+  <p>when you have lisp on the metal, everything is visible</p>
+  <img src="green-arch.png" alt="Bare metal Lisp architecture">
+</div>
+
+<!-- Slide 8 -->
+<div class="slide">
+  <p>this isn't hypothetical. every binary blob is a hole below the water line</p>
+  <img src="broadpwn.png" alt="Broadpwn vulnerability">
+</div>
+
+<!-- Slide 9 -->
+<div class="slide">
+  <p>to be sovereign we need to be seaworthy</p>
+  <img src="github-preview.png" alt="modus on GitHub">
+</div>
+
+<!-- Slide 10 -->
+<div class="slide text-only">
+  <p>it boots two (emulated) platforms, but emits:</p>
+  <p class="arch-list">x86-64, i386, AArch64, RISC-V 64, PPC64, PPC32, ARMv5, ARMv7, Motorola 68k</p>
+</div>
+
+<!-- Slide 11 -->
+<div class="slide">
+  <p>claude did this in three weeks (pi zero 2 w)</p>
+  <img src="hdmi.jpg" alt="modus on Raspberry Pi Zero 2 W">
+</div>
+
+<!-- Slide 12 -->
+<div class="slide text-only">
+  <p>also working on a universal boot image:</p>
+  <p class="arch-list">host lisp → x64 → aarch64 → riscv → x64</p>
+</div>
+
+<!-- Slide 13: Closing -->
+<div class="slide closing">
+  <h1>modus</h1>
+  <img src="github-qr.png" alt="modus QR code">
+</div>
+
+<div id="progress"></div>
+<div id="counter"></div>
+
+<script>
+  const slides = document.querySelectorAll('.slide');
+  let current = 0;
+
+  function show(n) {
+    current = Math.max(0, Math.min(n, slides.length - 1));
+    slides.forEach((s, i) => s.classList.toggle('active', i === current));
+    document.getElementById('progress').style.width =
+      ((current / (slides.length - 1)) * 100) + '%';
+    document.getElementById('counter').textContent =
+      (current + 1) + ' / ' + slides.length;
+  }
+
+  document.addEventListener('keydown', e => {
+    if (e.key === 'ArrowRight' || e.key === ' ' || e.key === 'ArrowDown') {
+      e.preventDefault(); show(current + 1);
+    }
+    if (e.key === 'ArrowLeft' || e.key === 'ArrowUp' || e.key === 'Backspace') {
+      e.preventDefault(); show(current - 1);
+    }
+    if (e.key === 'Home') { e.preventDefault(); show(0); }
+    if (e.key === 'End')  { e.preventDefault(); show(slides.length - 1); }
+  });
+
+  // Touch/swipe support
+  let touchX = 0;
+  document.addEventListener('touchstart', e => touchX = e.touches[0].clientX);
+  document.addEventListener('touchend', e => {
+    const dx = e.changedTouches[0].clientX - touchX;
+    if (Math.abs(dx) > 50) show(current + (dx < 0 ? 1 : -1));
+  });
+
+  // Click left/right halves
+  document.addEventListener('click', e => {
+    if (e.clientX > window.innerWidth / 2) show(current + 1);
+    else show(current - 1);
+  });
+
+  show(0);
+</script>
+</body>
+</html>

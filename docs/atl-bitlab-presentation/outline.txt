@@ -1,0 +1,40 @@
+modus - a new bare metal lisp
+lisperati-logo.png
+
+lisp is not new
+john-mccarthy-creator-of-lisp-l.jpg
+
+people once made machines that were only lisp
+LISP_machine.jpg
+
+nothing is more powerful than lisp
+Lisp_machines_in_Computer_History_Museum.jpg
+
+some of them looked like black and white versions of the tools we use today
+debugger.gif
+
+what's notable about them is that they're inspectable down to the chips
+
+modern stacks are complex. at best you can see into the app
+mixed-arch.png
+
+when you have lisp on the metal, everything is visible
+green-arch.png
+
+this isn't hypothetical. every binary blob is a hole below the water line
+broadpwn.png
+
+to be sovereign we need to be seaworthy
+github-preview.png
+
+it boots two (emulated) platforms, but emits:
+x86-64, i386, AArch64, RISC-V 64, PPC64, PPC32, ARMv5, ARMv7, Motorola 68k
+
+claude did this in three weeks (pi zero 2 w)
+hdmi.jpg
+
+also working on a universal boot image:
+host lisp -> x64 -> aarch64 -> riscv -> x64
+
+modus
+github-qr.png
