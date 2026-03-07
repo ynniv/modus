@@ -316,7 +316,10 @@
         (lookup-in-alist sym (cdr alist))))))
 
 (defun define-global (globals sym val)
-  (set-cdr globals (cons (cons sym val) (cdr globals)))
+  (let ((new-entry (cons sym val)))
+    (let ((old-cdr (cdr globals)))
+      (let ((new-cdr (cons new-entry old-cdr)))
+        (set-cdr globals new-cdr))))
   val)
 
 ;;; ============================================================
@@ -364,6 +367,20 @@
       acc
     (fold-mul (cdr vals) (* acc (car vals)))))
 
+(defun make-closure (params body env)
+  (let ((c1 (cons env nil)))
+    (let ((c2 (cons body c1)))
+      (let ((c3 (cons params c2)))
+        (cons 8888 c3)))))
+
+(defun eval-defun (x env globals)
+  (let ((fname (sym-name (cadr x))))
+    (let ((params (cadr (cdr x))))
+      (let ((body (cdr (cddr x))))
+        (let ((closure (make-closure params body env)))
+          (define-global globals fname closure)
+          (cons 9999 fname))))))
+
 (defun eval-special (name x env globals)
   (cond
     ;; QUOTE
@@ -391,12 +408,7 @@
      (eval-let (cadr x) (cddr x) env globals))
     ;; DEFUN
     ((symbol-eq name (cons 68 (cons 69 (cons 70 (cons 85 (cons 78 nil))))))
-     (let ((fname (sym-name (cadr x)))
-           (params (cadr (cdr x)))
-           (body (cdr (cddr x))))
-       (let ((closure (cons 8888 (cons params (cons body (cons env nil))))))
-         (define-global globals fname closure)
-         (cons 9999 fname))))
+     (eval-defun x env globals))
     ;; LAMBDA
     ((symbol-eq name (cons 76 (cons 65 (cons 77 (cons 66 (cons 68 (cons 65 nil)))))))
      (let ((params (cadr x))

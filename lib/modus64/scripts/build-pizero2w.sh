@@ -21,6 +21,8 @@ die() { echo "ERROR: $*" >&2; exit 1; }
 BUILD_SCRIPT="mvm/build-pizero2w-actors.lisp"
 if [ "${1:-}" = "--no-actors" ]; then
     BUILD_SCRIPT="mvm/build-pizero2w-ssh.lisp"
+elif [ "${1:-}" = "--hdmi" ]; then
+    BUILD_SCRIPT="mvm/build-pizero2w-hdmi.lisp"
 fi
 
 # --- Prerequisites ---

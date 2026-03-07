@@ -301,7 +301,9 @@
                 (len-bytes (make-array 4)))
             (ssh-put-u32 len-bytes 0 packet-len)
             (dotimes (i 4)
-              (aset enc-len i (logxor (aref len-bytes i) (aref len-ks i))))
+              (let ((lb (aref len-bytes i))
+                    (lk (aref len-ks i)))
+                (aset enc-len i (logxor lb lk))))
             ;; 2. Poly1305 key from K1, counter=0
             (let ((poly-ks (chacha-block k1 nonce 0))
                   (poly-key (make-array 32)))
@@ -344,8 +346,10 @@
     (let ((len-ks (chacha-block k2 nonce 0))
           (packet-len 0))
       (dotimes (i 4)
-        (let ((b (logxor (aref data i) (aref len-ks i))))
-          (setq packet-len (logior (ash packet-len 8) b))))
+        (let ((di (aref data i))
+              (ki (aref len-ks i)))
+          (let ((b (logxor di ki)))
+            (setq packet-len (logior (ash packet-len 8) b)))))
       ;; Check data completeness
       (when (< data-len (+ 4 packet-len 16))
         (return ()))

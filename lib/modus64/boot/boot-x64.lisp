@@ -23,7 +23,7 @@
 ;;; ============================================================
 
 (defconstant +x64-kernel-load-addr+ #x100000)     ; 1MB - multiboot load address
-(defconstant +x64-page-tables-addr+ #x200000)     ; 2MB - page table location
+(defconstant +x64-page-tables-addr+ #x500000)     ; 5MB - page table location (above max kernel image)
 (defconstant +x64-stack-top+        #x400000)     ; 4MB - initial stack top
 (defconstant +x64-kernel64-addr+    #x100100)     ; 64-bit entry point
 
@@ -72,7 +72,7 @@
    then far-jumps to 64-bit code segment.
    The 64-bit entry follows immediately after this code."
   (let ((base-addr +x64-kernel-load-addr+)
-        (pml4-addr #x110000)
+        (pml4-addr +x64-page-tables-addr+)
         (boot32-start (mvm-buffer-position buf)))
     ;; cli
     (mvm-emit-byte buf #xFA)
@@ -82,9 +82,9 @@
     (mvm-emit-byte buf #x1D)
     (mvm-emit-u32 buf #x500)
 
-    ;; Set up stack: mov esp, 0x120000
+    ;; Set up stack: mov esp, stack-top (above kernel image, below page tables)
     (mvm-emit-byte buf #xBC)
-    (mvm-emit-u32 buf #x120000)
+    (mvm-emit-u32 buf +x64-stack-top+)
 
     ;; Clear page table area (16KB at pml4-addr)
     ;; mov edi, pml4-addr
@@ -254,10 +254,10 @@
     ;; mov ss, ax
     (mvm-emit-byte buf #x8E) (mvm-emit-byte buf #xD0)
 
-    ;; Set up 64-bit stack: mov rsp, 0x200000
+    ;; Set up 64-bit stack: mov rsp, stack-top (below page tables)
     (mvm-emit-byte buf #x48)          ; REX.W
     (mvm-emit-byte buf #xBC)          ; mov rsp, imm64
-    (mvm-emit-u32 buf #x200000)
+    (mvm-emit-u32 buf +x64-stack-top+)
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
     ;; Initialize serial console (COM1 = 0x3F8)
@@ -284,6 +284,34 @@
     (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xBA) (mvm-emit-u16 buf #x03FA)
     (mvm-emit-byte buf #xB0) (mvm-emit-byte buf #xC7)
     (mvm-emit-byte buf #xEE)
+
+    ;; Initialize runtime registers for MVM-compiled code
+    ;; R15 = NIL (must match +nil-value+ = #xDEAD0001 used by MVM compiler)
+    ;; mov r15, #xDEAD0001
+    (mvm-emit-byte buf #x49)          ; REX.WB (W=64-bit, B=R15 extended)
+    (mvm-emit-byte buf #xBF)          ; mov r15, imm64
+    (mvm-emit-u32 buf #xDEAD0001)
+    (mvm-emit-u32 buf 0)              ; high 32 bits
+
+    ;; R12 = allocation pointer (heap starts at 256MB)
+    ;; mov r12, 0x10000000
+    (mvm-emit-byte buf #x49)          ; REX.WB
+    (mvm-emit-byte buf #xBC)          ; mov r12, imm64
+    (mvm-emit-u32 buf #x10000000)
+    (mvm-emit-u32 buf 0)
+
+    ;; R14 = allocation limit (heap ends at 480MB)
+    ;; mov r14, 0x1E000000
+    (mvm-emit-byte buf #x49)          ; REX.WB
+    (mvm-emit-byte buf #xBE)          ; mov r14, imm64
+    (mvm-emit-u32 buf #x1E000000)
+    (mvm-emit-u32 buf 0)
+
+    ;; RBP = frame pointer (same as RSP initially)
+    ;; mov rbp, rsp
+    (mvm-emit-byte buf #x48)          ; REX.W
+    (mvm-emit-byte buf #x89)          ; mov r/m64, r64
+    (mvm-emit-byte buf #xE5)          ; ModRM: reg=RSP(4), rm=RBP(5)
 
     ;; Fall through to native code
     ))

@@ -20,6 +20,7 @@
    #:label-p
    #:label-position
    #:emit-label
+   #:emit-label-ref-rel32
    #:fixup-labels
    ;; Registers
    #:rax #:rcx #:rdx #:rbx #:rsp #:rbp #:rsi #:rdi

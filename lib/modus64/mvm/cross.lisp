@@ -83,21 +83,40 @@
            (bytecode (mvm-module-bytecode module))
            ;; Build function table in the format each translator expects
            (fn-table (build-translator-fn-table fn-list target)))
-      ;; Call the bulk translator — returns an arch-specific buffer
-      ;; (some return multiple values; we only need the first)
-      (let* ((buf (funcall translator bytecode fn-table))
-             (native-bytes (extract-native-bytes buf target)))
-        ;; Map native offsets proportionally from bytecode positions
-        (let ((total-bc (max 1 (length bytecode)))
-              (total-native (length native-bytes)))
-          (dolist (fn-info fn-list)
-            (let* ((bc-off (mvm-function-info-bytecode-offset fn-info))
-                   (bc-len (mvm-function-info-bytecode-length fn-info))
-                   (native-off (truncate (* bc-off total-native) total-bc))
-                   (native-len (truncate (* bc-len total-native) total-bc)))
-              (setf (mvm-function-info-native-offset fn-info) native-off)
-              (setf (mvm-function-info-native-length fn-info) native-len))))
-        native-bytes))))
+      ;; Call the bulk translator — returns (values buf fn-map)
+      ;; fn-map maps function-name → label with actual native positions
+      (multiple-value-bind (buf fn-map)
+          (funcall translator bytecode fn-table)
+        (let ((native-bytes (extract-native-bytes buf target)))
+          ;; Use actual label positions from fn-map when available (x86-64, i386)
+          ;; Fall back to proportional mapping for other architectures
+          (if (and fn-map (hash-table-p fn-map))
+              ;; Accurate: look up each function's label position
+              (dolist (fn-info fn-list)
+                (let* ((name (string (mvm-function-info-name fn-info)))
+                       (label (gethash name fn-map)))
+                  (if (and label (modus64.asm:label-position label))
+                      (setf (mvm-function-info-native-offset fn-info)
+                            (modus64.asm:label-position label))
+                      ;; Fallback for functions not in fn-map
+                      (let ((total-bc (max 1 (length bytecode)))
+                            (total-native (length native-bytes)))
+                        (setf (mvm-function-info-native-offset fn-info)
+                              (truncate (* (mvm-function-info-bytecode-offset fn-info)
+                                           total-native) total-bc))))
+                  ;; Native length: distance to next function or end of code
+                  (setf (mvm-function-info-native-length fn-info) 0)))
+              ;; Proportional mapping (other architectures)
+              (let ((total-bc (max 1 (length bytecode)))
+                    (total-native (length native-bytes)))
+                (dolist (fn-info fn-list)
+                  (let* ((bc-off (mvm-function-info-bytecode-offset fn-info))
+                         (bc-len (mvm-function-info-bytecode-length fn-info))
+                         (native-off (truncate (* bc-off total-native) total-bc))
+                         (native-len (truncate (* bc-len total-native) total-bc)))
+                    (setf (mvm-function-info-native-offset fn-info) native-off)
+                    (setf (mvm-function-info-native-length fn-info) native-len)))))
+          native-bytes)))))
 
 (defun build-translator-fn-table (fn-list target)
   "Build a function table in the format the target's translator expects.
@@ -394,7 +413,7 @@
           (when entry-fn (funcall entry-fn boot-buf)))
         (setf (kernel-image-boot-code image)
               (mvm-buffer-used-bytes boot-buf))))
-    ;; Find kernel-main entry point
+    ;; Find kernel-main entry point (native offset within code buffer)
     (dolist (fn-info (mvm-module-function-table module))
       (when (string-equal (string (mvm-function-info-name fn-info)) "KERNEL-MAIN")
         (setf (kernel-image-entry-point image)
@@ -405,14 +424,27 @@
       (when (kernel-image-boot-code image)
         (loop for b across (kernel-image-boot-code image)
               do (mvm-emit-byte final-buf b)))
-      ;; Native code (kernel-main must be the first function in source
-      ;; so that boot code falls through to it)
-      (let ((code-offset (mvm-buffer-position final-buf)))
-        (loop for b across native-code
-              do (mvm-emit-byte final-buf b))
-        ;; Update entry point to absolute offset
-        (when (kernel-image-entry-point image)
-          (incf (kernel-image-entry-point image) code-offset)))
+      ;; Emit JMP to kernel-main after boot code (x86-64).
+      ;; Boot code falls through here; we need to jump past any functions
+      ;; defined before kernel-main in source order.
+      ;; JMP rel32 = E9 + 4-byte signed offset (relative to next instruction).
+      ;; After the JMP, native code starts, so rel32 = kernel-main native offset.
+      (let ((entry-native-offset (kernel-image-entry-point image))
+            (jmp-size 0))
+        (when (and entry-native-offset
+                   boot-descriptor
+                   (eq (getf boot-descriptor :arch) :x86-64))
+          ;; x86-64 JMP rel32 (5 bytes)
+          (mvm-emit-byte final-buf #xE9)
+          (mvm-emit-u32 final-buf (logand #xFFFFFFFF entry-native-offset))
+          (setq jmp-size 5))
+        ;; Native code
+        (let ((code-offset (mvm-buffer-position final-buf)))
+          (loop for b across native-code
+                do (mvm-emit-byte final-buf b))
+          ;; Update entry point to absolute offset
+          (when (kernel-image-entry-point image)
+            (incf (kernel-image-entry-point image) code-offset))))
       ;; Constant pool
       (loop for b across constant-pool
             do (mvm-emit-byte final-buf b))
@@ -460,7 +492,7 @@
    Board-specific targets (e.g. :rpi) map to their base architecture."
   (case target
     (:rpi :aarch64)
-    (:turducken :aarch64)
+    (:fixpoint :aarch64)
     (otherwise target)))
 
 (defun build-image (&key (target :x86-64) (source nil) (source-text nil))
@@ -522,7 +554,7 @@
     (:arm32   (arm32-boot-descriptor))
     (:armv7   (armv7-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
-    (:turducken (aarch64-turducken-boot-descriptor))
+    (:fixpoint (aarch64-fixpoint-boot-descriptor))
     (otherwise nil)))
 
 (defun write-kernel-image (image pathname)

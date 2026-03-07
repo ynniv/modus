@@ -101,6 +101,10 @@
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
 
+(defvar *pending-flet-ir* nil
+  "Collects (info . ir) pairs from flet/labels function compilations.
+   These are drained by mvm-compile-all into all-ir after each top-level form.")
+
 ;;; ============================================================
 ;;; Structures
 ;;; ============================================================
@@ -496,7 +500,9 @@
                   ,@(nreverse bindings))
              ,@body)))))
 
-  ;; SECOND, THIRD, FOURTH, FIFTH → car of nthcdr
+  ;; FIRST, SECOND, THIRD, FOURTH, FIFTH → car of nthcdr
+  (mvm-define-macro "FIRST"
+    (lambda (form) `(car ,(cadr form))))
   (mvm-define-macro "SECOND"
     (lambda (form) `(car (cdr ,(cadr form)))))
   (mvm-define-macro "THIRD"
@@ -506,42 +512,135 @@
   (mvm-define-macro "FIFTH"
     (lambda (form) `(car (cdr (cdr (cdr (cdr ,(cadr form))))))))
 
+  ;; WHEN → (if test (progn body...) nil)
+  (mvm-define-macro "WHEN"
+    (lambda (form)
+      (let ((test (cadr form))
+            (body (cddr form)))
+        `(if ,test (progn ,@body) nil))))
+
+  ;; UNLESS → (if test nil (progn body...))
+  (mvm-define-macro "UNLESS"
+    (lambda (form)
+      (let ((test (cadr form))
+            (body (cddr form)))
+        `(if ,test nil (progn ,@body)))))
+
+  ;; VECTOR → (let ((v (make-array N))) (aset v 0 a0) ... v)
+  (mvm-define-macro "VECTOR"
+    (lambda (form)
+      (let ((args (cdr form))
+            (n (length (cdr form)))
+            (var (gensym "VEC")))
+        `(let ((,var (make-array ,n)))
+           ,@(loop for arg in args
+                   for i from 0
+                   collect `(aset ,var ,i ,arg))
+           ,var))))
+
   ;; SETF expansion for complex places (car, cdr, aref, gethash)
   ;; Note: mem-ref SETF is handled directly in compile-setf
   (mvm-define-macro "SETF"
     (lambda (form)
-      (let ((place (cadr form))
-            (value (caddr form)))
-        (cond
-          ;; (setf var value) → (setq var value)
-          ((symbolp place)
-           `(setq ,place ,value))
-          ;; (setf (car x) v) → (set-car x v)
-          ((and (consp place) (name-eq (car place) "CAR"))
-           `(set-car ,(cadr place) ,value))
-          ;; (setf (cdr x) v) → (set-cdr x v)
-          ((and (consp place) (name-eq (car place) "CDR"))
-           `(set-cdr ,(cadr place) ,value))
-          ;; (setf (aref a i) v) → (aset a i v)
-          ((and (consp place) (name-eq (car place) "AREF"))
-           `(aset ,(cadr place) ,(caddr place) ,value))
-          ;; (setf (gethash k h) v) → (puthash k h v)
-          ((and (consp place) (name-eq (car place) "GETHASH"))
-           `(puthash ,(cadr place) ,(caddr place) ,value))
-          ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
-          ((and (consp place) (name-eq (car place) "MEM-REF"))
-           `(%setf-mem-ref ,place ,value))
-          ;; (setf (nth n lst) v) → (set-car (nthcdr n lst) v)
-          ((and (consp place) (name-eq (car place) "NTH"))
-           `(set-car (nthcdr ,(cadr place) ,(caddr place)) ,value))
-          ;; (setf (svref a i) v) → (aset a i v)
-          ((and (consp place) (name-eq (car place) "SVREF"))
-           `(aset ,(cadr place) ,(caddr place) ,value))
-          ;; Generic struct accessor: (setf (foo-bar x) v) → (set-foo-bar x v)
-          ((consp place)
-           (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                 :modus64.mvm)))
-             `(,setter ,(cadr place) ,value)))))))
+      (let ((args (cdr form)))
+        ;; Multi-place: (setf p1 v1 p2 v2 ...) → (progn (setf p1 v1) (setf p2 v2) ...)
+        (if (> (length args) 2)
+            (let ((pairs nil)
+                  (rest args))
+              (loop while rest
+                    do (push `(setf ,(first rest) ,(second rest)) pairs)
+                       (setq rest (cddr rest)))
+              `(progn ,@(nreverse pairs)))
+            ;; Single-place: (setf place value)
+            (let ((place (car args))
+                  (value (cadr args)))
+              (cond
+                ;; (setf var value) → (setq var value)
+                ((symbolp place)
+                 `(setq ,place ,value))
+                ;; (setf (car x) v) → (set-car x v)
+                ((and (consp place) (name-eq (car place) "CAR"))
+                 `(set-car ,(cadr place) ,value))
+                ;; (setf (cdr x) v) → (set-cdr x v)
+                ((and (consp place) (name-eq (car place) "CDR"))
+                 `(set-cdr ,(cadr place) ,value))
+                ;; (setf (aref a i) v) → (aset a i v)
+                ((and (consp place) (name-eq (car place) "AREF"))
+                 `(aset ,(cadr place) ,(caddr place) ,value))
+                ;; (setf (gethash k h) v) → (puthash k h v)
+                ((and (consp place) (name-eq (car place) "GETHASH"))
+                 `(puthash ,(cadr place) ,(caddr place) ,value))
+                ;; (setf (mem-ref ...) v) → keep as %setf-mem-ref for compile-setf
+                ((and (consp place) (name-eq (car place) "MEM-REF"))
+                 `(%setf-mem-ref ,place ,value))
+                ;; (setf (nth n lst) v) → (set-car (nthcdr n lst) v)
+                ((and (consp place) (name-eq (car place) "NTH"))
+                 `(set-car (nthcdr ,(cadr place) ,(caddr place)) ,value))
+                ;; (setf (svref a i) v) → (aset a i v)
+                ((and (consp place) (name-eq (car place) "SVREF"))
+                 `(aset ,(cadr place) ,(caddr place) ,value))
+                ;; Generic struct accessor: (setf (foo-bar x) v) → (set-foo-bar x v)
+                ((consp place)
+                 (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
+                                       :modus64.mvm)))
+                   `(,setter ,(cadr place) ,value)))))))))
+
+  ;; LDB — extract byte field from integer
+  ;; (ldb (byte size position) integer) → (logand (ash integer (- position)) mask)
+  (mvm-define-macro "LDB"
+    (lambda (form)
+      (let ((bytespec (cadr form))
+            (integer (caddr form)))
+        (if (and (consp bytespec)
+                 (symbolp (car bytespec))
+                 (string= (symbol-name (car bytespec)) "BYTE"))
+            (let* ((size (cadr bytespec))
+                   (pos (caddr bytespec))
+                   (mask (1- (ash 1 size))))
+              (if (zerop pos)
+                  `(logand ,integer ,mask)
+                  `(logand (ash ,integer ,(- pos)) ,mask)))
+            (error "MVM ldb: only (ldb (byte s p) n) supported, got ~S" bytespec)))))
+
+  ;; EMIT-BYTES — expand to individual emit-byte calls (avoids &rest)
+  (mvm-define-macro "EMIT-BYTES"
+    (lambda (form)
+      (let ((buf (cadr form))
+            (bytes (cddr form)))
+        `(progn ,@(mapcar (lambda (b) `(emit-byte ,buf ,b)) bytes)))))
+
+  ;; LIST — expand to nested cons (MVM has no &rest)
+  ;; (list) → nil, (list a) → (cons a nil), (list a b c) → (cons a (cons b (cons c nil)))
+  (mvm-define-macro "LIST"
+    (lambda (form)
+      (let ((args (cdr form)))
+        (if (null args)
+            nil
+            (let ((result nil))
+              (dolist (a (reverse args))
+                (setf result `(cons ,a ,result)))
+              result)))))
+
+  ;; REST — alias for CDR
+  (mvm-define-macro "REST"
+    (lambda (form)
+      `(cdr ,(cadr form))))
+
+  ;; /= — not equal
+  (mvm-define-macro "/="
+    (lambda (form)
+      `(not (= ,(cadr form) ,(caddr form)))))
+
+  ;; CADDR, CDDDR, CADDDR — extended car/cdr compositions
+  (mvm-define-macro "CADDR"
+    (lambda (form)
+      `(car (cddr ,(cadr form)))))
+  (mvm-define-macro "CDDDR"
+    (lambda (form)
+      `(cdr (cddr ,(cadr form)))))
+  (mvm-define-macro "CADDDR"
+    (lambda (form)
+      `(car (cdr (cddr ,(cadr form))))))
   )
 
 ;;; ============================================================
@@ -745,8 +844,10 @@
     (emit-ir :li dest tagged)))
 
 (defun compile-keyword (kw dest)
-  "Load a keyword (as its hash) into DEST"
-  (emit-ir :li dest (sxhash kw)))
+  "Load a keyword (as its tagged name hash) into DEST.
+   Uses normalize-name (not sxhash) so keywords match other symbol
+   representations and integer-encoded symbol IDs consistently."
+  (emit-ir :li dest (ash (normalize-name kw) +fixnum-shift+)))
 
 ;;; ------ Variable Reference ------
 
@@ -789,7 +890,7 @@
 (defun compile-compound (form env dest)
   "Compile a compound form (operator . args)"
   (let* ((op (car form))
-         (op-name (and (symbolp op) (normalize-name op))))
+         (op-name (cond ((integerp op) op) ((symbolp op) (normalize-name op)) (t nil))))
     (cond
       ;; Non-symbol operator (lambda call, etc.)
       ((null op-name)
@@ -1020,8 +1121,28 @@
      (compile-character value dest))
     ((keywordp value)
      (compile-keyword value dest))
+    ;; Non-keyword symbol: store as tagged name hash
+    ((symbolp value)
+     (emit-ir :li dest (ash (normalize-name value) +fixnum-shift+)))
+    ;; Cons cell: proper lists built iteratively, dotted pairs recursively
+    ((consp value)
+     (if (and (listp (cdr (last value)))  ; proper list check
+              (> (length value) 4))       ; optimize lists of 5+ elements
+         ;; Iterative: build in reverse with single temp reg
+         (let ((elems (reverse value)))
+           (compile-nil dest)
+           (dolist (elem elems)
+             (emit-ir :push dest)
+             (let ((temp (alloc-temp-reg)))
+               (compile-quote elem temp)
+               (emit-ir :pop dest)
+               (emit-ir :gc-check)
+               (emit-ir :cons dest temp dest)
+               (free-temp-reg))))
+         ;; Short lists / dotted pairs: recursive
+         (compile-cons `(quote ,(car value)) `(quote ,(cdr value)) nil dest)))
+    ;; String or other: use constant table
     (t
-     ;; Complex constant: add to constant table, load placeholder
      (let ((idx (length *constant-table*)))
        (push value *constant-table*)
        (emit-ir :li-const dest idx)))))
@@ -1210,15 +1331,23 @@
 (defun compile-flet (defs body env dest)
   "Compile (flet ((name (params) body) ...) body).
    Each local function is compiled as a named global function.
-   The local name is used for calls within the body."
+   The local name is used for calls within the body.
+   The compiled IR is collected in *pending-flet-ir* for later emission."
   (dolist (def defs)
     (let ((name (car def))
           (params (cadr def))
           (fbody (cddr def)))
       (let ((pp (preprocess-params params fbody)))
-        (mvm-compile-function-internal
-         (if (symbolp name) (symbol-name name) (string name))
-         (car pp) (cdr pp) env))))
+        ;; Use mvm-compile-function-internal with parent env (for closure access),
+        ;; then manually register and collect IR (like mvm-compile-function does).
+        (let* ((fname (if (symbolp name) (symbol-name name) (string name)))
+               (result (mvm-compile-function-internal fname (car pp) (cdr pp) env))
+               (info (car result)))
+          ;; Register in function table so CALL resolution works
+          (setf (gethash (function-info-name info) *functions*) info)
+          (push info *function-table*)
+          ;; Save IR for collection by mvm-compile-all
+          (push result *pending-flet-ir*)))))
   ;; Compile body in same environment
   (compile-progn (strip-declares body) env dest))
 
@@ -1601,8 +1730,17 @@
 
         (:general
          (let ((var (loop-iter-var iter)))
-           (push (list var (loop-iter-init-form iter)) bindings)
-           (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))
+           (if (eq (loop-iter-init-form iter) (loop-iter-step-form iter))
+               ;; No THEN clause: re-evaluate each iteration in init-stmts.
+               ;; This ensures correct ordering when referencing other loop
+               ;; variables (e.g., "for entry in list for name = (first entry)").
+               (progn
+                 (push (list var nil) bindings)
+                 (push `(setq ,var ,(loop-iter-init-form iter)) init-stmts))
+               ;; Has THEN clause: init from binding, step from step-form
+               (progn
+                 (push (list var (loop-iter-init-form iter)) bindings)
+                 (push `(setq ,var ,(loop-iter-step-form iter)) step-stmts)))))
 
         (:while
          (push `(if (null ,(loop-iter-init-form iter)) (return nil)) test-forms))
@@ -1747,7 +1885,14 @@
   "Compile (funcall f arg1 arg2 ...) - indirect function call"
   (let ((fn-form (car args))
         (call-args (cdr args))
-        (nargs (length (cdr args))))
+        (nargs (length (cdr args)))
+        (save-count (min *temp-reg-counter* 5)))
+    ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
+    ;; Skip dest register — it will be overwritten with the CALL result.
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+            do (unless (= r dest)
+                 (emit-ir :push r))))
     ;; Push overflow args FIRST (before populating V0-V3), because
     ;; evaluating overflow args may involve function calls that clobber V0-V3.
     (when (> nargs +max-reg-args+)
@@ -1783,7 +1928,12 @@
       (let ((temp (alloc-temp-reg)))
         (dotimes (i (- nargs +max-reg-args+))
           (emit-ir :pop temp))
-        (free-temp-reg)))))
+        (free-temp-reg)))
+    ;; Restore caller-saved temp registers (reverse order, skip dest)
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+            do (unless (= r dest)
+                 (emit-ir :pop r))))))
 
 ;;; ============================================================
 ;;; Arithmetic Operations
@@ -1995,25 +2145,24 @@
     (free-temp-reg)))
 
 (defun compile-set-car (cell-arg value-arg env dest)
-  "Compile (set-car cell value)"
-  (let ((temp (alloc-temp-reg)))
-    (compile-form cell-arg env dest)
-    (compile-form value-arg env temp)
-    (emit-ir :setcar dest temp)
-    ;; Write barrier for GC
-    (emit-ir :write-barrier dest)
-    ;; Return the value
-    (emit-ir :mov dest temp)
+  "Compile (set-car cell value).
+   Cell goes into a callee-saved temp (V4/RBX), value into dest.
+   This avoids VR clobber when value-arg is a function call."
+  (let ((cell-reg (alloc-temp-reg)))
+    (compile-form cell-arg env cell-reg)
+    (compile-form value-arg env dest)
+    (emit-ir :setcar cell-reg dest)
+    (emit-ir :write-barrier cell-reg)
     (free-temp-reg)))
 
 (defun compile-set-cdr (cell-arg value-arg env dest)
-  "Compile (set-cdr cell value)"
-  (let ((temp (alloc-temp-reg)))
-    (compile-form cell-arg env dest)
-    (compile-form value-arg env temp)
-    (emit-ir :setcdr dest temp)
-    (emit-ir :write-barrier dest)
-    (emit-ir :mov dest temp)
+  "Compile (set-cdr cell value).
+   Cell goes into a callee-saved temp (V4/RBX), value into dest."
+  (let ((cell-reg (alloc-temp-reg)))
+    (compile-form cell-arg env cell-reg)
+    (compile-form value-arg env dest)
+    (emit-ir :setcdr cell-reg dest)
+    (emit-ir :write-barrier cell-reg)
     (free-temp-reg)))
 
 ;; Compound accessors
@@ -2267,7 +2416,7 @@
     ;; Has object tag: check subtag
     ;; Extract subtag from header at [obj & ~0xF]
     (emit-ir :obj-subtag temp dest)
-    (emit-ir :li temp2 +subtag-bignum+)
+    (emit-ir :li temp2 (ash +subtag-bignum+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     ;; False
@@ -2290,13 +2439,15 @@
         (temp2 (alloc-temp-reg)))
     (compile-form arg env dest)
     ;; Check object tag
+    ;; OBJ-TAG/OBJ-SUBTAG return tagged fixnums (value << fixnum-shift),
+    ;; so comparison values must also be tagged.
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 +tag-object+)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Check subtag
     (emit-ir :obj-subtag temp dest)
-    (emit-ir :li temp2 expected-subtag)
+    (emit-ir :li temp2 (ash expected-subtag +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     ;; False
@@ -2337,12 +2488,12 @@
     ;; Check bignum
     (emit-ir-label check-bignum-label)
     (emit-ir :obj-tag temp dest)
-    (emit-ir :li temp2 +tag-object+)
+    (emit-ir :li temp2 (ash +tag-object+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :bne false-label)
     ;; Check subtag
     (emit-ir :obj-subtag temp dest)
-    (emit-ir :li temp2 +subtag-bignum+)
+    (emit-ir :li temp2 (ash +subtag-bignum+ +fixnum-shift+))
     (emit-ir :cmp temp temp2)
     (emit-ir :beq true-label)
     ;; False
@@ -2766,16 +2917,21 @@
 
 (defun compile-make-array (size-form env dest)
   "Compile (make-array size).
-   Constant size: ALLOC-OBJ with imm16 element count.
-   Variable size: compile size, untag, ALLOC-ARRAY."
-  (if (integerp size-form)
-      ;; Constant size — emit ALLOC-OBJ directly
+   Constant size <= 65535: ALLOC-OBJ with imm16 element count.
+   Constant size > 65535 or variable size: ALLOC-ARRAY (register-based)."
+  (if (and (integerp size-form) (<= size-form 65535))
+      ;; Small constant size — emit ALLOC-OBJ directly
       ;; imm16 = element count, translator computes allocation size
       (emit-ir :alloc-obj dest size-form +subtag-array+)
-      ;; Variable size — compile size expr, untag fixnum, emit ALLOC-ARRAY
+      ;; Large constant or variable size — compile to register, ALLOC-ARRAY
       (progn
-        (compile-form size-form env dest)
-        (emit-ir :sar dest dest +fixnum-shift+)
+        (if (integerp size-form)
+            ;; Large constant: load as immediate, already untagged
+            (emit-ir :li dest size-form)
+            ;; Variable: compile and untag
+            (progn
+              (compile-form size-form env dest)
+              (emit-ir :sar dest dest +fixnum-shift+)))
         (emit-ir :alloc-array dest dest))))
 
 (defun compile-aref (arr-form idx-form env dest)
@@ -2788,12 +2944,11 @@
         (emit-ir :obj-ref dest arr-reg idx-form)
         (free-temp-reg))
       ;; Variable index — use AREF opcode
+      ;; AREF expects tagged fixnum index: SHL 2 with tagged gives real_idx*8
       (let ((arr-reg (alloc-temp-reg))
             (idx-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
         (compile-form idx-form env idx-reg)
-        ;; Untag index (tagged fixnum → raw integer)
-        (emit-ir :sar idx-reg idx-reg +fixnum-shift+)
         (emit-ir :aref dest arr-reg idx-reg)
         (free-temp-reg)
         (free-temp-reg))))
@@ -2812,19 +2967,17 @@
         (free-temp-reg)
         (free-temp-reg))
       ;; Variable index — use ASET opcode
+      ;; ASET expects tagged fixnum index: SHL 2 with tagged gives real_idx*8
+      ;; Use dedicated val-reg to avoid VR=scratch(RAX) clobber in translator
       (let ((arr-reg (alloc-temp-reg))
-            (idx-reg (alloc-temp-reg)))
+            (idx-reg (alloc-temp-reg))
+            (val-reg (alloc-temp-reg)))
         (compile-form arr-form env arr-reg)
         (compile-form idx-form env idx-reg)
-        ;; Untag index
-        (emit-ir :sar idx-reg idx-reg +fixnum-shift+)
-        ;; Save arr and idx across value eval
-        (emit-ir :push arr-reg)
-        (emit-ir :push idx-reg)
-        (compile-form val-form env dest)
-        (emit-ir :pop idx-reg)
-        (emit-ir :pop arr-reg)
-        (emit-ir :aset arr-reg idx-reg dest)
+        (compile-form val-form env val-reg)
+        (emit-ir :aset arr-reg idx-reg val-reg)
+        (emit-ir :mov dest val-reg)
+        (free-temp-reg)
         (free-temp-reg)
         (free-temp-reg))))
 
@@ -2840,8 +2993,25 @@
 (defun compile-call (fn args env dest)
   "Compile a function call (fn arg1 arg2 ...).
    Register args are saved to the stack during evaluation to avoid
-   exhausting temp registers when args contain nested function calls."
-  (let ((nargs (length args)))
+   exhausting temp registers when args contain nested function calls.
+   Caller-saved temp registers (V5-V8) are saved/restored around the CALL
+   to prevent clobbering live variables in those registers."
+  (let ((nargs (length args))
+        ;; Save the current temp count BEFORE arg evaluation.
+        ;; V4 (RBX) is callee-saved, V9+ are spill slots (on stack, safe).
+        ;; We need to save V5..V(4+save-count-1) where save-count is the
+        ;; number of temps currently in use, but only those in V5-V8 range
+        ;; (the caller-saved physical registers).
+        (save-count (min *temp-reg-counter* 5)))  ; at most V4..V8 = 5 regs
+    ;; Save caller-saved temp registers (V5 through V(4+save-count-1))
+    ;; V4 (RBX) is callee-saved, so skip it — start from V5.
+    ;; Skip dest register: it will be overwritten with the CALL result,
+    ;; so restoring its old value would clobber the result.
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ 1) below (+ +vreg-v4+ save-count)
+            do (unless (= r dest)
+                 (emit-ir :push r))))
+
     ;; Push overflow args FIRST (before populating V0-V3), because
     ;; evaluating overflow args may involve function calls that clobber V0-V3.
     ;; These end up deeper on the stack, which is correct: after CALL+frame-enter,
@@ -2888,7 +3058,13 @@
       (let ((temp (alloc-temp-reg)))
         (dotimes (i (- nargs +max-reg-args+))
           (emit-ir :pop temp))
-        (free-temp-reg)))))
+        (free-temp-reg)))
+
+    ;; Restore caller-saved temp registers (reverse order, skip dest)
+    (when (> save-count 1)
+      (loop for r from (+ +vreg-v4+ save-count -1) downto (+ +vreg-v4+ 1)
+            do (unless (= r dest)
+                 (emit-ir :pop r))))))
 
 ;;; ============================================================
 ;;; Parameter List Preprocessing
@@ -3108,7 +3284,8 @@
       ;; Load immediate: 1 opcode + 1 reg + 8 imm64 = 10 bytes
       (:li    10)
       (:li-const 10)
-      (:li-func 10)
+      ;; li-func now emits FN-ADDR (1 opcode + 1 reg + 4 imm32 = 6 bytes)
+      (:li-func 6)
 
       ;; Function address: 1 opcode + 1 reg + 4 imm32 = 6 bytes
       (:fn-addr 6)
@@ -3323,14 +3500,16 @@
            ;; Load constant by index (placeholder, resolved during linking)
            (mvm-li buf (second insn) (third insn)))
           (:li-func
-           ;; Load function address (placeholder, resolved during linking)
-           ;; Encode function name index as the immediate
+           ;; Load function address (resolved during translation to native)
+           ;; Use FN-ADDR opcode so the translator can map bytecode offset
+           ;; to native code address. Plain LI would load the bytecode offset
+           ;; which is NOT a valid native address for CALL-IND.
            (let* ((fn-name (third insn))
                   (fn-info (gethash fn-name *functions*)))
-             (mvm-li buf (second insn)
-                     (if fn-info
-                         (function-info-bytecode-offset fn-info)
-                         0))))
+             (mvm-fn-addr buf (second insn)
+                          (if fn-info
+                              (function-info-bytecode-offset fn-info)
+                              0))))
 
           ;; ---- Branches ----
           (:br
@@ -3400,6 +3579,8 @@
                   (target (if fn-info
                               (function-info-bytecode-offset fn-info)
                               0)))
+             (unless fn-info
+               (format t "  WARN: unresolved CALL ~S~%" fn-name))
              (mvm-call buf target)))
 
           (:call-indirect
@@ -3533,12 +3714,18 @@
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
        ;; Compile as a thunk that initializes the variable
+       ;; IMPORTANT: 1) Use raw name-hash (NOT pre-shifted), because
+       ;; compile-integer will apply fixnum-shift. Pre-shifting causes
+       ;; double-tagging: init stores at hash*4 but reads look up hash*2.
+       ;; 2) Wrap value in let to avoid register clobber when value is
+       ;; a function call (which would clobber V0 holding the hash).
        (when value
-         (mvm-compile-function
-          (format nil "INIT-~A" (symbol-name name))
-          nil
-          (list `(set-symbol-value ,(ash name-hash +fixnum-shift+)
-                                   ,value))))))
+         (let ((tmp-var (gensym "INIT-TMP")))
+           (mvm-compile-function
+            (format nil "INIT-~A" (symbol-name name))
+            nil
+            (list `(let ((,tmp-var ,value))
+                     (set-symbol-value ,name-hash ,tmp-var))))))))
 
     ;; (defparameter name value) — same as defvar
     ((and (consp form) (name-eq (car form) "DEFPARAMETER"))
@@ -3548,11 +3735,12 @@
        ;; Register as global variable
        (setf (gethash name-hash *globals*) t)
        (when value
-         (mvm-compile-function
-          (format nil "INIT-~A" (symbol-name name))
-          nil
-          (list `(set-symbol-value ,(ash name-hash +fixnum-shift+)
-                                   ,value))))))
+         (let ((tmp-var (gensym "INIT-TMP")))
+           (mvm-compile-function
+            (format nil "INIT-~A" (symbol-name name))
+            nil
+            (list `(let ((,tmp-var ,value))
+                     (set-symbol-value ,name-hash ,tmp-var))))))))
 
     ;; (defpackage ...) — skip, package system is SBCL-side only
     ((and (consp form) (name-eq (car form) "DEFPACKAGE"))
@@ -3560,6 +3748,13 @@
 
     ;; (in-package ...) — skip, package system is SBCL-side only
     ((and (consp form) (name-eq (car form) "IN-PACKAGE"))
+     nil)
+
+    ;; (eval-when (situations...) body...) — compile body as top-level forms
+    ;; MVM treats all compilation situations as :execute
+    ((and (consp form) (name-eq (car form) "EVAL-WHEN"))
+     (dolist (subform (cddr form))
+       (mvm-compile-toplevel subform))
      nil)
 
     ;; (defconstant name value)
@@ -3685,12 +3880,13 @@
                   (arrayp obj))
                forms-to-compile))
 
-       ;; Compile all generated forms
-       (let ((last-result nil))
+       ;; Compile all generated forms and return ALL results
+       (let ((results nil))
          (dolist (gen-form (nreverse forms-to-compile))
            (let ((result (mvm-compile-toplevel gen-form)))
-             (when result (setf last-result result))))
-         last-result)))
+             (when result (push result results))))
+         ;; Return multi-result so mvm-compile-all collects all of them
+         (cons :multi-result (nreverse results)))))
 
     ;; Other top-level forms: wrap in anonymous function
     (t
@@ -3711,6 +3907,7 @@
         (*loop-exit-label* nil)
         (*block-labels* nil)
         (*tagbody-tags* nil)
+        (*pending-flet-ir* nil)
         (all-ir nil))
 
     ;; Register standard macros (cond, and, or) for this compilation
@@ -3718,14 +3915,49 @@
 
     ;; Phase 1 & 2: Compile all forms to IR
     (dolist (form forms)
-      (let* ((result (mvm-compile-toplevel form))
-             (info (car result))
-             (ir (cdr result)))
-        (when (and info ir)
-          (push (cons info ir) all-ir))))
+      (setf *pending-flet-ir* nil)
+      (let* ((result (mvm-compile-toplevel form)))
+        (cond
+          ;; Multi-result from defstruct: collect all sub-results
+          ((and (consp result) (eq (car result) :multi-result))
+           (dolist (sub-result (cdr result))
+             (let ((info (car sub-result))
+                   (ir (cdr sub-result)))
+               (when (and info ir)
+                 (push (cons info ir) all-ir)))))
+          ;; Single result
+          (t
+           (let ((info (car result))
+                 (ir (cdr result)))
+             (when (and info ir)
+               (push (cons info ir) all-ir))))))
+      ;; Drain any flet/labels IR collected during this form's compilation
+      (dolist (flet-result *pending-flet-ir*)
+        (let ((info (car flet-result))
+              (ir (cdr flet-result)))
+          (when (and info ir)
+            (push (cons info ir) all-ir)))))
 
     ;; Reverse to get compilation order
     (setf all-ir (nreverse all-ir))
+
+    ;; Auto-generate init-all-globals: calls every INIT-* thunk
+    (let ((init-calls nil))
+      (dolist (entry all-ir)
+        (let ((name (function-info-name (car entry))))
+          (when (and (stringp name)
+                     (>= (length name) 5)
+                     (string= name "INIT-" :end1 5))
+            (format t "  init thunk: ~A~%" name)
+            (push (list (intern name :modus64.mvm)) init-calls))))
+      (when init-calls
+        (let* ((result (mvm-compile-toplevel
+                         `(defun init-all-globals ()
+                            ,@(nreverse init-calls))))
+               (info (car result))
+               (ir (cdr result)))
+          (when (and info ir)
+            (setf all-ir (nconc all-ir (list (cons info ir))))))))
 
     ;; Phase 3: Emit bytecode
     (let ((buf (make-mvm-buffer)))

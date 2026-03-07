@@ -300,6 +300,26 @@
               (emit-bytes buf #x66 #xBA #xF8 #x03)
               ;; out dx, al
               (emit-bytes buf #xEE))
+             ((= code #x0301)
+              ;; Serial read: poll COM1 LSR until data ready, read byte
+              ;; Result in V0 (RSI) as tagged fixnum
+              ;; poll: mov dx, 0x3FD (LSR)  ; 4 bytes
+              ;;        in al, dx           ; 1 byte
+              ;;        test al, 1          ; 2 bytes
+              ;;        jz poll             ; 2 bytes  (back 9 = 0xF7)
+              (emit-bytes buf #x66 #xBA #xFD #x03)  ; mov dx, 0x3FD
+              (emit-bytes buf #xEC)                   ; in al, dx
+              (emit-bytes buf #xA8 #x01)              ; test al, 1
+              (emit-bytes buf #x74 #xF7)              ; jz -9 (back to mov dx)
+              ;; Data ready — read from data port
+              (emit-bytes buf #x66 #xBA #xF8 #x03)  ; mov dx, 0x3F8
+              (emit-bytes buf #xEC)                   ; in al, dx
+              ;; movzx esi, al; shl esi, 1 (tag as fixnum)
+              (emit-bytes buf #x0F #xB6 #xF0)       ; movzx esi, al
+              (emit-bytes buf #xD1 #xE6))            ; shl esi, 1
+             ((= code #x0302)
+              ;; Memory barrier: mfence
+              (emit-bytes buf #x0F #xAE #xF0))
              (t
               ;; Real CPU trap
               (emit-mov-reg-imm buf 'rax code)
@@ -898,23 +918,59 @@
         ;; Object Operations
         ;; ============================================
         ((op= +op-alloc-obj+)
-         ;; (alloc-obj Vd size:imm16 subtag:imm8)
-         ;; Allocate SIZE bytes from bump allocator.
-         ;; Write header word at [R12]: (size << 8) | subtag
-         ;; Result = R12 | 0x09 (object tag), advance R12 by size.
+         ;; (alloc-obj Vd count:imm16 subtag:imm8)
+         ;; Allocate an object with COUNT elements from bump allocator.
+         ;; Write header word at [R12]: (count << 8) | subtag
+         ;; Result = R12 | 0x09 (object tag), advance R12 by (count+2)*8.
+         ;; Elements start at offset 16 (8 byte header + 8 byte padding).
          (let* ((vd (first operands))
-                (size (second operands))
+                (count (second operands))
                 (subtag (third operands))
                 (d (dest-phys-or-scratch vd))
-                (header (logior (ash size 8) subtag)))
+                (header (logior (ash count 8) subtag)))
            ;; Write header
            (emit-mov-reg-imm buf +scratch-reg+ header)
            (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
            ;; Result = R12 | object-tag
            (emit-lea buf d 'r12 #x09)
-           ;; Advance alloc pointer by size (aligned to 16)
-           (let ((aligned-size (logand (+ size 15) (lognot 15))))
-             (emit-add-reg-imm buf 'r12 aligned-size))
+           ;; Advance alloc pointer: (count+2)*8, aligned to 16
+           (let ((alloc-bytes (logand (+ (* (+ count 2) 8) 15) (lognot 15))))
+             (emit-add-reg-imm buf 'r12 alloc-bytes))
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-alloc-array+)
+         ;; (alloc-array Vd Vcount) — dynamic array allocation
+         ;; Vcount: UNTAGGED element count (compiler SAR'd it)
+         ;; Allocates (count+1)*8 bytes, aligned to 16 (header + elements)
+         ;; Header = (count << 8) | array-subtag
+         ;; Result = R12 | 0x09 (object tag)
+         (let* ((vd (first operands))
+                (vcount (second operands))
+                (d (dest-phys-or-scratch vd))
+                (pc (vreg-phys vcount)))
+           ;; Load count into scratch register
+           (if pc
+               (emit-mov-reg-reg buf +scratch-reg+ pc)
+               (emit-load-vreg buf vcount +scratch-reg+))
+           ;; Save count on stack (will be clobbered by header build)
+           (emit-push buf +scratch-reg+)
+           ;; Build header: (count << 8) | subtag-array
+           (emit-shl-reg-imm buf +scratch-reg+ 8)
+           (emit-or-reg-imm buf +scratch-reg+ #x32)  ; array subtag
+           ;; Write header at [R12]
+           (emit-mov-mem-reg buf 'r12 +scratch-reg+ 0)
+           ;; Result = R12 | 0x09 (object tag)
+           (emit-lea buf d 'r12 #x09)
+           ;; Restore count, compute allocation size
+           (emit-pop buf +scratch-reg+)
+           ;; size = (count + 2) << 3, aligned to 16
+           ;; +2 because elements start at offset +16 (header + padding)
+           (emit-add-reg-imm buf +scratch-reg+ 2)  ; count + 2
+           (emit-shl-reg-imm buf +scratch-reg+ 3)  ; * 8 bytes per word
+           (emit-add-reg-imm buf +scratch-reg+ 15)  ; for alignment
+           (emit-and-reg-imm buf +scratch-reg+ -16) ; align to 16
+           ;; Advance alloc pointer
+           (emit-add-reg-reg buf 'r12 +scratch-reg+)
            (maybe-store-scratch buf vd)))
 
         ((op= +op-obj-ref+)
@@ -1010,6 +1066,87 @@
            ;; Extract low 8 bits of header as subtag
            (emit-and-reg-imm buf d #xFF)
            ;; Tag as fixnum
+           (emit-shl-reg-imm buf d 1)
+           (maybe-store-scratch buf vd)))
+
+        ;; ============================================
+        ;; Variable-Index Array Operations
+        ;; ============================================
+        ((op= +op-aref+)
+         ;; (aref Vd Vobj Vidx) — variable-index array load
+         ;; Element at [Vobj + Vidx*4 + 7]
+         ;; (Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8)
+         (let* ((vd (first operands))
+                (vobj (second operands))
+                (vidx (third operands))
+                (d (dest-phys-or-scratch vd)))
+           ;; Compute address in scratch: Vidx*4
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           ;; Add Vobj
+           (let ((pobj (vreg-phys vobj)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf vobj 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           ;; Load from [scratch + 7]
+           (emit-mov-reg-mem buf d +scratch-reg+ 7)
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-aset+)
+         ;; (aset Vobj Vidx Vs) — variable-index array store
+         ;; Store Vs at [Vobj + Vidx*4 + 7]
+         (let* ((vobj (first operands))
+                (vidx (second operands))
+                (vs (third operands)))
+           ;; Compute address in scratch: Vidx*4
+           (let ((pidx (vreg-phys vidx)))
+             (if pidx
+                 (emit-mov-reg-reg buf +scratch-reg+ pidx)
+                 (emit-load-vreg buf vidx +scratch-reg+)))
+           (emit-shl-reg-imm buf +scratch-reg+ 2)
+           ;; Add Vobj
+           (let ((pobj (vreg-phys vobj)))
+             (if pobj
+                 (emit-add-reg-reg buf +scratch-reg+ pobj)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf vobj 'r13)
+                   (emit-add-reg-reg buf +scratch-reg+ 'r13)
+                   (emit-pop buf 'r13))))
+           ;; Store Vs at [scratch + 7]
+           (let ((ps (vreg-phys vs)))
+             (if ps
+                 (emit-mov-mem-reg buf +scratch-reg+ ps 7)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf vs 'r13)
+                   (emit-mov-mem-reg buf +scratch-reg+ 'r13 7)
+                   (emit-pop buf 'r13))))))
+
+        ((op= +op-array-len+)
+         ;; (array-len Vd Vobj) — extract element count from header
+         ;; Header at [Vobj - 9], count = header >> 8, tagged = count << 1
+         (let* ((vd (first operands))
+                (vobj (second operands))
+                (d (dest-phys-or-scratch vd)))
+           (let ((po (vreg-phys vobj)))
+             (if po
+                 (emit-mov-reg-mem buf d po -9)
+                 (progn
+                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                     (emit-push buf tmp)
+                     (emit-load-vreg buf vobj tmp)
+                     (emit-mov-reg-mem buf d tmp -9)
+                     (emit-pop buf tmp)))))
+           ;; header >> 8 gives element count, << 1 tags as fixnum
+           (emit-shr-reg-imm buf d 8)
            (emit-shl-reg-imm buf d 1)
            (maybe-store-scratch buf vd)))
 
@@ -1306,6 +1443,26 @@
            (emit-u32 buf offset)))
 
         ;; ============================================
+        ;; Function Address (for indirect calls)
+        ;; ============================================
+        ((op= +op-fn-addr+)
+         ;; (fn-addr Vd target:imm32)
+         ;; Load the native address of a function into Vd.
+         ;; Target is the bytecode offset, resolved via function table
+         ;; to a native label. Uses LEA [RIP+disp32] for position-independent
+         ;; address loading.
+         (let* ((vd (first operands))
+                (target-offset (second operands))
+                (fn-table (translate-state-function-table state))
+                (label (when fn-table (gethash target-offset fn-table)))
+                (d (dest-phys-or-scratch vd)))
+           (if label
+               (emit-lea-label buf d label)
+               ;; Unknown target — load 0
+               (emit-mov-reg-imm buf d 0))
+           (maybe-store-scratch buf vd)))
+
+        ;; ============================================
         ;; Unknown Opcode
         ;; ============================================
         (t
@@ -1495,6 +1652,23 @@
 ;;; ============================================================
 ;;; Function Prologue / Epilogue
 ;;; ============================================================
+
+(defun emit-lea-label (buf phys-reg label)
+  "Emit LEA reg, [RIP + disp32] to load a label's native address into a register.
+   Uses the same fixup mechanism as emit-call (both are RIP-relative disp32)."
+  ;; REX.W + LEA r64, [RIP+disp32]
+  ;; Encoding: [REX] 8D [ModR/M: 00 reg 101]  disp32
+  (let ((extended (reg-extended-p phys-reg)))
+    (emit-byte buf (rex-prefix t extended nil nil))
+    (emit-byte buf #x8D)    ; LEA
+    ;; ModR/M: mod=00, r/m=101 (RIP-relative), reg=phys-reg
+    (emit-byte buf (modrm #b00 (reg-code phys-reg) 5))
+    ;; disp32: use same fixup as emit-call/emit-label-ref-rel32
+    (if (label-position label)
+        (emit-u32 buf (logand #xFFFFFFFF
+                              (- (label-position label)
+                                 (+ (code-buffer-position buf) 4))))
+        (emit-label-ref-rel32 buf label))))
 
 (defun emit-function-prologue (buf)
   "Emit the standard function prologue.

@@ -341,10 +341,10 @@
         :general-base +aarch64-general-base+))
 
 ;;; ============================================================
-;;; Turducken Boot: MMU with VA=PA-0x40000000 offset mapping
+;;; Fixpoint Boot: MMU with VA=PA-0x40000000 offset mapping
 ;;; ============================================================
 ;;;
-;;; The turducken proves the MVM compiler is a fixed point across
+;;; The fixpoint proves the MVM compiler is a fixed point across
 ;;; architectures. For the runtime's build-image (with hardcoded x64
 ;;; addresses like 0x08000000, 0x330000, 0x4FF080) to work on AArch64,
 ;;; we set up page tables mapping low VAs to DRAM:
@@ -366,10 +366,10 @@
 (defconstant +tdk-dram-base-pa+  #x40000000)  ; QEMU virt DRAM start
 (defconstant +tdk-uart-pa+       #x09000000)  ; PL011 UART physical
 
-;; VA addresses for turducken runtime (same as x64)
+;; VA addresses for fixpoint runtime (same as x64)
 (defconstant +tdk-stack-va+      #x00200000)  ; Stack top
 (defconstant +tdk-cons-base-va+  #x04000000)  ; Cons alloc
-(defconstant +tdk-cons-limit-va+ #x05000000)  ; Cons limit
+(defconstant +tdk-cons-limit-va+ #x07000000)  ; Cons limit (48MB, needs room for 2MB code-buffer)
 (defconstant +tdk-uart-va+       #x20000000)  ; UART via page tables
 (defconstant +tdk-percpu-va+     #x00360000)  ; Per-CPU data (same as x64)
 
@@ -404,8 +404,8 @@
                                 (ash rn 5)
                                 rt)))
 
-(defun emit-aarch64-turducken-entry (buf)
-  "Emit AArch64 turducken kernel entry with MMU page tables.
+(defun emit-aarch64-fixpoint-entry (buf)
+  "Emit AArch64 fixpoint kernel entry with MMU page tables.
    QEMU virt loads raw binary at PA 0x40000000. Boot code runs at PA,
    sets up page tables for VA=PA-0x40000000 offset, enables MMU,
    then branches to native code via offset-mapped VA."
@@ -466,6 +466,15 @@
     (emit-aarch64-load-imm64 buf x1 #x40000701)
     (emit-aarch64-str-x buf x1 x0 1)            ; L1[1] (offset 8)
 
+    ;; 5b. L1[256] = 1GB block, device memory for PCI ECAM (0x4010000000)
+    ;;    PA 0x4000000000, AttrIndx=1 (device nGnRnE), AF=1, SH=inner
+    ;;    entry = 0x4000000000 | (1<<10) | (3<<8) | (1<<2) | 0b01 = 0x4000000705
+    ;;    L1 entry 256 at L1_base + 256*8 = L1_base + 0x800
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-page-table-pa+ #x800))
+    (emit-aarch64-load-imm64 buf x1 #x4000000705)
+    (emit-aarch64-str-x buf x1 x0 0)
+    (emit-aarch64-load-imm64 buf x0 +tdk-page-table-pa+)  ; restore x0 = L1 base
+
     ;; 6. Fill L2[0..255] = 2MB blocks, VA 0x00-0x1FF → PA 0x400-0x5FF
     ;;    Each entry: (0x40000000 + i*0x200000) | 0x701
     (emit-aarch64-load-imm64 buf x0 +tdk-l2-table-pa+)  ; x0 = L2 base
@@ -492,6 +501,15 @@
     ;;    L2 entry 256 is at L2_base + 256*8 = L2_base + 0x800
     (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 256 8)))
     (emit-aarch64-load-imm64 buf x1 #x09000705)
+    (emit-aarch64-str-x buf x1 x0 0)
+
+    ;; 7b. L2[128] = 2MB block, device memory for E1000 BAR
+    ;;    VA 0x10000000 → PA 0x10000000 (identity-mapped, overrides offset map)
+    ;;    L2[128] was filled with PA 0x50000000 by the loop; overwrite now.
+    ;;    entry = 0x10000705 (device, AF, SH, AttrIndx=1)
+    ;;    L2 entry 128 at L2_base + 128*8 = L2_base + 0x400
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ #x400))
+    (emit-aarch64-load-imm64 buf x1 #x10000705)
     (emit-aarch64-str-x buf x1 x0 0)
 
     ;; ================================================================
@@ -597,11 +615,11 @@
     ;; Native code follows at offset 0x1000 (= VA 0x1000)
     ))
 
-(defun aarch64-turducken-boot-descriptor ()
-  "Return the AArch64 boot descriptor for turducken builds.
+(defun aarch64-fixpoint-boot-descriptor ()
+  "Return the AArch64 boot descriptor for fixpoint builds.
    Uses MMU with offset page tables so x64-compatible addresses work."
   (list :arch :aarch64
-        :entry-fn #'emit-aarch64-turducken-entry
+        :entry-fn #'emit-aarch64-fixpoint-entry
         :serial-base +tdk-uart-va+
         :load-addr +tdk-dram-base-pa+
         :stack-top +tdk-stack-va+

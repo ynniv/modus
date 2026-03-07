@@ -162,6 +162,20 @@
       (setq idx (+ idx 1))
       (setq cur (cdr cur)))))
 
+(defun position (item seq)
+  "Return the index of ITEM in SEQ (list or array, EQL test), or nil."
+  (if (consp seq)
+      (position-in-list item seq)
+      (if (null seq)
+          nil
+          ;; Array
+          (let ((len (array-length seq))
+                (i 0))
+            (loop
+              (when (= i len) (return nil))
+              (when (eql (aref seq i) item) (return i))
+              (setq i (+ i 1)))))))
+
 (defun remove-if (pred list)
   "Return a new list with elements for which PRED returns non-nil removed.
    PRED must be a function (use with funcall)."
@@ -410,7 +424,7 @@
 ;;;
 ;;; Structure: wrapper cons cell whose car is an alist of
 ;;; (key . value) pairs. Keys compared using equal.
-;;; O(n) lookup — sufficient for turducken proof.
+;;; O(n) lookup — sufficient for fixpoint proof.
 
 (defun make-hash-table ()
   "Create an empty hash table (wrapper cons cell)."
@@ -491,6 +505,62 @@
 (defun string (x)
   "Identity — on bare metal, symbols are already name-hashes or strings."
   x)
+
+;;; ============================================================
+;;; Multiple Values (bare-metal stub)
+;;; ============================================================
+;;;
+;;; MVM's multiple-value-bind expansion destructures via car/cdr,
+;;; so values must return a cons cell. Callers not using m-v-b
+;;; should destructure with car to get the primary value.
+
+(defun values (a b)
+  "Return multiple values as a cons cell (for m-v-b destructuring)."
+  (cons a b))
+
+;;; ============================================================
+;;; Global Variable Store (bare-metal)
+;;; ============================================================
+;;;
+;;; The MVM compiler emits calls to SYMBOL-VALUE and SET-SYMBOL-VALUE
+;;; for defvar/defparameter globals. On bare metal, we implement these
+;;; using an alist stored at fixed address 0x400000.
+;;; Keys are tagged name hashes (fixnums), values are arbitrary.
+;;; mem-ref :u64 returns raw bits, which for tagged Lisp values is
+;;; the value itself (cons pointers, fixnums, etc.).
+
+(defun symbol-value (name-hash)
+  "Look up a global variable by its tagged name hash."
+  (let ((head (mem-ref #x400000 :u64)))
+    (if (zerop head)
+        nil
+        (let ((cur head))
+          (loop
+            (when (null cur) (return nil))
+            (let ((pair (car cur)))
+              (when (eql (car pair) name-hash)
+                (return (cdr pair))))
+            (setq cur (cdr cur)))))))
+
+(defun set-symbol-value (name-hash value)
+  "Set a global variable by its tagged name hash."
+  (let ((head (mem-ref #x400000 :u64)))
+    (if (zerop head)
+        (progn
+          (setf (mem-ref #x400000 :u64)
+                (cons (cons name-hash value) nil))
+          value)
+        (let ((cur head))
+          (loop
+            (when (null cur)
+              (setf (mem-ref #x400000 :u64)
+                    (cons (cons name-hash value) head))
+              (return value))
+            (let ((pair (car cur)))
+              (when (eql (car pair) name-hash)
+                (set-cdr pair value)
+                (return value)))
+            (setq cur (cdr cur)))))))
 
 ;;; ============================================================
 ;;; Error handling (bare-metal stubs)

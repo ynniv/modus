@@ -35,7 +35,7 @@
 
 (in-package :modus64.mvm)
 
-;;; Try to compile each turducken source file through MVM
+;;; Try to compile each fixpoint source file through MVM
 
 (defun read-file-forms (path)
   "Read all forms from a Lisp source file."
@@ -85,8 +85,8 @@
   (test-compile-file (merge-pathnames "mvm/translate-x64.lisp" base))
   (test-compile-file (merge-pathnames "mvm/cross.lisp" base))
 
-  ;; Test combined (turducken source blob order)
-  (format t "~%=== Combined turducken source ===~%")
+  ;; Test combined (fixpoint source blob order)
+  (format t "~%=== Combined fixpoint source ===~%")
   (handler-case
       (let* ((all-forms
               (append
@@ -110,10 +110,10 @@
                                   :source-text "(defun kernel-main () (write-byte 42) (halt))")))
           (format t "  x86-64 image: ~D bytes~%"
                   (length (kernel-image-image-bytes image))))
-        (format t "~%=== Build turducken AArch64 REPL image (sanity) ===~%")
-        (let ((image (build-image :target :turducken
+        (format t "~%=== Build fixpoint AArch64 REPL image (sanity) ===~%")
+        (let ((image (build-image :target :fixpoint
                                   :source-text "(defun kernel-main () (write-byte 42) (halt))")))
-          (format t "  AArch64 turducken image: ~D bytes~%"
+          (format t "  AArch64 fixpoint image: ~D bytes~%"
                   (length (kernel-image-image-bytes image))))
         (format t "~%=== Self-compile summary ===~%")
         (format t "  MVM compiler + translators + cross pipeline: 759 functions~%")

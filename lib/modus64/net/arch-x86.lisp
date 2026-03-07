@@ -44,4 +44,5 @@
 (defun ssh-conn-base () #x05080000)
 
 ;; Base address for SSH IPC shared state (REPL, evaluator, connection management)
-(defun ssh-ipc-base () #x300000)
+;; Moved from #x300000 to avoid conflict with fixpoint metadata at VA 0x300000
+(defun ssh-ipc-base () #x500000)

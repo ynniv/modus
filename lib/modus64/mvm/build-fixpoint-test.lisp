@@ -1,12 +1,12 @@
-;;;; build-turducken-test.lisp - Test turducken boot (AArch64 with MMU)
+;;;; build-fixpoint-test.lisp - Test fixpoint boot (AArch64 with MMU)
 ;;;;
-;;;; Usage: cd lib/modus64 && sbcl --script mvm/build-turducken-test.lisp
+;;;; Usage: cd lib/modus64 && sbcl --script mvm/build-fixpoint-test.lisp
 ;;;;
-;;;; Produces /tmp/modus64-turducken.bin — boot with:
+;;;; Produces /tmp/modus64-fixpoint.bin — boot with:
 ;;;;   qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-;;;;     -kernel /tmp/modus64-turducken.bin -nographic
+;;;;     -kernel /tmp/modus64-fixpoint.bin -nographic
 ;;;;
-;;;; This builds an AArch64 REPL kernel using the turducken boot
+;;;; This builds an AArch64 REPL kernel using the fixpoint boot
 ;;;; preamble (with MMU page tables mapping x64-compatible VAs).
 
 ;;; ============================================================
@@ -56,7 +56,7 @@
 (mvm-load "mvm/repl-source.lisp")
 
 ;;; ============================================================
-;;; Build turducken test image (AArch64 with MMU)
+;;; Build fixpoint test image (AArch64 with MMU)
 ;;; ============================================================
 
 (in-package :modus64.mvm)
@@ -64,8 +64,8 @@
 ;; Install the AArch64 translator
 (install-aarch64-translator)
 
-(format t "Building turducken test image (AArch64 with MMU)...~%")
-(let ((image (build-image :target :turducken :source-text *repl-source*)))
-  (write-kernel-image image "/tmp/modus64-turducken.bin")
+(format t "Building fixpoint test image (AArch64 with MMU)...~%")
+(let ((image (build-image :target :fixpoint :source-text *repl-source*)))
+  (write-kernel-image image "/tmp/modus64-fixpoint.bin")
   (format t "Done. Boot with:~%")
-  (format t "  qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel /tmp/modus64-turducken.bin -nographic~%"))
+  (format t "  qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel /tmp/modus64-fixpoint.bin -nographic~%"))

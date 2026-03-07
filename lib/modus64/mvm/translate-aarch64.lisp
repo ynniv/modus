@@ -1713,9 +1713,10 @@
                   (pobj (ensure-src (vr 1) +a64-x16+))
                   (pidx (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             ;; Compute address: x16 = (Vobj - 2) + Vidx * 8
+             ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
+             ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
              (a64-sub-imm buf +a64-x16+ pobj 2)
-             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 3)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 2)
              ;; Load from computed address
              (a64-ldur buf pd +a64-x16+ 0)
              (unless (a64-phys-reg vd)
@@ -1726,9 +1727,10 @@
           ((= op +op-aset+)
            (let* ((pobj (ensure-src (vr 0) +a64-x16+))
                   (pidx (ensure-src (vr 1) +a64-x17+)))
-             ;; Compute address: x16 = (Vobj - 2) + Vidx * 8
+             ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
+             ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
              (a64-sub-imm buf +a64-x16+ pobj 2)
-             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 3)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 2)
              ;; Reload value into x17 (safe — done with idx)
              (let ((ps (ensure-src (vr 2) +a64-x17+)))
                (a64-stur buf ps +a64-x16+ 0))))
@@ -2070,13 +2072,10 @@
              (if label
                  (let ((idx (a64-current-index buf)))
                    ;; ADR Xd, target — placeholder, resolved by fixup
+                   ;; Result is raw address (NOT tagged) — matches x64 behavior.
+                   ;; CALL-IND uses BLR which needs a raw address.
                    (a64-emit buf (logior (ash #b10000 24) pd))
-                   (a64-add-fixup buf idx label :adr)
-                   ;; LSL Xd, Xd, #1 — tag as fixnum (shift left by 1)
-                   (a64-emit buf (logior #xD3400000       ; UBFM (64-bit)
-                                         (ash 63 16)      ; immr=63 for LSL #1
-                                         (ash 62 10)      ; imms=62 for LSL #1
-                                         (ash pd 5) pd)))
+                   (a64-add-fixup buf idx label :adr))
                  ;; Unknown target: load 0
                  (a64-movz buf pd 0))
              (unless (a64-phys-reg vd)
