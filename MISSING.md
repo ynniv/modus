@@ -20,7 +20,7 @@
 ## Networking
 - No TLS (SSH rolls its own crypto channel)
 - No HTTP
-- No WebSocket (in modus64; movitz32 has it)
+- No WebSocket
 - TCP is bare-bones (no retransmit, no congestion control)
 
 ## Tooling

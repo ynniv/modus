@@ -12,7 +12,7 @@ dependencies and verification steps.
 ## Phase 1: Boot to Serial (Week 1-2)
 
 ### 1.0 Cross-Compiler Foundation
-**File**: `lib/modus64/cross/cross-compile.lisp`
+**File**: `cross/cross-compile.lisp`
 
 This is a minimal, throwaway compiler that runs on SBCL and emits 64-bit code.
 NOT the final compiler - just enough to bootstrap.
@@ -33,7 +33,7 @@ Verification:
 ```
 
 ### 1.1 Multiboot Entry Point
-**File**: `lib/modus64/boot/multiboot.s` (hand-written assembly)
+**File**: `boot/multiboot.s` (hand-written assembly)
 
 ```
 Tasks:
@@ -48,7 +48,7 @@ Verification:
 ```
 
 ### 1.2 Transition to Long Mode
-**File**: `lib/modus64/boot/start64.s` (hand-written assembly)
+**File**: `boot/start64.s` (hand-written assembly)
 
 ```
 Tasks:
@@ -67,7 +67,7 @@ Verification:
 ```
 
 ### 1.3 Basic GDT and IDT
-**File**: `lib/modus64/boot/gdt.lisp` (cross-compiled)
+**File**: `boot/gdt.lisp` (cross-compiled)
 
 ```
 Tasks:
@@ -83,7 +83,7 @@ Verification:
 ```
 
 ### 1.4 Serial Driver (Minimal)
-**File**: `lib/modus64/drivers/serial.lisp` (cross-compiled)
+**File**: `drivers/serial.lisp` (cross-compiled)
 
 ```
 Tasks:
@@ -98,7 +98,7 @@ Verification:
 ```
 
 ### 1.5 Build System
-**File**: `lib/modus64/cross/build.lisp`
+**File**: `cross/build.lisp`
 
 ```
 Tasks:
@@ -120,7 +120,7 @@ Verification:
 ## Phase 2: Memory and Basic Types (Week 3-4)
 
 ### 2.1 Physical Memory Manager
-**File**: `lib/modus64/boot/memory.lisp`
+**File**: `boot/memory.lisp`
 
 ```
 Tasks:
@@ -136,7 +136,7 @@ Verification:
 ```
 
 ### 2.2 Bump Allocator
-**File**: `lib/modus64/runtime/alloc.lisp`
+**File**: `runtime/alloc.lisp`
 
 ```
 Tasks:
@@ -151,7 +151,7 @@ Verification:
 ```
 
 ### 2.3 Tag Predicates
-**File**: `lib/modus64/runtime/tags.lisp`
+**File**: `runtime/tags.lisp`
 
 ```
 Tasks:
@@ -167,7 +167,7 @@ Verification:
 ```
 
 ### 2.4 Cons Cells
-**File**: `lib/modus64/runtime/cons.lisp`
+**File**: `runtime/cons.lisp`
 
 ```
 Tasks:
@@ -184,7 +184,7 @@ Verification:
 ```
 
 ### 2.5 Fixnum Arithmetic
-**File**: `lib/modus64/runtime/number.lisp`
+**File**: `runtime/number.lisp`
 
 ```
 Tasks:
@@ -201,7 +201,7 @@ Verification:
 ```
 
 ### 2.6 Simple Vectors
-**File**: `lib/modus64/runtime/vector.lisp`
+**File**: `runtime/vector.lisp`
 
 ```
 Tasks:
@@ -222,7 +222,7 @@ Verification:
 ## Phase 3: Reader and REPL (Week 5-6)
 
 ### 3.1 Symbol Table
-**File**: `lib/modus64/runtime/symbol.lisp`
+**File**: `runtime/symbol.lisp`
 
 ```
 Tasks:
@@ -240,7 +240,7 @@ Verification:
 ```
 
 ### 3.2 Character Input
-**File**: `lib/modus64/drivers/serial.lisp` (extend)
+**File**: `drivers/serial.lisp` (extend)
 
 ```
 Tasks:
@@ -255,7 +255,7 @@ Verification:
 ```
 
 ### 3.3 Lisp Reader
-**File**: `lib/modus64/compiler/reader.lisp`
+**File**: `compiler/reader.lisp`
 
 ```
 Tasks:
@@ -273,7 +273,7 @@ Verification:
 ```
 
 ### 3.4 Lisp Printer
-**File**: `lib/modus64/runtime/print.lisp`
+**File**: `runtime/print.lisp`
 
 ```
 Tasks:
@@ -290,7 +290,7 @@ Verification:
 ```
 
 ### 3.5 Tree-Walking Evaluator
-**File**: `lib/modus64/runtime/eval.lisp`
+**File**: `runtime/eval.lisp`
 
 ```
 Tasks:
@@ -311,7 +311,7 @@ Verification:
 ```
 
 ### 3.6 REPL
-**File**: `lib/modus64/runtime/repl.lisp`
+**File**: `runtime/repl.lisp`
 
 ```
 Tasks:
@@ -331,7 +331,7 @@ Verification:
 ## Phase 4: Native Compiler (Week 7-8)
 
 ### 4.1 IR Generation
-**File**: `lib/modus64/compiler/ir.lisp`
+**File**: `compiler/ir.lisp`
 
 ```
 Tasks:
@@ -346,7 +346,7 @@ Verification:
 ```
 
 ### 4.2 Register Allocator
-**File**: `lib/modus64/compiler/regalloc.lisp`
+**File**: `compiler/regalloc.lisp`
 
 ```
 Tasks:
@@ -361,7 +361,7 @@ Verification:
 ```
 
 ### 4.3 x86-64 Code Generation
-**File**: `lib/modus64/compiler/x64-gen.lisp`
+**File**: `compiler/x64-gen.lisp`
 
 ```
 Tasks:
@@ -379,7 +379,7 @@ Verification:
 ```
 
 ### 4.4 Assembler
-**File**: `lib/modus64/compiler/assemble.lisp`
+**File**: `compiler/assemble.lisp`
 
 ```
 Tasks:
@@ -395,7 +395,7 @@ Verification:
 ```
 
 ### 4.5 compile Function
-**File**: `lib/modus64/compiler/compile.lisp`
+**File**: `compiler/compile.lisp`
 
 ```
 Tasks:
@@ -416,7 +416,7 @@ Verification:
 ## Phase 5: GC and Full Runtime (Week 9-10)
 
 ### 5.1 Copying GC
-**File**: `lib/modus64/runtime/gc.lisp`
+**File**: `runtime/gc.lisp`
 
 ```
 Tasks:
@@ -432,7 +432,7 @@ Verification:
 ```
 
 ### 5.2 Write Barrier
-**File**: `lib/modus64/runtime/gc.lisp` (extend)
+**File**: `runtime/gc.lisp` (extend)
 
 ```
 Tasks:
@@ -446,7 +446,7 @@ Verification:
 ```
 
 ### 5.3 Bignums
-**File**: `lib/modus64/runtime/bignum.lisp`
+**File**: `runtime/bignum.lisp`
 
 ```
 Tasks:
@@ -462,7 +462,7 @@ Verification:
 ```
 
 ### 5.4 Strings
-**File**: `lib/modus64/runtime/string.lisp`
+**File**: `runtime/string.lisp`
 
 ```
 Tasks:
@@ -478,7 +478,7 @@ Verification:
 ```
 
 ### 5.5 Hash Tables
-**File**: `lib/modus64/runtime/hash.lisp`
+**File**: `runtime/hash.lisp`
 
 ```
 Tasks:
@@ -500,7 +500,7 @@ Verification:
 ## Phase 6: Network and SSH (Week 11-12)
 
 ### 6.1 E1000 Driver
-**File**: `lib/modus64/drivers/e1000.lisp`
+**File**: `drivers/e1000.lisp`
 
 ```
 Tasks:
@@ -515,7 +515,7 @@ Verification:
 ```
 
 ### 6.2 TCP/IP Stack
-**File**: `lib/modus64/net/tcp.lisp`
+**File**: `net/tcp.lisp`
 
 ```
 Tasks:
@@ -530,7 +530,7 @@ Verification:
 ```
 
 ### 6.3 Crypto Library
-**File**: `lib/modus64/crypto/*.lisp`
+**File**: `crypto/*.lisp`
 
 ```
 Tasks:
@@ -546,7 +546,7 @@ Verification:
 ```
 
 ### 6.4 SSH Server
-**File**: `lib/modus64/net/ssh.lisp`
+**File**: `net/ssh.lisp`
 
 ```
 Tasks:
@@ -662,7 +662,7 @@ Verification:
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│ CROSS-COMPILER (lib/modus64/cross/)                                 │
+│ CROSS-COMPILER (cross/)                                 │
 │ • Runs on SBCL                                                      │
 │ • Minimal (~2000 lines)                                             │
 │ • Produces: boot code, runtime, reader, simple eval                 │
@@ -681,7 +681,7 @@ Verification:
                               │ loads & compiles
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ NATIVE COMPILER (lib/modus64/compiler/)                             │
+│ NATIVE COMPILER (compiler/)                             │
 │ • Runs on Modus64                                                   │
 │ • Full-featured                                                     │
 │ • Self-hosting                                                      │

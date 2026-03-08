@@ -32,7 +32,6 @@ Modus64 runs bare-metal on the Pi Zero 2 W (BCM2710A1, Cortex-A53). The system b
 
 ```bash
 # Build the bootloader kernel (includes SSH fallback)
-cd lib/modus64
 bash scripts/make-sdcard-bootloader.sh
 
 # Flash to micro-SD (one time only!)
@@ -43,7 +42,6 @@ sudo dd if=/tmp/pizero2w-sdcard.img of=/dev/sdX bs=4M status=progress
 
 ```bash
 # Build any kernel
-cd lib/modus64
 sbcl --script mvm/build-rpi-periph.lisp     # peripheral test
 sbcl --script mvm/build-pizero2w-ssh.lisp    # SSH server
 sbcl --script mvm/build-uart-bootloader.lisp # bootloader itself
@@ -263,7 +261,7 @@ All drivers in `net/bcm2835-periph.lisp`. Tested on both QEMU raspi3b and real h
 
 ## Files
 
-### Source files (`lib/modus64/net/`)
+### Source files (`net/`)
 
 | File | Lines | Purpose |
 |------|-------|---------|
@@ -280,7 +278,7 @@ All drivers in `net/bcm2835-periph.lisp`. Tested on both QEMU raspi3b and real h
 | `ssh.lisp` | ~1500 | SSH server (shared) |
 | `aarch64-overrides.lisp` | ~200 | Single-threaded SSH overrides |
 
-### Build scripts (`lib/modus64/mvm/`)
+### Build scripts (`mvm/`)
 
 | Script | Output | Purpose |
 |--------|--------|---------|
@@ -295,8 +293,8 @@ All drivers in `net/bcm2835-periph.lisp`. Tested on both QEMU raspi3b and real h
 | Script | Location | Purpose |
 |--------|----------|---------|
 | `deploy-kernel.py` | `scripts/` | UART kernel upload from Pi 5 |
-| `make-sdcard-bootloader.sh` | `lib/modus64/scripts/` | One-time SD card with bootloader |
-| `make-sdcard.sh` | `lib/modus64/scripts/` | SD card with SSH-only kernel |
+| `make-sdcard-bootloader.sh` | `scripts/` | One-time SD card with bootloader |
+| `make-sdcard.sh` | `scripts/` | SD card with SSH-only kernel |
 
 ---
 

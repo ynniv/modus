@@ -1,12 +1,10 @@
-# Modus64
+# Modus
 
-Modus64 is a self-hosting bare-metal Lisp operating system. It compiles Lisp to native code via the MVM (Modus Virtual Machine) — a portable virtual ISA with translators for 7 CPU architectures. The system runs SSH servers, handles USB devices, and supports cooperative actor-based concurrency, all on bare metal with no OS underneath.
+Modus is a self-hosting bare-metal Lisp operating system. It compiles Lisp to native code via the MVM (Modus Virtual Machine) — a portable virtual ISA with translators for 9 CPU architectures. The system runs SSH servers, handles USB devices, and supports cooperative actor-based concurrency, all on bare metal with no OS underneath.
 
 ## Directory Structure
 
 ```
-root=lib/modus64
-
 cross/          SBCL-hosted cross-compiler and x64 assembler
   cross-compile.lisp   Phase 0 cross-compiler (1845L)
   build.lisp           Runtime + self-hosting kernel builder (~16500L)
@@ -49,10 +47,15 @@ net/            Networking, crypto, USB, actor system
   hid.lisp             USB HID (keyboard, mouse, tablet)
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
+  crypto-32.lisp       32-bit safe field/poly multiply (pair arithmetic)
+  crypto-i386.lisp     i386 SHA-256/512, ChaCha20 (w32 pair arithmetic)
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
+  ne2000.lisp          NE2000 ISA NIC driver (i386)
   http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
   aarch64-overrides.lisp   Line editor, buffer reader, SSH I/O overrides
+  i386-overrides.lisp      i386 30-bit fixnum safety overrides (crypto, SSH)
+  arch-i386.lisp           i386 NE2000 adapter, NIC state, allocation
   uart-bootloader.lisp     UART bootloader for rapid kernel redeploy
   bcm2835-periph.lisp      BCM2835 GPIO, SPI, I2C, PWM
 
@@ -70,7 +73,7 @@ runtime/        Runtime type system
 
 ## Build Commands
 
-All builds: `cd lib/modus64 && sbcl --script <build-script>`
+All builds: `sbcl --script <build-script>`
 
 ### QEMU AArch64 (virt machine, E1000)
 ```bash
@@ -98,6 +101,26 @@ sbcl --script mvm/build-rpi-ssh.lisp      # SSH
 sbcl --script mvm/build-rpi-hid.lisp      # USB keyboard REPL
 sbcl --script mvm/build-rpi-repl.lisp     # Serial REPL
 sbcl --script mvm/build-rpi-periph.lisp   # GPIO/SPI/I2C peripherals
+```
+
+### QEMU i386 (32-bit x86, Multiboot)
+```bash
+sbcl --script mvm/build-i386-repl.lisp    # Serial REPL
+sbcl --script mvm/build-i386-ssh.lisp     # SSH (NE2000 ISA NIC)
+```
+
+QEMU launch (REPL):
+```bash
+qemu-system-i386 -kernel /tmp/modus64-i386.bin -m 256 \
+  -display none -serial stdio -no-reboot
+```
+
+QEMU launch (SSH):
+```bash
+qemu-system-i386 -m 256 -nographic -no-reboot \
+  -kernel /tmp/modus64-i386-ssh.bin \
+  -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
+  -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 ```
 
 ### Pi Zero 2 W (real hardware, DWC2 USB gadget, CDC-ECM)

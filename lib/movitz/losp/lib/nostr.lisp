@@ -1,1 +1,0 @@
-../../../../modus/src/net/nostr.lisp

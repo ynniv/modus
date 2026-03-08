@@ -20,18 +20,3 @@ LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
-----------------------------------------------------------------------
-
-This project includes the following third-party components, each under
-a BSD 3-clause license. See the COPYING file in each directory for the
-full license text.
-
-Movitz (lib/movitz/)
-  Copyright (C) 1999, 2003-2004
-  Department of Computer Science, University of Tromsoe, Norway
-  Author: Frode Vatvedt Fjeld <frodef@acm.org>
-
-binary-types (lib/binary-types/)
-  Copyright (C) 1999
-  Department of Computer Science, University of Tromsoe, Norway
-  Author: Frode Vatvedt Fjeld <frodef@acm.org>

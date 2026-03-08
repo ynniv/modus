@@ -23,7 +23,4 @@ temp/
 nohup.out
 
 # Logs
-modus/log/
-
-# Movitz build state
-lib/movitz/bootblock-id.txt
+*.log

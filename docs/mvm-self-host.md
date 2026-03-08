@@ -27,7 +27,6 @@ The kernel is a flat Multiboot ELF loaded at 0x100000.
 ### Build command
 
 ```bash
-cd lib/modus64
 sbcl --control-stack-size 64 \
      --eval '(push (truename ".") asdf:*central-registry*)' \
      --eval '(asdf:load-system :modus64)' \
@@ -63,7 +62,7 @@ pmemsave(val=0x08000000, size=image_size, filename="gen1.elf")
 ### Build script
 
 ```bash
-./modus/scripts/run-x64-gen1-repl.sh --rebuild
+./scripts/run-x64-gen1-repl.sh --rebuild
 ```
 
 This script:

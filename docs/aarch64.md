@@ -6,7 +6,7 @@ Modus64 runs on AArch64 QEMU `virt` with E1000 networking and an SSH server. The
 
 ```bash
 # Build and run
-./modus/scripts/run-aarch64-ssh.sh
+./scripts/run-aarch64-ssh.sh
 
 # Connect
 ssh -p 2222 -o StrictHostKeyChecking=no test@localhost
@@ -25,7 +25,7 @@ modus64> (fact 10)
 
 ### Shared networking code
 
-The networking/crypto/SSH code lives in `lib/modus64/net/` and is architecture-independent — pure `mem-ref` MMIO operations and fixnum arithmetic. Each architecture provides a thin adapter (~200 lines) defining PCI access, I/O delays, and memory addresses.
+The networking/crypto/SSH code lives in `net/` and is architecture-independent — pure `mem-ref` MMIO operations and fixnum arithmetic. Each architecture provides a thin adapter (~200 lines) defining PCI access, I/O delays, and memory addresses.
 
 ```
 net/
