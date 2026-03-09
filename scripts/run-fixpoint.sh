@@ -15,7 +15,7 @@ set -e
 cd "$(dirname "$0")/.."
 
 TIMEOUT=${FIXPOINT_TIMEOUT:-90}
-IMAGE_SIZE=2621504
+IMAGE_SIZE=3145792
 GEN0=/tmp/fixpoint-gen0.elf
 GEN1=/tmp/fixpoint-gen1.bin
 GEN2=/tmp/fixpoint-gen2.bin

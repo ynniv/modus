@@ -198,7 +198,7 @@
 ;;; ============================================================
 
 (defstruct i386-buffer
-  (bytes (make-array 524288))           ; fixed-size, position tracks fill
+  (bytes (make-array 1572864))          ; 1.5MB, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)     ; list of (byte-position label-id fixup-type)
   (position 0))

@@ -1,5 +1,10 @@
 ;;;; e1000.lisp - Intel E1000 NIC driver (shared, arch-independent)
 ;;;;
+;;;; Internal functions use e1000-hw-* names to allow driver dispatch.
+;;;; Default wrappers at the end provide the e1000-* API.
+;;;; For dual-driver builds, a dispatch layer loaded after this file
+;;;; overrides the wrappers via last-defun-wins.
+;;;;
 ;;;; Requires arch adapter defining:
 ;;;;   pci-config-read, pci-config-write, io-delay
 ;;;;   e1000-state-base, e1000-rx-desc-base, e1000-rx-buf-base
@@ -183,7 +188,7 @@
     1))
 
 ;; Send raw ethernet frame from byte array
-(defun e1000-send (buf len)
+(defun e1000-hw-send (buf len)
   (let ((state (e1000-state-base))
         (tx-desc (e1000-tx-desc-base))
         (tx-buf (e1000-tx-buf-base)))
@@ -212,7 +217,7 @@
             done))))))
 
 ;; Check for received packet. Returns length or 0 if none.
-(defun e1000-receive ()
+(defun e1000-hw-receive ()
   (let ((state (e1000-state-base)))
     (let ((rx-cur (mem-ref (+ state #x10) :u32)))
       ;; Check if E1000 has advanced RDH past our cursor
@@ -228,14 +233,14 @@
               pkt-len))))))
 
 ;; Get pointer to current RX buffer data
-(defun e1000-rx-buf ()
+(defun e1000-hw-rx-buf ()
   (let ((rx-cur (mem-ref (+ (e1000-state-base) #x10) :u32)))
     ;; Return previous cursor's buffer since we already advanced
     (let ((prev (mod (+ rx-cur 127) 128)))
       (+ (e1000-rx-buf-base) (* prev 2048)))))
 
 ;; Find E1000 and initialize. Main entry point.
-(defun e1000-probe ()
+(defun e1000-hw-probe ()
   (let ((mmio (pci-find-e1000)))
     (if (zerop mmio)
         (progn
@@ -251,3 +256,9 @@
           (print-hex32 (logand mmio #xFFFFFFFF))
           (write-byte 10)
           (e1000-init)))))
+
+;;; Default API wrappers — override these via last-defun-wins for other drivers
+(defun e1000-send (buf len) (e1000-hw-send buf len))
+(defun e1000-receive () (e1000-hw-receive))
+(defun e1000-rx-buf () (e1000-hw-rx-buf))
+(defun e1000-probe () (e1000-hw-probe))

@@ -20,14 +20,15 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$(dirname "$0")/.."
 
-TIMEOUT=${FIXPOINT_TIMEOUT:-90}
+TIMEOUT=${FIXPOINT_TIMEOUT:-240}
 ARCHS=("$@")
 
 # Validate arguments
 if [[ ${#ARCHS[@]} -lt 2 ]]; then
   echo "Usage: $0 arch1 arch2 [arch3 ...]"
-  echo "  Architectures: x64, aarch64"
+  echo "  Architectures: x64, aarch64, i386"
   echo "  First must be x64. Last boots as SSH server."
+  echo "  All three architectures can cross-compile to any other."
   exit 1
 fi
 
@@ -36,16 +37,22 @@ if [[ "${ARCHS[0]}" != "x64" ]]; then
   exit 1
 fi
 
-for arch in "${ARCHS[@]}"; do
-  if [[ "$arch" != "x64" && "$arch" != "aarch64" ]]; then
-    echo "Error: unknown architecture '$arch' (valid: x64, aarch64)"
+for ((idx = 0; idx < ${#ARCHS[@]}; idx++)); do
+  arch="${ARCHS[$idx]}"
+  if [[ "$arch" != "x64" && "$arch" != "aarch64" && "$arch" != "i386" ]]; then
+    echo "Error: unknown architecture '$arch' (valid: x64, aarch64, i386)"
     exit 1
   fi
+  # i386 can self-host, cross-compile to x64, and cross-compile to aarch64.
 done
 
 # Architecture helpers
 arch_id() {
-  if [[ "$1" == "x64" ]]; then echo 0; else echo 1; fi
+  case "$1" in
+    x64)     echo 0 ;;
+    aarch64) echo 1 ;;
+    i386)    echo 2 ;;
+  esac
 }
 
 NO_THP="$SCRIPT_DIR/no-thp-exec"
@@ -53,38 +60,41 @@ NO_THP="$SCRIPT_DIR/no-thp-exec"
 run_qemu() {
   # Runs QEMU directly with no-thp-exec wrapper to avoid THP compaction stalls
   local arch=$1 kernel=$2; shift 2
-  if [[ "$arch" == "x64" ]]; then
-    "$NO_THP" qemu-system-x86_64 -kernel "$kernel" -m 512 -nographic -no-reboot "$@"
-  else
-    "$NO_THP" qemu-system-aarch64 -M virt -cpu cortex-a53 -m 512 -kernel "$kernel" -nographic "$@"
-  fi
+  case "$arch" in
+    x64)
+      "$NO_THP" qemu-system-x86_64 -kernel "$kernel" -m 512 -nographic -no-reboot "$@" ;;
+    aarch64)
+      "$NO_THP" qemu-system-aarch64 -M virt -cpu cortex-a53 -m 512 -kernel "$kernel" -nographic "$@" ;;
+    i386)
+      "$NO_THP" qemu-system-i386 -kernel "$kernel" -m 256 -nographic -no-reboot "$@" ;;
+  esac
 }
 
 extract_pa() {
   # Physical address where generated image is written in QEMU memory
-  if [[ "$1" == "x64" ]]; then
-    echo 134217728    # 0x08000000
-  else
-    echo 1207959552   # 0x48000000 (VA 0x08000000 + 0x40000000 MMU offset)
-  fi
+  case "$1" in
+    x64)     echo 134217728  ;;  # 0x08000000
+    aarch64) echo 1207959552 ;;  # 0x48000000 (VA 0x08000000 + 0x40000000 MMU offset)
+    i386)    echo 134217728  ;;  # 0x08000000 (same as x64)
+  esac
 }
 
 metadata_file_offset() {
   # File offset of MVMT metadata within the image
-  if [[ "$1" == "x64" ]]; then
-    echo 2097152      # 0x200000
-  else
-    echo 2621440      # 0x280000
-  fi
+  case "$1" in
+    x64)     echo 2621440  ;;  # 0x280000
+    aarch64) echo 3145728  ;;  # 0x300000
+    i386)    echo 2621440  ;;  # 0x280000 (same layout as x64)
+  esac
 }
 
 image_extract_size() {
   # Total image size to extract via pmemsave
-  if [[ "$1" == "x64" ]]; then
-    echo 2097216      # 0x200000 + 64 (metadata)
-  else
-    echo 2621504      # 0x280000 + 64 (metadata)
-  fi
+  case "$1" in
+    x64)     echo 2621504  ;;  # 0x280000 + 64 (metadata)
+    aarch64) echo 3145792  ;;  # 0x300000 + 64 (metadata)
+    i386)    echo 2621504  ;;  # 0x280000 + 64 (same as x64)
+  esac
 }
 
 patch_u32_le() {
@@ -217,9 +227,19 @@ echo "=== Booting Gen$LAST ($FINAL_ARCH) as SSH server ==="
 MD_OFF=$(metadata_file_offset "$FINAL_ARCH")
 patch_u32_le "$GEN" $((MD_OFF + 56)) 1
 
-# Launch QEMU with E1000 networking and SSH port forwarding
+# Launch QEMU with networking and SSH port forwarding
 echo ""
 echo "SSH available at: ssh -p 2222 test@localhost"
 echo "Press Ctrl-C to stop."
 echo ""
-run_qemu "$FINAL_ARCH" "$GEN" -device 'e1000,netdev=net0,romfile=,rombar=0' -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+if [[ "$FINAL_ARCH" == "i386" ]]; then
+  # i386 uses NE2000 ISA NIC
+  run_qemu "$FINAL_ARCH" "$GEN" \
+    -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
+    -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+else
+  # x64 and AArch64 use E1000 PCI NIC
+  run_qemu "$FINAL_ARCH" "$GEN" \
+    -device 'e1000,netdev=net0,romfile=,rombar=0' \
+    -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+fi

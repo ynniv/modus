@@ -57,7 +57,14 @@
          (entry-addr (+ load-addr 32)))  ; boot32 starts right after header
     (mvm-emit-u32 buf magic)
     (mvm-emit-u32 buf flags)
-    (mvm-emit-u32 buf (logand #xFFFFFFFF (- (+ magic flags))))
+    ;; Checksum: -(magic + flags) mod 2^32
+    ;; Emit as bytes to avoid i386 30-bit fixnum overflow.
+    ;; For magic=#x1BADB002, flags=#x10003: checksum = #xE4514FFB
+    (let ((neg-sum (- (+ magic flags))))
+      (mvm-emit-byte buf (logand neg-sum 255))
+      (mvm-emit-byte buf (logand (ash neg-sum -8) 255))
+      (mvm-emit-byte buf (logand (ash neg-sum -16) 255))
+      (mvm-emit-byte buf (logand (ash neg-sum -24) 255)))
     ;; Address fields
     (mvm-emit-u32 buf load-addr)     ; header_addr
     (mvm-emit-u32 buf load-addr)     ; load_addr
@@ -156,7 +163,9 @@
 
     ;; Enable long mode (IA32_EFER.LME = bit 8)
     (mvm-emit-byte buf #xB9)          ; mov ecx, 0xC0000080 (IA32_EFER)
-    (mvm-emit-u32 buf #xC0000080)
+    ;; Emit as bytes (0xC0000080 overflows i386 30-bit fixnum)
+    (mvm-emit-byte buf #x80) (mvm-emit-byte buf #x00)
+    (mvm-emit-byte buf #x00) (mvm-emit-byte buf #xC0)
     (mvm-emit-byte buf #x0F)          ; rdmsr
     (mvm-emit-byte buf #x32)
     (mvm-emit-byte buf #x0D)          ; or eax, 0x100
@@ -169,7 +178,9 @@
     (mvm-emit-byte buf #x20)
     (mvm-emit-byte buf #xC0)
     (mvm-emit-byte buf #x0D)          ; or eax, 0x80000000
-    (mvm-emit-u32 buf #x80000000)
+    ;; Emit as bytes (0x80000000 overflows i386 30-bit fixnum)
+    (mvm-emit-byte buf #x00) (mvm-emit-byte buf #x00)
+    (mvm-emit-byte buf #x00) (mvm-emit-byte buf #x80)
     (mvm-emit-byte buf #x0F)          ; mov cr0, eax
     (mvm-emit-byte buf #x22)
     (mvm-emit-byte buf #xC0)
@@ -290,7 +301,9 @@
     ;; mov r15, #xDEAD0001
     (mvm-emit-byte buf #x49)          ; REX.WB (W=64-bit, B=R15 extended)
     (mvm-emit-byte buf #xBF)          ; mov r15, imm64
-    (mvm-emit-u32 buf #xDEAD0001)
+    ;; Emit as bytes (0xDEAD0001 overflows i386 30-bit fixnum)
+    (mvm-emit-byte buf #x01) (mvm-emit-byte buf #x00)
+    (mvm-emit-byte buf #xAD) (mvm-emit-byte buf #xDE)
     (mvm-emit-u32 buf 0)              ; high 32 bits
 
     ;; R12 = allocation pointer (heap starts at 256MB)

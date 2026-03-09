@@ -16,6 +16,11 @@
     (when (zerop s) (setq s 42))
     s))
 
+;; PCI stubs — i386 uses ISA NIC (NE2000), no PCI bus
+(defun pci-config-read (bus dev fn reg) 0)
+(defun pci-config-write (bus dev fn reg val) nil)
+(defun pci-assign-bars () nil)
+
 ;; State base addresses for i386
 ;; Must be below 8MB (cons base) and above kernel+stack (4MB)
 (defun e1000-state-base () #x200000)     ; 2MB - shared state (crypto K, MAC, IP, etc.)

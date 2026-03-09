@@ -188,11 +188,10 @@
                     (immhi (logand (ash byte-off -2) #x7FFFF))
                     (word (aref code index))
                     (rd (logand word #x1F)))
+               ;; Use nested 2-arg logior (bare-metal multi-arg may clobber)
                (setf (aref code index)
-                     (logior (ash immlo 29)
-                             (ash #b10000 24)
-                             (ash immhi 5)
-                             rd)))))))))))
+                     (logior (logior (ash immlo 29) (ash #b10000 24))
+                             (logior (ash immhi 5) rd))))))))))))
 
 (defun a64-buffer-to-bytes (buf)
   "Convert the instruction buffer to a byte vector (little-endian)."
@@ -229,120 +228,108 @@
 ;;; --- ADD (shifted register) ---
 ;;; sf|0|0|01011|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)
 
-(defun a64-add-reg (buf rd rn rm &key (shift :lsl) (amount 0))
-  "ADD Xd, Xn, Xm{, shift #amount}  (64-bit)"
-  (let ((sh (ecase shift (:lsl 0) (:lsr 1) (:asr 2))))
-    (a64-emit buf (logior (ash 1 31)        ; sf=1 (64-bit)
-                          (ash 0 30)        ; op=0 (ADD)
-                          (ash 0 29)        ; S=0
-                          (ash #b01011 24)
-                          (ash sh 22)
-                          (ash 0 21)        ; must be 0
-                          (ash rm 16)
-                          (ash amount 10)
-                          (ash rn 5)
-                          rd))))
+(defun a64-add-reg (buf rd rn rm shift amount)
+  "ADD Xd, Xn, Xm{, shift #amount}  (64-bit)  shift: 0=LSL 1=LSR 2=ASR"
+  (a64-emit buf (logior (ash 1 31)        ; sf=1 (64-bit)
+                        (ash 0 30)        ; op=0 (ADD)
+                        (ash 0 29)        ; S=0
+                        (ash #b01011 24)
+                        (ash shift 22)
+                        (ash 0 21)        ; must be 0
+                        (ash rm 16)
+                        (ash amount 10)
+                        (ash rn 5)
+                        rd)))
 
-(defun a64-adds-reg (buf rd rn rm &key (shift :lsl) (amount 0))
-  "ADDS Xd, Xn, Xm{, shift #amount}  (64-bit, sets flags)"
-  (let ((sh (ecase shift (:lsl 0) (:lsr 1) (:asr 2))))
-    (a64-emit buf (logior (ash 1 31)        ; sf=1
-                          (ash 0 30)        ; op=0
-                          (ash 1 29)        ; S=1
-                          (ash #b01011 24)
-                          (ash sh 22)
-                          (ash 0 21)
-                          (ash rm 16)
-                          (ash amount 10)
-                          (ash rn 5)
-                          rd))))
+(defun a64-adds-reg (buf rd rn rm shift amount)
+  "ADDS Xd, Xn, Xm{, shift #amount}  (64-bit, sets flags)  shift: 0=LSL 1=LSR 2=ASR"
+  (a64-emit buf (logior (ash 1 31)        ; sf=1
+                        (ash 0 30)        ; op=0
+                        (ash 1 29)        ; S=1
+                        (ash #b01011 24)
+                        (ash shift 22)
+                        (ash 0 21)
+                        (ash rm 16)
+                        (ash amount 10)
+                        (ash rn 5)
+                        rd)))
 
 ;;; --- SUB (shifted register) ---
 ;;; sf|1|0|01011|shift(2)|0|Rm(5)|imm6(6)|Rn(5)|Rd(5)
 
-(defun a64-sub-reg (buf rd rn rm &key (shift :lsl) (amount 0))
-  "SUB Xd, Xn, Xm{, shift #amount}  (64-bit)"
-  (let ((sh (ecase shift (:lsl 0) (:lsr 1) (:asr 2))))
-    (a64-emit buf (logior (ash 1 31)        ; sf=1
-                          (ash 1 30)        ; op=1 (SUB)
-                          (ash 0 29)        ; S=0
-                          (ash #b01011 24)
-                          (ash sh 22)
-                          (ash 0 21)
-                          (ash rm 16)
-                          (ash amount 10)
-                          (ash rn 5)
-                          rd))))
+(defun a64-sub-reg (buf rd rn rm shift amount)
+  "SUB Xd, Xn, Xm{, shift #amount}  (64-bit)  shift: 0=LSL 1=LSR 2=ASR"
+  (a64-emit buf (logior (ash 1 31)        ; sf=1
+                        (ash 1 30)        ; op=1 (SUB)
+                        (ash 0 29)        ; S=0
+                        (ash #b01011 24)
+                        (ash shift 22)
+                        (ash 0 21)
+                        (ash rm 16)
+                        (ash amount 10)
+                        (ash rn 5)
+                        rd)))
 
-(defun a64-subs-reg (buf rd rn rm &key (shift :lsl) (amount 0))
-  "SUBS Xd, Xn, Xm{, shift #amount}  (64-bit, sets flags = CMP when Rd=XZR)"
-  (let ((sh (ecase shift (:lsl 0) (:lsr 1) (:asr 2))))
-    (a64-emit buf (logior (ash 1 31)
-                          (ash 1 30)        ; SUB
-                          (ash 1 29)        ; S=1
-                          (ash #b01011 24)
-                          (ash sh 22)
-                          (ash 0 21)
-                          (ash rm 16)
-                          (ash amount 10)
-                          (ash rn 5)
-                          rd))))
+(defun a64-subs-reg (buf rd rn rm shift amount)
+  "SUBS Xd, Xn, Xm{, shift #amount}  (64-bit, sets flags)  shift: 0=LSL 1=LSR 2=ASR"
+  (a64-emit buf (logior (ash 1 31)
+                        (ash 1 30)        ; SUB
+                        (ash 1 29)        ; S=1
+                        (ash #b01011 24)
+                        (ash shift 22)
+                        (ash 0 21)
+                        (ash rm 16)
+                        (ash amount 10)
+                        (ash rn 5)
+                        rd)))
 
 (defun a64-cmp-reg (buf rn rm)
   "CMP Xn, Xm  →  SUBS XZR, Xn, Xm"
-  (a64-subs-reg buf +a64-xzr+ rn rm))
+  (a64-subs-reg buf +a64-xzr+ rn rm 0 0))
 
 ;;; --- ADD/SUB (immediate) ---
 ;;; sf|op|S|100010|sh|imm12(12)|Rn(5)|Rd(5)
 ;;; sh=0: imm12 not shifted. sh=1: imm12 << 12.
 
-(defun a64-add-imm (buf rd rn imm12 &key (shift 0))
-  "ADD Xd, Xn, #imm12{, LSL #shift}  (shift: 0 or 12)"
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31)          ; sf=1
-                          (ash 0 30)          ; op=0 (ADD)
-                          (ash 0 29)          ; S=0
-                          (ash #b100010 23)
-                          (ash sh 22)
-                          (ash (logand imm12 #xFFF) 10)
-                          (ash rn 5)
-                          rd))))
+(defun a64-add-imm (buf rd rn imm12)
+  "ADD Xd, Xn, #imm12"
+  (a64-emit buf (logior (ash 1 31)          ; sf=1
+                        (ash 0 30)          ; op=0 (ADD)
+                        (ash 0 29)          ; S=0
+                        (ash #b100010 23)
+                        (ash (logand imm12 #xFFF) 10)
+                        (ash rn 5)
+                        rd)))
 
-(defun a64-adds-imm (buf rd rn imm12 &key (shift 0))
+(defun a64-adds-imm (buf rd rn imm12)
   "ADDS Xd, Xn, #imm12  (sets flags)"
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31)
-                          (ash 0 30)
-                          (ash 1 29)          ; S=1
-                          (ash #b100010 23)
-                          (ash sh 22)
-                          (ash (logand imm12 #xFFF) 10)
-                          (ash rn 5)
-                          rd))))
+  (a64-emit buf (logior (ash 1 31)
+                        (ash 0 30)
+                        (ash 1 29)          ; S=1
+                        (ash #b100010 23)
+                        (ash (logand imm12 #xFFF) 10)
+                        (ash rn 5)
+                        rd)))
 
-(defun a64-sub-imm (buf rd rn imm12 &key (shift 0))
+(defun a64-sub-imm (buf rd rn imm12)
   "SUB Xd, Xn, #imm12"
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31)
-                          (ash 1 30)          ; SUB
-                          (ash 0 29)
-                          (ash #b100010 23)
-                          (ash sh 22)
-                          (ash (logand imm12 #xFFF) 10)
-                          (ash rn 5)
-                          rd))))
+  (a64-emit buf (logior (ash 1 31)
+                        (ash 1 30)          ; SUB
+                        (ash 0 29)
+                        (ash #b100010 23)
+                        (ash (logand imm12 #xFFF) 10)
+                        (ash rn 5)
+                        rd)))
 
-(defun a64-subs-imm (buf rd rn imm12 &key (shift 0))
+(defun a64-subs-imm (buf rd rn imm12)
   "SUBS Xd, Xn, #imm12  (sets flags)"
-  (let ((sh (if (= shift 12) 1 0)))
-    (a64-emit buf (logior (ash 1 31)
-                          (ash 1 30)
-                          (ash 1 29)          ; S=1
-                          (ash #b100010 23)
-                          (ash sh 22)
-                          (ash (logand imm12 #xFFF) 10)
-                          (ash rn 5)
-                          rd))))
+  (a64-emit buf (logior (ash 1 31)
+                        (ash 1 30)
+                        (ash 1 29)          ; S=1
+                        (ash #b100010 23)
+                        (ash (logand imm12 #xFFF) 10)
+                        (ash rn 5)
+                        rd)))
 
 (defun a64-cmp-imm (buf rn imm12)
   "CMP Xn, #imm12  →  SUBS XZR, Xn, #imm12"
@@ -518,13 +505,13 @@
 
 (defun a64-neg (buf rd rm)
   "NEG Xd, Xm  →  SUB Xd, XZR, Xm"
-  (a64-sub-reg buf rd +a64-xzr+ rm))
+  (a64-sub-reg buf rd +a64-xzr+ rm 0 0))
 
 ;;; --- Move wide (MOVZ / MOVK) ---
 ;;; sf|opc(2)|100101|hw(2)|imm16(16)|Rd(5)
 ;;; MOVZ: opc=10, MOVK: opc=11
 
-(defun a64-movz (buf rd imm16 &key (hw 0))
+(defun a64-movz (buf rd imm16 hw)
   "MOVZ Xd, #imm16{, LSL #(hw*16)}"
   (a64-emit buf (logior (ash 1 31)            ; sf=1
                         (ash #b10 29)         ; MOVZ
@@ -533,7 +520,7 @@
                         (ash (logand imm16 #xFFFF) 5)
                         rd)))
 
-(defun a64-movk (buf rd imm16 &key (hw 0))
+(defun a64-movk (buf rd imm16 hw)
   "MOVK Xd, #imm16{, LSL #(hw*16)}"
   (a64-emit buf (logior (ash 1 31)
                         (ash #b11 29)         ; MOVK
@@ -542,7 +529,7 @@
                         (ash (logand imm16 #xFFFF) 5)
                         rd)))
 
-(defun a64-movn (buf rd imm16 &key (hw 0))
+(defun a64-movn (buf rd imm16 hw)
   "MOVN Xd, #imm16{, LSL #(hw*16)}  (move wide NOT)"
   (a64-emit buf (logior (ash 1 31)
                         (ash #b00 29)         ; MOVN
@@ -563,11 +550,11 @@
     (cond
       ;; Zero
       ((zerop val)
-       (a64-movz buf rd 0))
+       (a64-movz buf rd 0 0))
       ;; Single 16-bit chunk
       ((= (length nonzero) 1)
        (let ((c (first nonzero)))
-         (a64-movz buf rd (cdr c) :hw (car c))))
+         (a64-movz buf rd (cdr c) (car c))))
       ;; Check if all-ones complement is cheaper (MOVN)
       ((let* ((inv (logxor val #xFFFFFFFFFFFFFFFF))
               (ihw0 (logand inv #xFFFF))
@@ -579,19 +566,15 @@
               (inv-nonzero (remove-if (lambda (c) (zerop (cdr c))) ichunks)))
          (when (= (length inv-nonzero) 1)
            (let ((c (first inv-nonzero)))
-             ;; MOVN inverts, then MOVK patches nonzero inverted chunks
-             ;; Actually for a single inverted chunk: MOVN sets ~(imm16 << shift)
-             ;; which gives us all-ones except that chunk.
-             ;; But we want val = ~inv, so MOVN Xd, #inv_chunk, hw=chunk_hw
-             (a64-movn buf rd (cdr c) :hw (car c))
+             (a64-movn buf rd (cdr c) (car c))
              t))))
       ;; General case: MOVZ first non-zero, then MOVK the rest
       (t
        (let ((first-chunk (first nonzero))
              (rest-chunks (rest nonzero)))
-         (a64-movz buf rd (cdr first-chunk) :hw (car first-chunk))
+         (a64-movz buf rd (cdr first-chunk) (car first-chunk))
          (dolist (c rest-chunks)
-           (a64-movk buf rd (cdr c) :hw (car c))))))))
+           (a64-movk buf rd (cdr c) (car c))))))))
 
 ;;; --- Load/Store (unsigned offset) ---
 ;;; size(2)|111|V|01|opc(2)|imm12(12)|Rn(5)|Rt(5)
@@ -802,14 +785,14 @@
 ;;; DMB: 11010101000000110011|CRm(4)|1|01|11111
 ;;; CRm: #xB = ISH (inner shareable), #xF = SY (full system)
 
-(defun a64-dmb (buf &key (option #xB))
-  "DMB option  (data memory barrier, default ISH)"
+(defun a64-dmb (buf option)
+  "DMB option  (data memory barrier)"
   (a64-emit buf (logior #xD503301F
                         (ash #b101 5)
                         (ash (logand option #xF) 8))))
 
-(defun a64-dsb (buf &key (option #xB))
-  "DSB option  (data synchronization barrier, default ISH)"
+(defun a64-dsb (buf option)
+  "DSB option  (data synchronization barrier)"
   (a64-emit buf (logior #xD503301F
                         (ash #b100 5)
                         (ash (logand option #xF) 8))))
@@ -1160,7 +1143,7 @@
                 ;; DSB SY barrier: force all previous memory accesses to complete
                 ;; Required on AArch64 with MMU off (Normal Non-cacheable) to
                 ;; prevent write buffer reordering between peripheral pages
-                (a64-dsb buf :option #xF))  ;; SY = full system
+                (a64-dsb buf #xF))  ;; SY = full system
                ((= code #x0303)
                 ;; Jump to address: untag V0 (ASR 1), BR x0
                 (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)
@@ -1212,7 +1195,7 @@
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-add-reg buf pd pa pb)
+             (a64-add-reg buf pd pa pb 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1222,7 +1205,7 @@
                   (pa (ensure-src (vr 1) +a64-x16+))
                   (pb (ensure-src (vr 2) +a64-x17+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-sub-reg buf pd pa pb)
+             (a64-sub-reg buf pd pa pb 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1268,7 +1251,7 @@
              ;; MUL x16, x16, Vb  (quotient * divisor)
              (a64-mul buf +a64-x16+ +a64-x16+ pb)
              ;; SUB Vd, Va, x16  (remainder = dividend - q*divisor)
-             (a64-sub-reg buf pd pa +a64-x16+)
+             (a64-sub-reg buf pd pa +a64-x16+ 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1580,7 +1563,7 @@
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
              ;; Load mask into x17 scratch
-             (a64-movz buf +a64-x17+ #xF)
+             (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
              (a64-cmp-imm buf +a64-x16+ 1)
              (a64-cset buf pd +cc-eq+)
@@ -1593,7 +1576,7 @@
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x17+)))
-             (a64-movz buf +a64-x17+ #xF)
+             (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf +a64-x16+ ps +a64-x17+)
              (a64-cmp-imm buf +a64-x16+ 1)
              (a64-cset buf pd +cc-ne+)
@@ -1614,8 +1597,8 @@
                   (total-size (logand (+ 8 data-bytes 15) (lognot 15)))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Build header: (count << 16) | subtag
-             (a64-movz buf +a64-x16+ subtag :hw 0)
-             (a64-movk buf +a64-x16+ count :hw 1)
+             (a64-movz buf +a64-x16+ subtag 0)
+             (a64-movk buf +a64-x16+ count 1)
              ;; Store header at alloc pointer
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
              ;; Result = alloc pointer + 8 (skip header) + object tag (2)
@@ -1625,7 +1608,7 @@
                  (a64-add-imm buf +a64-x24+ +a64-x24+ total-size)
                  (progn
                    (a64-load-imm64 buf +a64-x17+ total-size)
-                   (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+)))
+                   (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1652,7 +1635,7 @@
                        (a64-ldur buf pd pobj offset)
                        (progn
                          (a64-load-imm64 buf +a64-x17+ offset)
-                         (a64-add-reg buf +a64-x17+ pobj +a64-x17+)
+                         (a64-add-reg buf +a64-x17+ pobj +a64-x17+ 0 0)
                          (a64-ldur buf pd +a64-x17+ 0)))))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -1678,7 +1661,7 @@
                        (a64-stur buf ps pobj offset)
                        (progn
                          (a64-load-imm64 buf +a64-x16+ offset)
-                         (a64-add-reg buf +a64-x16+ pobj +a64-x16+)
+                         (a64-add-reg buf +a64-x16+ pobj +a64-x16+ 0 0)
                          (a64-stur buf ps +a64-x16+ 0)))))))
 
           ;; ---- OBJ-TAG Vd, Vs ----
@@ -1687,7 +1670,7 @@
            (let* ((vd (vr 0))
                   (ps (ensure-src (vr 1) +a64-x16+))
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
-             (a64-movz buf +a64-x17+ #xF)
+             (a64-movz buf +a64-x17+ #xF 0)
              (a64-and-reg buf pd ps +a64-x17+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -1700,7 +1683,7 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Header is at [Vs - tag(2) - 8]
              (a64-ldur buf +a64-x17+ ps -10)
-             (a64-movz buf +a64-x16+ #xFF)
+             (a64-movz buf +a64-x16+ #xFF 0)
              (a64-and-reg buf pd +a64-x17+ +a64-x16+)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -1716,7 +1699,7 @@
              ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
              ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
              (a64-sub-imm buf +a64-x16+ pobj 2)
-             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 2)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
              ;; Load from computed address
              (a64-ldur buf pd +a64-x16+ 0)
              (unless (a64-phys-reg vd)
@@ -1730,7 +1713,7 @@
              ;; Compute address: x16 = (Vobj - 2) + Vidx * 4
              ;; Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8
              (a64-sub-imm buf +a64-x16+ pobj 2)
-             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx :shift :lsl :amount 2)
+             (a64-add-reg buf +a64-x16+ +a64-x16+ pidx 0 2)
              ;; Reload value into x17 (safe — done with idx)
              (let ((ps (ensure-src (vr 2) +a64-x17+)))
                (a64-stur buf ps +a64-x16+ 0))))
@@ -1762,7 +1745,7 @@
                   (pd (or (a64-phys-reg vd) +a64-x16+)))
              ;; Build header: x16 = (count << 16) | #x32
              (a64-lsl-imm buf +a64-x16+ pcount 16)
-             (a64-movk buf +a64-x16+ #x32 :hw 0)
+             (a64-movk buf +a64-x16+ #x32 0)
              ;; Store header at alloc pointer
              (a64-stur buf +a64-x16+ +a64-x24+ 0)
              ;; Compute aligned allocation: floor((count+2)/2) * 16
@@ -1773,7 +1756,7 @@
              ;; Result = alloc_ptr + 10 (8 header + 2 tag)
              (a64-add-imm buf pd +a64-x24+ 10)
              ;; Bump alloc pointer
-             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+)
+             (a64-add-reg buf +a64-x24+ +a64-x24+ +a64-x17+ 0 0)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 
@@ -1796,7 +1779,7 @@
 
           ;; ---- FENCE ----
           ((= op +op-fence+)
-           (a64-dmb buf :option #xB))  ; DMB ISH
+           (a64-dmb buf #xB))  ; DMB ISH
 
           ;; ---- CALL target:imm32 ----
           ;; Target operand is the bytecode offset of the called function.
@@ -1858,7 +1841,7 @@
           ((= op +op-write-barrier+)
            ;; In a real implementation this would compute the card table
            ;; offset and store a dirty byte. For now, emit a memory barrier.
-           (a64-dmb buf :option #xB))
+           (a64-dmb buf #xB))
 
           ;; ---- SAVE-CTX Vd ----
           ;; Real setjmp semantics for actor context switching.
@@ -1892,7 +1875,7 @@
                (a64-ldr-unsigned buf +a64-x17+ +a64-x16+ #x30)
                (a64-str-unsigned buf +a64-x17+ pa #x70)  ; [pa+0x70] = obj-limit
                ;; 6. Initial save: return 0
-               (a64-movz buf +a64-x0+ 0)
+               (a64-movz buf +a64-x0+ 0 0)
                ;; 7. B to pop (skip resume entry)
                (let ((b-idx (a64-current-index buf)))
                  (a64-b buf 0)                           ; placeholder
@@ -1909,7 +1892,7 @@
                                    (ash immhi 5)
                                    +a64-x17+)))
                    ;; Resume path: return 2 (tagged fixnum 1)
-                   (a64-movz buf +a64-x0+ 2)
+                   (a64-movz buf +a64-x0+ 2 0)
                    ;; 9. Pop callee-saved (both paths converge here)
                    (let ((pop-idx (a64-current-index buf)))
                      ;; Patch B forward to here
@@ -1953,7 +1936,7 @@
                (a64-load-imm64 buf +a64-x0+ *aarch64-sched-lock-addr*)
                (a64-str-unsigned buf +a64-xzr+ +a64-x0+ 0) ; store 0 → unlock
                ;; Memory barrier — ensure lock release visible to other CPUs
-               (a64-dmb buf :option #xB)
+               (a64-dmb buf #xB)
                ;; Enable interrupts
                (a64-msr-daifclr buf #x3))
              ;; Jump to continuation (save-ctx's resume entry point)
@@ -2044,7 +2027,7 @@
                  (a64-ldr-unsigned buf pd +a64-x17+ offset)
                  (progn
                    (a64-load-imm64 buf +a64-x16+ offset)
-                   (a64-add-reg buf +a64-x17+ +a64-x17+ +a64-x16+)
+                   (a64-add-reg buf +a64-x17+ +a64-x17+ +a64-x16+ 0 0)
                    (a64-ldur buf pd +a64-x17+ 0)))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
@@ -2058,7 +2041,7 @@
                  (a64-str-unsigned buf ps +a64-x16+ offset)
                  (progn
                    (a64-load-imm64 buf +a64-x17+ offset)
-                   (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x17+)
+                   (a64-add-reg buf +a64-x16+ +a64-x16+ +a64-x17+ 0 0)
                    (a64-stur buf ps +a64-x16+ 0)))))
 
           ;; ---- FN-ADDR Vd, target:imm32 ----
@@ -2077,7 +2060,7 @@
                    (a64-emit buf (logior (ash #b10000 24) pd))
                    (a64-add-fixup buf idx label :adr))
                  ;; Unknown target: load 0
-                 (a64-movz buf pd 0))
+                 (a64-movz buf pd 0 0))
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
 

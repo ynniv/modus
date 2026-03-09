@@ -11,15 +11,18 @@
 #   Gen0(x64) → i386-A, Gen1(aarch64) → i386-B
 #   SHA256(i386-A) == SHA256(i386-B) proves i386 translator determinism
 #
+#   i386-A → AArch64-E
+#   SHA256(AArch64-E) == SHA256(Gen1) proves i386→AArch64 cross-compilation
+#
 # Usage: ./scripts/run-fixpoint-i386.sh
 
 set -e
 cd "$(dirname "$0")/.."
 
 TIMEOUT=${FIXPOINT_TIMEOUT:-120}
-X64_IMAGE_SIZE=2097216    # 0x200000 + 64
-A64_IMAGE_SIZE=2621504    # 0x280000 + 64
-I386_IMAGE_SIZE=2097216   # 0x200000 + 64 (same layout as x64)
+X64_IMAGE_SIZE=2621504    # 0x280000 + 64
+A64_IMAGE_SIZE=3145792    # 0x300000 + 64
+I386_IMAGE_SIZE=2621504   # 0x280000 + 64 (same layout as x64)
 GEN0=/tmp/fixpoint-gen0.elf
 GEN1=/tmp/fixpoint-gen1.bin
 GEN2=/tmp/fixpoint-gen2.bin
@@ -142,7 +145,7 @@ echo ""
 echo "Step 4: Gen0(x64) → i386-A"
 GEN0_I386=/tmp/fixpoint-gen0-i386.elf
 cp "$GEN0" "$GEN0_I386"
-patch_target "$GEN0_I386" $((0x200000)) 2
+patch_target "$GEN0_I386" $((0x280000)) 2
 extract_image "$GEN0_I386" "$I386_A" "i386-A" \
   "qemu-system-x86_64 -m 512 -no-reboot" \
   134217728 $I386_IMAGE_SIZE
@@ -152,10 +155,43 @@ echo ""
 echo "Step 5: Gen1(aarch64) → i386-B"
 GEN1_I386=/tmp/fixpoint-gen1-i386.bin
 cp "$GEN1" "$GEN1_I386"
-patch_target "$GEN1_I386" $((0x280000)) 2
+patch_target "$GEN1_I386" $((0x300000)) 2
 extract_image "$GEN1_I386" "$I386_B" "i386-B" \
   "qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -semihosting" \
   1207959552 $I386_IMAGE_SIZE
+echo ""
+
+# Step 6: i386-A → i386-C [i386 self-hosting: target=2]
+echo "Step 6: i386-A → i386-C (i386 self-hosting)"
+I386_C=/tmp/fixpoint-i386-self.bin
+I386_A_SELF=/tmp/fixpoint-i386a-self.bin
+cp "$I386_A" "$I386_A_SELF"
+patch_target "$I386_A_SELF" $((0x280000)) 2
+extract_image "$I386_A_SELF" "$I386_C" "i386-C" \
+  "qemu-system-i386 -m 256 -no-reboot" \
+  134217728 $I386_IMAGE_SIZE
+echo ""
+
+# Step 7: i386-A → x64-D [i386→x64 cross-compilation: target=0]
+echo "Step 7: i386-A → x64-D (i386→x64 cross-compilation)"
+X64_D=/tmp/fixpoint-x64-from-i386.bin
+I386_A_X64=/tmp/fixpoint-i386a-x64.bin
+cp "$I386_A" "$I386_A_X64"
+patch_target "$I386_A_X64" $((0x280000)) 0
+extract_image "$I386_A_X64" "$X64_D" "x64-D" \
+  "qemu-system-i386 -m 256 -no-reboot" \
+  134217728 $X64_IMAGE_SIZE
+echo ""
+
+# Step 8: i386-A → AArch64-E (i386→AArch64 cross-compilation: target=1)
+echo "Step 8: i386-A → AArch64-E (i386→AArch64 cross-compilation)"
+A64_E=/tmp/fixpoint-a64-from-i386.bin
+I386_A_A64=/tmp/fixpoint-i386a-a64.bin
+cp "$I386_A" "$I386_A_A64"
+patch_target "$I386_A_A64" $((0x280000)) 1
+extract_image "$I386_A_A64" "$A64_E" "AArch64-E" \
+  "qemu-system-i386 -m 256 -no-reboot" \
+  134217728 $A64_IMAGE_SIZE
 echo ""
 
 # Compare results
@@ -175,7 +211,7 @@ else
   exit 1
 fi
 
-# i386 translator determinism
+# i386 translator determinism (x64 vs aarch64 host)
 hash_i386a=$(sha256sum "$I386_A" | cut -d' ' -f1)
 hash_i386b=$(sha256sum "$I386_B" | cut -d' ' -f1)
 
@@ -189,5 +225,46 @@ else
   exit 1
 fi
 
+# i386 self-hosting fixpoint (i386 host produces same as x64 host)
+hash_i386c=$(sha256sum "$I386_C" | cut -d' ' -f1)
+
+if [ "$hash_i386a" = "$hash_i386c" ]; then
+  echo "PASS: SHA256(i386-A) == SHA256(i386-C)  [i386 self-hosting fixpoint]"
+  echo "  $hash_i386c"
+else
+  echo "FAIL: SHA256(i386-A) != SHA256(i386-C)  [i386 self-hosting]"
+  echo "  i386-A (from x64):  $hash_i386a"
+  echo "  i386-C (from i386): $hash_i386c"
+  exit 1
+fi
+
+# i386→x64 cross-compilation (i386 host produces same x64 image as aarch64 host)
+hash_x64d=$(sha256sum "$X64_D" | cut -d' ' -f1)
+hash_gen2=$(sha256sum "$GEN2" | cut -d' ' -f1)
+
+if [ "$hash_x64d" = "$hash_gen2" ]; then
+  echo "PASS: SHA256(x64-D) == SHA256(Gen2)  [i386→x64 cross-compilation fixpoint]"
+  echo "  $hash_x64d"
+else
+  echo "FAIL: SHA256(x64-D) != SHA256(Gen2)  [i386→x64 cross-compilation]"
+  echo "  x64-D (from i386): $hash_x64d"
+  echo "  Gen2 (from aarch64): $hash_gen2"
+  exit 1
+fi
+
+# i386→AArch64 cross-compilation (i386 host produces same AArch64 image as x64 host)
+hash_a64e=$(sha256sum "$A64_E" | cut -d' ' -f1)
+
+if [ "$hash_a64e" = "$hash1" ]; then
+  echo "PASS: SHA256(AArch64-E) == SHA256(Gen1)  [i386→AArch64 cross-compilation fixpoint]"
+  echo "  $hash_a64e"
+else
+  echo "FAIL: SHA256(AArch64-E) != SHA256(Gen1)  [i386→AArch64 cross-compilation]"
+  echo "  AArch64-E (from i386): $hash_a64e"
+  echo "  Gen1 (from x64):      $hash1"
+  exit 1
+fi
+
 echo ""
 echo "Cross-architecture fixpoint proven across x64, AArch64, and i386."
+echo "Including: i386 self-hosting + i386→x64 + i386→AArch64 cross-compilation."

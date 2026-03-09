@@ -8,28 +8,29 @@ A self-hosting 64-bit system with a portable virtual machine (MVM) targeting 9 C
 
 ### Platforms
 
-|                    | x86-64 QEMU | AArch64 QEMU virt | RPi 3B QEMU | Pi Zero 2 W |
-|--------------------|:-----------:|:-----------------:|:-----------:|:-----------:|
-| Serial REPL        | Y | Y | Y | Y |
-| E1000 networking   | Y | Y | - | - |
-| USB CDC networking | - | - | Y | Y |
-| SSH server         | Y | Y | Y | Y |
-| HTTP server/client | - | Y | - | Y |
-| Actors             | Y | Y | - | Y |
-| Actor isolation    | - | Y | - | - |
-| SMP (multi-core)   | Y | - | - | - |
-| Self-hosting       | Y | Y | - | - |
-| USB HID            | - | - | Y | - |
-| GPIO/SPI/I2C       | - | - | Y | - |
-| GPU framebuffer    | - | - | Y | Y |
-| UART bootloader    | - | - | - | Y |
-| Real hardware      | - | - | - | Y |
+|                    | x86-64 QEMU | AArch64 QEMU virt | RPi 3B QEMU | Pi Zero 2 W | i386 QEMU |
+|--------------------|:-----------:|:-----------------:|:-----------:|:-----------:|:---------:|
+| Serial REPL        | Y | Y | Y | Y | Y |
+| E1000 networking   | Y | Y | - | - | - |
+| NE2000 networking  | - | - | - | - | Y |
+| USB CDC networking | - | - | Y | Y | - |
+| SSH server         | Y | Y | Y | Y | Y |
+| HTTP server/client | - | Y | - | Y | - |
+| Actors             | Y | Y | - | Y | - |
+| Actor isolation    | - | Y | - | - | - |
+| SMP (multi-core)   | Y | - | - | - | - |
+| Self-hosting       | Y | Y | - | - | Y |
+| USB HID            | - | - | Y | - | - |
+| GPIO/SPI/I2C       | - | - | Y | - | - |
+| GPU framebuffer    | - | - | Y | Y | - |
+| UART bootloader    | - | - | - | Y | - |
+| Real hardware      | - | - | - | Y | - |
 
-NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB — host mode (CDC Ethernet) on QEMU raspi3b, device/gadget mode (CDC-ECM) on Pi Zero 2 W.
+NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB — host mode (CDC Ethernet) on QEMU raspi3b, device/gadget mode (CDC-ECM) on Pi Zero 2 W. i386 uses NE2000 ISA NIC (port I/O).
 
 ### MVM architectures
 
-All 9 architectures compile and produce correct output (factorial 3628800) in QEMU. x86-64 and AArch64 have full runtime support; i386 has REPL support.
+All 9 architectures compile and produce correct output (factorial 3628800) in QEMU. x86-64 and AArch64 have full runtime support; i386 has REPL, SSH, and self-hosting.
 
 | Architecture | Bits | Endian | Translator | Boot | QEMU target | Status |
 |-------------|:----:|:------:|:----------:|:----:|-------------|--------|
@@ -39,7 +40,7 @@ All 9 architectures compile and produce correct output (factorial 3628800) in QE
 | RISC-V 64   | 64 | little | translate-riscv.lisp  | boot-riscv.lisp  | `qemu-system-riscv64`   | Serial output |
 | PPC64       | 64 | big    | translate-ppc.lisp    | boot-ppc64.lisp  | `qemu-system-ppc64`     | Serial output |
 | PPC32       | 32 | big    | translate-ppc.lisp    | boot-ppc32.lisp  | `qemu-system-ppc`       | Serial output |
-| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | REPL |
+| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Full (REPL, SSH, self-hosting) |
 | ARM32 (v5)  | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M versatilepb` | Serial output |
 | ARMv7       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M virt` | Serial output |
 | 68k         | 32 | big    | translate-68k.lisp    | boot-68k.lisp    | `qemu-system-m68k -M an5206` | Serial output |
@@ -87,7 +88,10 @@ Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
 ```bash
 ./scripts/run-i386-repl.sh     # 32-bit x86 REPL on QEMU
+./scripts/run-i386-ssh.sh      # i386 SSH over NE2000 NIC (port 2222)
 ```
+
+Connect to i386 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
 ### Raspberry Pi (QEMU raspi3b)
 
@@ -138,10 +142,15 @@ net/                   Shared networking/crypto/SSH (arch-independent, ~8000 lin
   hid.lisp             USB HID keyboard/mouse/tablet
   ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
   crypto.lisp          SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
+  crypto-32.lisp       32-bit field multiply (pair arithmetic for i386)
+  crypto-i386.lisp     i386 SHA-256/512, ChaCha20 (w32 pair arithmetic)
   ssh.lisp             SSH server (multi-connection)
   http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client with URL parsing and DNS
   actors.lisp          Actor system (spawn, yield, send, receive, scheduler)
+  arch-i386.lisp       i386 adapter (NE2000, state addresses, PCI stubs)
+  ne2000.lisp          NE2000 ISA NIC driver (i386)
+  i386-overrides.lisp  30-bit fixnum safety overrides for i386
   isolated-net.lisp    Qubes-like isolation (net-domain owns all hardware)
   bcm2835-periph.lisp  System timer, GPIO LED, GPU framebuffer
   uart-bootloader.lisp UART serial bootloader protocol
@@ -189,7 +198,7 @@ docs/                  Design documents and presentations
 
 MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
 
-All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via both QEMU virt (PCI ECAM + E1000) and real Pi hardware (DWC2 USB + CDC-ECM). i386 runs an interactive REPL with user-defined functions and global variables. The other 6 targets boot and run serial output programs.
+All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via both QEMU virt (PCI ECAM + E1000) and real Pi hardware (DWC2 USB + CDC-ECM). i386 runs an SSH server over an NE2000 ISA NIC with 30-bit fixnum-safe crypto (pair arithmetic for SHA-256, ChaCha20, X25519, Ed25519), and achieves a self-hosting cross-compilation fixpoint across all three architectures. The other 6 targets boot and run serial output programs.
 
 ### Tagged objects
 
@@ -198,6 +207,10 @@ All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-
 ### Self-hosting
 
 The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap. The MVM compiler can also compile its own source to architecture-independent bytecode, proving the compilation pipeline is a fixed point.
+
+### Cross-architecture fixpoint
+
+The fixpoint proof chain (`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across x64, AArch64, and i386 to verify 5 SHA256 equalities — proving that the same bytecodes produce byte-identical native code regardless of which architecture runs the translator. This includes i386 self-hosting (i386 compiles itself), i386→x64, and i386→AArch64 cross-compilation.
 
 ### Actors and SMP
 

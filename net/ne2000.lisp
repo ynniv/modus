@@ -305,17 +305,11 @@
 
 ;; ================================================================
 ;; API wrappers (compatible with shared ip.lisp / ssh.lisp)
+;; Override e1000-* via last-defun-wins to route to NE2000 driver.
+;; For dual-driver builds, a dispatch layer replaces these.
 ;; ================================================================
 
-(defun e1000-probe ()
-  (ne2k-reset)
-  (ne2k-init))
-
-(defun e1000-send (buf len)
-  (ne2k-send buf len))
-
-(defun e1000-receive ()
-  (ne2k-receive))
-
-(defun e1000-rx-buf ()
-  (ne2k-rx-host))
+(defun e1000-send (buf len) (ne2k-send buf len))
+(defun e1000-receive () (ne2k-receive))
+(defun e1000-rx-buf () (ne2k-rx-host))
+(defun e1000-probe () (ne2k-reset) (ne2k-init))
