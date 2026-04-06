@@ -1,6 +1,6 @@
 ;;;; x64-asm.lisp - x86-64 Instruction Encoder
 ;;;;
-;;;; Part of Modus64 cross-compiler (runs on SBCL)
+;;;; Part of Modus cross-compiler (runs on SBCL)
 ;;;; Minimal, purpose-built for bootstrap - not a general assembler
 ;;;;
 ;;;; References:
@@ -9,14 +9,14 @@
 
 ;; Package defined in packages.lisp
 
-(in-package :modus64.asm)
+(in-package :modus.asm)
 
 ;;; ============================================================
 ;;; Code Buffer
 ;;; ============================================================
 
 (defstruct code-buffer
-  (bytes (make-array 2097152))              ; 2MB fixed-size, use position tracking
+  (bytes (make-array 3145728))              ; 3MB fixed-size, use position tracking
   (labels (make-hash-table :test 'eq))      ; label -> position
   (fixups nil)                              ; list of (position label offset-size)
   (position 0))

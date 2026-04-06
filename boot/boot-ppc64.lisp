@@ -1,4 +1,4 @@
-;;;; boot-ppc64.lisp - PPC64 Boot Sequence for Modus64
+;;;; boot-ppc64.lisp - PPC64 Boot Sequence for Modus
 ;;;;
 ;;;; PPC64 boot protocol (for qemu-system-ppc64 -machine powernv):
 ;;;;   1. Skiboot firmware hands off in hypervisor real mode
@@ -14,7 +14,7 @@
 ;;;; SMP via OPAL firmware calls:
 ;;;;   - opal_start_cpu(server_no, start_addr, r3_value) to wake threads
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; PPC64 Boot Constants

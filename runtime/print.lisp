@@ -1,8 +1,8 @@
-;;;; print.lisp - Printing for Modus64
+;;;; print.lisp - Printing for Modus
 ;;;;
 ;;;; Basic printing to serial port for debugging.
 
-(in-package :modus64.runtime)
+(in-package :modus.runtime)
 
 ;;; ============================================================
 ;;; Serial Port Output

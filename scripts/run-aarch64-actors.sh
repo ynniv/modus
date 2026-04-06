@@ -3,6 +3,6 @@
 # Build first: sbcl --script mvm/build-aarch64-actors.lisp
 
 qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-    -kernel /tmp/modus64-aarch64-actors.bin -nographic -semihosting \
+    -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \
     -device 'e1000,netdev=net0,romfile=,rombar=0' \
     -netdev 'user,id=net0,hostfwd=tcp::2222-:22'

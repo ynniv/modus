@@ -8,7 +8,7 @@ TIMEOUT=120
 echo "Building AArch64 actors kernel..."
 sbcl --script mvm/build-aarch64-actors.lisp > /dev/null 2>&1
 
-boot_aarch64_virt /tmp/modus64-aarch64-actors.bin \
+boot_aarch64_virt /tmp/modus-aarch64-actors.bin \
     -device 'e1000,netdev=net0,romfile=,rombar=0' \
     -netdev "user,id=net0"
 wait_for "SSH:" 120

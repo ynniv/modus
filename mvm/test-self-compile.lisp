@@ -33,7 +33,7 @@
 (mvm-load "mvm/translate-arm32.lisp")
 (mvm-load "mvm/cross.lisp")
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; Try to compile each fixpoint source file through MVM
 
@@ -102,7 +102,7 @@
                 (length (compiled-module-function-table module))
                 (length (compiled-module-bytecode module)))
         ;; Install translators
-        (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS64.MVM.X64"))
+        (funcall (intern "INSTALL-X64-TRANSLATOR" "MODUS.MVM.X64"))
         (install-aarch64-translator)
         ;; Quick sanity: build a small image using the translators
         (format t "~%=== Build x86-64 REPL image (sanity) ===~%")

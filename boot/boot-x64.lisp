@@ -1,4 +1,4 @@
-;;;; boot-x64.lisp - x86-64 Boot Sequence for Modus64
+;;;; boot-x64.lisp - x86-64 Boot Sequence for Modus
 ;;;;
 ;;;; Refactored from the original monolithic boot code.
 ;;;; This file contains the x86-64-specific boot sequence that runs
@@ -16,15 +16,15 @@
 ;;;;   9. Initialize allocation registers (R12=alloc, R14=limit, R15=NIL)
 ;;;;  10. Call kernel-main
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; x86-64 Boot Constants
 ;;; ============================================================
 
 (defconstant +x64-kernel-load-addr+ #x100000)     ; 1MB - multiboot load address
-(defconstant +x64-page-tables-addr+ #x500000)     ; 5MB - page table location (above max kernel image)
-(defconstant +x64-stack-top+        #x400000)     ; 4MB - initial stack top
+(defconstant +x64-page-tables-addr+ #x500000)     ; 5MB - page table location
+(defconstant +x64-stack-top+        #x800000)     ; 8MB - initial stack top (above image+pagetables)
 (defconstant +x64-kernel64-addr+    #x100100)     ; 64-bit entry point
 
 ;; Memory regions
@@ -93,13 +93,13 @@
     (mvm-emit-byte buf #xBC)
     (mvm-emit-u32 buf +x64-stack-top+)
 
-    ;; Clear page table area (16KB at pml4-addr)
+    ;; Clear page table area (28KB at pml4-addr: PML4+PDPT+4xPD)
     ;; mov edi, pml4-addr
     (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf pml4-addr)
-    ;; mov ecx, 4096  (16KB / 4 bytes)
+    ;; mov ecx, 7168  (28KB / 4 bytes)
     (mvm-emit-byte buf #xB9)
-    (mvm-emit-u32 buf 4096)
+    (mvm-emit-u32 buf 7168)
     ;; xor eax, eax
     (mvm-emit-byte buf #x31)
     (mvm-emit-byte buf #xC0)
@@ -113,22 +113,40 @@
     (mvm-emit-u32 buf pml4-addr)
     (mvm-emit-u32 buf (logior (+ pml4-addr #x1000) 3))
 
-    ;; PDPT[0] -> PD  (pml4_addr+0x2000 | 3)
+    ;; PDPT[0] -> PD0  (pml4_addr+0x2000 | 3)
     (mvm-emit-byte buf #xC7)
     (mvm-emit-byte buf #x05)
     (mvm-emit-u32 buf (+ pml4-addr #x1000))
     (mvm-emit-u32 buf (logior (+ pml4-addr #x2000) 3))
 
-    ;; Fill PD with 512 x 2MB pages (identity map first 1GB)
-    ;; mov edi, pd_addr
+    ;; PDPT[1] -> PD1  (pml4_addr+0x3000 | 3)
+    (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x05)
+    (mvm-emit-u32 buf (+ pml4-addr #x1008))
+    (mvm-emit-u32 buf (logior (+ pml4-addr #x3000) 3))
+
+    ;; PDPT[2] -> PD2  (pml4_addr+0x4000 | 3)
+    (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x05)
+    (mvm-emit-u32 buf (+ pml4-addr #x1010))
+    (mvm-emit-u32 buf (logior (+ pml4-addr #x4000) 3))
+
+    ;; PDPT[3] -> PD3  (pml4_addr+0x5000 | 3)
+    (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x05)
+    (mvm-emit-u32 buf (+ pml4-addr #x1018))
+    (mvm-emit-u32 buf (logior (+ pml4-addr #x5000) 3))
+
+    ;; Fill 4 PDs with 2048 x 2MB pages (identity map first 4GB)
+    ;; mov edi, pd0_addr
     (mvm-emit-byte buf #xBF)
     (mvm-emit-u32 buf (+ pml4-addr #x2000))
     ;; mov eax, 0x83  (present + writable + 2MB page)
     (mvm-emit-byte buf #xB8)
     (mvm-emit-u32 buf #x83)
-    ;; mov ecx, 512
+    ;; mov ecx, 2048
     (mvm-emit-byte buf #xB9)
-    (mvm-emit-u32 buf 512)
+    (mvm-emit-u32 buf 2048)
     ;; loop: stosd; add eax,0x200000; mov [edi],0; add edi,4; loop
     (let ((loop-start (mvm-buffer-position buf)))
       (mvm-emit-byte buf #xAB)        ; stosd (store eax to [edi], edi+=4)
@@ -326,8 +344,162 @@
     (mvm-emit-byte buf #x89)          ; mov r/m64, r64
     (mvm-emit-byte buf #xE5)          ; ModRM: reg=RSP(4), rm=RBP(5)
 
+    ;; Set up timer interrupt for HLT-based io-delay
+    (emit-x64-interrupt-setup buf)
+
     ;; Fall through to native code
     ))
+
+(defun emit-x64-out (buf port val)
+  "Emit: mov al, val; mov dx, port; out dx, al"
+  (mvm-emit-byte buf #xB0) (mvm-emit-byte buf val)         ; mov al, imm8
+  (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xBA)        ; mov dx, imm16
+  (mvm-emit-u16 buf port)
+  (mvm-emit-byte buf #xEE))                                 ; out dx, al
+
+(defun emit-x64-interrupt-setup (buf)
+  "Set up PIC remap, PIT timer (~100Hz), and minimal IDT for HLT-based io-delay.
+   After this, STI + HLT will sleep until the next PIT timer tick (~10ms)."
+  ;; === Remap PIC: master IRQ 0x20-0x27, slave IRQ 0x28-0x2F ===
+  ;; ICW1: init + ICW4 needed
+  (emit-x64-out buf #x20 #x11)   ; master ICW1
+  (emit-x64-out buf #xA0 #x11)   ; slave ICW1
+  ;; ICW2: vector offset
+  (emit-x64-out buf #x21 #x20)   ; master: IRQ0 → INT 0x20
+  (emit-x64-out buf #xA1 #x28)   ; slave: IRQ8 → INT 0x28
+  ;; ICW3: master/slave wiring
+  (emit-x64-out buf #x21 #x04)   ; master: slave on IRQ2
+  (emit-x64-out buf #xA1 #x02)   ; slave: cascade identity
+  ;; ICW4: 8086 mode
+  (emit-x64-out buf #x21 #x01)
+  (emit-x64-out buf #xA1 #x01)
+  ;; Mask all IRQs except IRQ0 (timer)
+  (emit-x64-out buf #x21 #xFE)   ; master: unmask IRQ0 only
+  (emit-x64-out buf #xA1 #xFF)   ; slave: mask all
+
+  ;; === Program PIT channel 0 for ~1000Hz (divisor = 1193 = 0x04A9) ===
+  ;; Mode 2 (rate generator), binary, channel 0, lo/hi byte
+  (emit-x64-out buf #x43 #x34)   ; command: channel 0, lobyte/hibyte, mode 2
+  (emit-x64-out buf #x40 #xA9)   ; divisor low byte (1193 & 0xFF = 0xA9)
+  (emit-x64-out buf #x40 #x04)   ; divisor high byte (1193 >> 8 = 0x04)
+
+  ;; === Build minimal 64-bit IDT at 0x4F0000 ===
+  ;; We only need entry 0x20 (PIT timer IRQ). All others can be absent/zero.
+  ;; IDT entry format (16 bytes):
+  ;;   [offset_lo:16][selector:16][IST:3][zero:5][type:4][zero:1][DPL:2][P:1][offset_mid:16]
+  ;;   [offset_hi:32][reserved:32]
+  ;; ISR is placed at 0x4F0800 (2KB into IDT page)
+  (let* ((idt-base #x4F0000)
+         (isr-addr #x4F0800)
+         (entry-offset (* #x20 16))  ; entry 0x20 = byte offset 512
+         (entry-addr (+ idt-base entry-offset))
+         (offset-lo (logand isr-addr #xFFFF))
+         (offset-mid (logand (ash isr-addr -16) #xFFFF))
+         (offset-hi (logand (ash isr-addr -32) #xFFFFFFFF))
+         (selector #x10)              ; 64-bit code segment
+         (type-attr #x8E))            ; P=1, DPL=0, interrupt gate (0xE)
+
+    ;; Zero IDT area (entries 0x00-0x2F = 48 entries × 16 bytes = 768 bytes)
+    ;; Use REP STOSQ: rcx = count, rdi = addr, rax = value
+    ;; mov rdi, idt-base
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf idt-base) (mvm-emit-u32 buf 0)
+    ;; xor rax, rax
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x31) (mvm-emit-byte buf #xC0)
+    ;; mov rcx, 96 (768/8 qwords)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xB9)
+    (mvm-emit-u32 buf 96) (mvm-emit-u32 buf 0)
+    ;; rep stosq
+    (mvm-emit-byte buf #xF3) (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xAB)
+
+    ;; Write IDT entry 0x20 (PIT timer) at idt-base + 0x200
+    ;; mov rdi, entry_addr
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf entry-addr) (mvm-emit-u32 buf 0)
+    ;; Word 0: [offset_lo:16 | selector:16] = (selector << 16) | offset_lo
+    ;; mov eax, imm32
+    (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf (logior offset-lo (ash selector 16)))
+    ;; mov [rdi], eax
+    (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x07)
+    ;; Word 1: [IST=0 | type_attr | offset_mid]
+    ;; mov eax, imm32
+    (mvm-emit-byte buf #xB8)
+    (mvm-emit-u32 buf (logior (ash type-attr 8) (ash offset-mid 16)))
+    ;; mov [rdi+4], eax
+    (mvm-emit-byte buf #x89) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x04)
+    ;; Word 2: offset_hi (0 for addresses < 4GB)
+    ;; mov dword [rdi+8], offset_hi
+    (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x08)
+    (mvm-emit-u32 buf offset-hi)
+    ;; Word 3: reserved = 0
+    ;; mov dword [rdi+12], 0
+    (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x0C)
+    (mvm-emit-u32 buf 0)
+
+    ;; === Write ISR at 0x4F0800 ===
+    ;; Minimal timer ISR: push rax, send EOI to PIC, pop rax, iretq
+    ;; mov rdi, isr_addr
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xBF)
+    (mvm-emit-u32 buf isr-addr) (mvm-emit-u32 buf 0)
+    ;; ISR code (11 bytes):
+    ;;   50           push rax
+    ;;   B0 20        mov al, 0x20
+    ;;   E6 20        out 0x20, al    (EOI to master PIC)
+    ;;   58           pop rax
+    ;;   48 CF        iretq
+    ;; mov byte [rdi+0], 0x50 (push rax)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x07) (mvm-emit-byte buf #x50)
+    ;; mov byte [rdi+1], 0xB0 (mov al, imm8)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x01)
+    (mvm-emit-byte buf #xB0)
+    ;; mov byte [rdi+2], 0x20 (imm8 = 0x20 = EOI)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x02)
+    (mvm-emit-byte buf #x20)
+    ;; mov byte [rdi+3], 0xE6 (out imm8, al)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x03)
+    (mvm-emit-byte buf #xE6)
+    ;; mov byte [rdi+4], 0x20 (port 0x20)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x04)
+    (mvm-emit-byte buf #x20)
+    ;; mov byte [rdi+5], 0x58 (pop rax)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x05)
+    (mvm-emit-byte buf #x58)
+    ;; mov byte [rdi+6], 0x48 (REX.W prefix for iretq)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x06)
+    (mvm-emit-byte buf #x48)
+    ;; mov byte [rdi+7], 0xCF (iretq)
+    (mvm-emit-byte buf #xC6) (mvm-emit-byte buf #x47) (mvm-emit-byte buf #x07)
+    (mvm-emit-byte buf #xCF)
+
+    ;; === Load IDTR ===
+    ;; IDTR format: [limit:16 | base:64] at a scratch location
+    ;; Use stack for IDTR descriptor
+    ;; lidt [rsp-10] after writing limit+base there
+    ;; sub rsp, 16
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
+    (mvm-emit-byte buf #xEC) (mvm-emit-byte buf #x10)
+    ;; mov word [rsp], limit (48*16-1 = 767)
+    (mvm-emit-byte buf #x66) (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x04) (mvm-emit-byte buf #x24)
+    (mvm-emit-u16 buf (1- (* 48 16)))
+    ;; mov qword [rsp+2], idt-base
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #xC7)
+    (mvm-emit-byte buf #x44) (mvm-emit-byte buf #x24) (mvm-emit-byte buf #x02)
+    (mvm-emit-u32 buf idt-base)
+    ;; Also need high 4 bytes of base = 0
+    (mvm-emit-byte buf #xC7) (mvm-emit-byte buf #x44)
+    (mvm-emit-byte buf #x24) (mvm-emit-byte buf #x06)
+    (mvm-emit-u32 buf 0)
+    ;; lidt [rsp]
+    (mvm-emit-byte buf #x0F) (mvm-emit-byte buf #x01)
+    (mvm-emit-byte buf #x1C) (mvm-emit-byte buf #x24)
+    ;; add rsp, 16  (restore stack)
+    (mvm-emit-byte buf #x48) (mvm-emit-byte buf #x83)
+    (mvm-emit-byte buf #xC4) (mvm-emit-byte buf #x10))
+  ;; Interrupts remain disabled (CLI from boot). Lisp code uses (sti-hlt) to
+  ;; atomically enable + halt, then (cli) after wake.
+  )
 
 (defun emit-x64-ap-trampoline (buf)
   "Emit AP (Application Processor) startup trampoline for SMP.

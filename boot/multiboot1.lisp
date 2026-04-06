@@ -3,7 +3,7 @@
 ;;;; Multiboot1 is simpler than Multiboot2 and QEMU can load it directly.
 ;;;; Reference: https://www.gnu.org/software/grub/manual/multiboot/multiboot.html
 
-(in-package :modus64.cross)
+(in-package :modus.cross)
 
 ;;; ============================================================
 ;;; Multiboot1 Constants
@@ -258,7 +258,7 @@
                   (emit-byte buf #xEE)
 
                   ;; Print boot message
-                  (let ((message "Modus64 OK!"))
+                  (let ((message "Modus OK!"))
                     (loop for char across message do
                       ;; Wait for THR empty
                       (let ((wait-loop (code-buffer-position buf)))
@@ -328,5 +328,5 @@
 
 (defun test-multiboot1 ()
   "Build and test multiboot1 image"
-  (build-multiboot1-image "/tmp/modus64.elf")
-  (format t "~%To test: qemu-system-x86_64 -kernel /tmp/modus64.elf -nographic~%"))
+  (build-multiboot1-image "/tmp/modus.elf")
+  (format t "~%To test: qemu-system-x86_64 -kernel /tmp/modus.elf -nographic~%"))

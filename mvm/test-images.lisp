@@ -54,9 +54,9 @@
 ;;; Install translators
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
-(handler-case (modus64.mvm.x64:install-x64-translator)
+(handler-case (modus.mvm.x64:install-x64-translator)
   (error (e) (format t "  x64: skip (~A)~%" e)))
 (handler-case (install-riscv-translator)
   (error (e) (format t "  rv: skip (~A)~%" e)))
@@ -66,7 +66,7 @@
   (error (e) (format t "  ppc64: skip (~A)~%" e)))
 (handler-case (install-ppc32-translator)
   (error (e) (format t "  ppc32: skip (~A)~%" e)))
-(handler-case (modus64.mvm.i386:install-i386-translator)
+(handler-case (modus.mvm.i386:install-i386-translator)
   (error (e) (format t "  i386: skip (~A)~%" e)))
 (handler-case (install-68k-translator)
   (error (e) (format t "  68k: skip (~A)~%" e)))

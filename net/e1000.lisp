@@ -174,8 +174,12 @@
     (e1000-write-reg #x3820 0)   ; TIDV
     (e1000-write-reg #x382C 0)   ; TADV
 
-    ;; Disable interrupts
-    (e1000-write-reg #xD8 #xFFFFFFFF)
+    ;; Enable RXT0 interrupt (bit 7) — RX timer fires on packet receive.
+    ;; IRQs stay masked at CPU (PSTATE.I=1 / EFLAGS.IF=0) so no ISR runs,
+    ;; but the pending interrupt signal wakes HLT/WFI in io-delay.
+    ;; Clear all first, then set RXT0.
+    (e1000-write-reg #xD8 #xFFFFFFFF)  ; IMC: clear all
+    (e1000-write-reg #xD0 #x80)        ; IMS: enable RXT0 (bit 7)
 
     ;; Store our IP (10.0.2.15) and gateway (10.0.2.2)
     (setf (mem-ref (+ state #x18) :u32) #x0F02000A)  ; 10.0.2.15
@@ -217,12 +221,17 @@
             done))))))
 
 ;; Check for received packet. Returns length or 0 if none.
+;; Reads ICR to clear pending interrupt cause (allows HLT/WFI to sleep
+;; until next packet arrives, rather than waking immediately on stale cause).
 (defun e1000-hw-receive ()
   (let ((state (e1000-state-base)))
     (let ((rx-cur (mem-ref (+ state #x10) :u32)))
       ;; Check if E1000 has advanced RDH past our cursor
       (if (eq (e1000-read-reg #x2810) rx-cur)
-          0
+          (progn
+            ;; No packet — read ICR to clear pending interrupt cause
+            (e1000-read-reg #xC0)
+            0)
           ;; Packet received! Get length from descriptor
           (let ((desc-addr (+ (e1000-rx-desc-base) (* rx-cur 16))))
             (let ((pkt-len (mem-ref (+ desc-addr 8) :u16)))

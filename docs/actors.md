@@ -1,4 +1,4 @@
-# Modus64 Actor Model: Design Document
+# Modus Actor Model: Design Document
 
 ## Why Actors
 

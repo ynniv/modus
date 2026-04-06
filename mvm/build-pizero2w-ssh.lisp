@@ -8,50 +8,8 @@
 ;;;; DWC2 operates in USB device (gadget) mode with CDC-ECM Ethernet.
 ;;;; Host sees a USB Ethernet adapter. Static IP: 10.0.0.2 (host: 10.0.0.1)
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Load REPL source + networking source
-;;; ============================================================
-
-(format t "Loading REPL + USB gadget networking source...~%")
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
 (defun read-file-text (path)
@@ -67,11 +25,12 @@
 ;; Load: arch-raspi3b (adapter) + dwc2-device (USB gadget NIC)
 ;; + ip + crypto + ssh + http + overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2-device.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
@@ -81,7 +40,7 @@
 ;;; Build Pi Zero 2 W SSH image (DWC2 USB gadget + CDC-ECM)
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)
@@ -177,12 +136,15 @@
                          ;; Must be after conn-base clear and ssh-seed-random
                          "  (pre-compute-server-eph (conn-ssh 0))"
                          "  (write-byte 91) (write-byte 67) (write-byte 93)"
+                         ;; Enable ARM timer for WFI-based io-delay (after all crypto init)
+                         "  (enable-rpi-timer)"
                          "  (net-actor-main))"
 )))
+       ;; SSH kernel-main MUST be LAST: "last-defun-wins" makes it the entry point.
        (combined-source (concatenate 'string
-                                      ssh-main
                                       cl-user::*net-source*
-                                      *repl-source*)))
+                                      *repl-source*
+                                      ssh-main)))
   (format t "Building Pi Zero 2 W SSH image (DWC2 USB gadget)...~%")
   (format t "Combined source: ~D chars~%" (length combined-source))
   (let ((image (build-image :target :rpi :source-text combined-source)))

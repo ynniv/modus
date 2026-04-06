@@ -6,7 +6,8 @@ set -e
 cd "$(dirname "$0")/.."
 
 PORT=${1:-2222}
-LOGFILE="/tmp/modus64-i386-ssh.log"
+EXPR="${2:-}"
+LOGFILE="/tmp/modus-i386-ssh.log"
 QEMU_PID=""
 
 cleanup() {
@@ -23,7 +24,7 @@ echo "Building i386 SSH kernel..."
 sbcl --script mvm/build-i386-ssh.lisp
 echo "Build complete."
 
-pkill -9 -f 'qemu-system-i386.*modus64-i386-ssh' 2>/dev/null || true
+pkill -9 -f 'qemu-system-i386.*modus-i386-ssh' 2>/dev/null || true
 sleep 0.5
 
 # Start QEMU in background
@@ -32,7 +33,7 @@ qemu-system-i386 \
     -m 256 \
     -nographic \
     -no-reboot \
-    -kernel /tmp/modus64-i386-ssh.bin \
+    -kernel /tmp/modus-i386-ssh.bin \
     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
     -netdev "user,id=net0,hostfwd=tcp::${PORT}-:22" \
     > "$LOGFILE" 2>&1 &
@@ -61,12 +62,18 @@ if ! grep -q "DHCP:IP=" "$LOGFILE" 2>/dev/null; then
     exit 1
 fi
 
-echo ""
-echo "Modus64 i386 SSH server ready on port $PORT."
-echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
-echo ""
-echo "Press Ctrl-C to stop."
+if [ -n "$EXPR" ]; then
+    sleep 5
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -p "$PORT" test@localhost "$EXPR" 2>/dev/null || true
+    cleanup
+else
+    echo ""
+    echo "Modus i386 SSH server ready on port $PORT."
+    echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
+    echo ""
+    echo "Press Ctrl-C to stop."
 
-# Wait for QEMU to exit or Ctrl-C
-wait "$QEMU_PID" 2>/dev/null
-QEMU_PID=""
+    # Wait for QEMU to exit or Ctrl-C
+    wait "$QEMU_PID" 2>/dev/null
+    QEMU_PID=""
+fi

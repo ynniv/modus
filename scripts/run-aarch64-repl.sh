@@ -2,21 +2,29 @@
 # run-aarch64-repl.sh — Build and run AArch64 REPL image in QEMU (virt)
 #
 # Usage:
-#   ./run-aarch64-repl.sh
+#   ./scripts/run-aarch64-repl.sh              # interactive REPL
+#   ./scripts/run-aarch64-repl.sh "(+ 1 2)"    # eval expression, print result, exit
 #
-# Ctrl-A X to quit QEMU
+# Ctrl-A X to quit QEMU (interactive mode)
 
 set -e
 cd "$(dirname "$0")/.."
 
-echo "Building AArch64 REPL image..."
-sbcl --script mvm/build-aarch64-repl.lisp
-echo "Build OK"
+BIN=/tmp/modus-aarch64.bin
+
+if [ ! -f "$BIN" ] || [ mvm/build-aarch64-repl.lisp -nt "$BIN" ]; then
+    echo "Building AArch64 REPL image..." >&2
+    sbcl --script mvm/build-aarch64-repl.lisp >&2
+fi
+
+if [ -n "$1" ]; then
+    exec "$(dirname "$0")/run-repl-eval.sh" aarch64 "$BIN" "$1"
+fi
 
 exec qemu-system-aarch64 \
     -machine virt \
     -cpu cortex-a57 \
     -m 512 \
-    -kernel /tmp/modus64-aarch64.bin \
+    -kernel "$BIN" \
     -nographic \
     -semihosting

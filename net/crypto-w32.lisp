@@ -1,4 +1,4 @@
-;;;; crypto-i386.lisp — SHA-256, ChaCha20, SHA-512 for 31-bit fixnum (i386)
+;;;; crypto-w32.lisp — SHA-256, ChaCha20, SHA-512 for 31-bit fixnum (32-bit targets)
 ;;;;
 ;;;; Load AFTER crypto.lisp + crypto-32.lisp (last-defun-wins).
 ;;;;
@@ -245,7 +245,8 @@
 (defun sha256 (msg)
   (let ((msg-len (array-length msg)))
     (let ((r (mod (+ msg-len 9) 64)))
-      (let ((total (+ msg-len 9 (if (zerop r) 0 (- 64 r)))))
+      (let ((pad-extra (if (zerop r) 0 (- 64 r))))
+      (let ((total (+ (+ msg-len 9) pad-extra)))
         (let ((padded (make-array total)))
           (dotimes (i total) (aset padded i 0))
           (dotimes (i msg-len) (aset padded i (aref msg i)))
@@ -270,7 +271,7 @@
                 (when (not (< offset total)) (return ()))
                 (sha256-block padded offset h)
                 (setq offset (+ offset 64))))
-            h))))))
+            h)))))))
 
 ;; ================================================================
 ;; ChaCha20 (w32 pair-based)
@@ -479,8 +480,8 @@
 (defun bytes8-rotr (src dst n)
   ;; Zero dst
   (dotimes (i 8) (aset dst i 0))
-  ;; For each source bit position, compute destination position
   ;; Byte-level approach: shift bytes, then handle sub-byte shifts
+  ;; Flattened to avoid deeply nested logand/logior/ash (MVM register clobber)
   (let ((byte-shift (ash n -3))     ;; n / 8
         (bit-shift (logand n 7)))   ;; n % 8
     (if (zerop bit-shift)
@@ -491,15 +492,24 @@
         ;; Byte rotation + sub-byte shift
         (dotimes (i 8)
           (let ((di (logand (+ i byte-shift) 7))
-                (di1 (logand (+ i byte-shift 1) 7)))
+                (di1 (logand (+ (+ i byte-shift) 1) 7)))
             (let ((sv (aref src i)))
-              (aset dst di (logand (logior (aref dst di) (ash sv (- 0 bit-shift))) #xFF))
-              (aset dst di1 (logand (logior (aref dst di1)
-                                           (ash (logand sv (- (ash 1 bit-shift) 1))
-                                                (- 8 bit-shift)))
-                                   #xFF))))))))
+              ;; dst[di] |= (sv >> bit-shift) & 0xFF
+              (let ((cur-di (aref dst di)))
+                (let ((shifted (ash sv (- 0 bit-shift))))
+                  (let ((ored (logior cur-di shifted)))
+                    (aset dst di (logand ored #xFF)))))
+              ;; dst[di1] |= ((sv & mask) << (8 - bit-shift)) & 0xFF
+              (let ((cur-di1 (aref dst di1)))
+                (let ((mask-val (- (ash 1 bit-shift) 1)))
+                  (let ((masked (logand sv mask-val)))
+                    (let ((shift-amt (- 8 bit-shift)))
+                      (let ((shifted2 (ash masked shift-amt)))
+                        (let ((ored2 (logior cur-di1 shifted2)))
+                          (aset dst di1 (logand ored2 #xFF))))))))))))))
 
 ;; Shift right 8 bytes by n bits
+;; Flattened to avoid deeply nested logand/logior/ash (MVM register clobber)
 (defun bytes8-shr (src dst n)
   (dotimes (i 8) (aset dst i 0))
   (let ((byte-shift (ash n -3))
@@ -514,13 +524,22 @@
           (loop
             (when (>= i 8) (return ()))
             (let ((si (- i byte-shift)))
-              (aset dst i (logand (logior (aref dst i) (ash (aref src si) (- 0 bit-shift))) #xFF))
+              ;; dst[i] = (src[si] >> bit-shift) & 0xFF
+              (let ((cur (aref dst i)))
+                (let ((sv (aref src si)))
+                  (let ((shifted (ash sv (- 0 bit-shift))))
+                    (let ((ored (logior cur shifted)))
+                      (aset dst i (logand ored #xFF))))))
+              ;; dst[i] |= ((src[si-1] & mask) << (8 - bit-shift)) & 0xFF
               (when (> si 0)
-                (aset dst i (logand (logior (aref dst i)
-                                           (ash (logand (aref src (- si 1))
-                                                        (- (ash 1 bit-shift) 1))
-                                                (- 8 bit-shift)))
-                                   #xFF))))
+                (let ((cur2 (aref dst i)))
+                  (let ((prev (aref src (- si 1))))
+                    (let ((mask-val (- (ash 1 bit-shift) 1)))
+                      (let ((masked (logand prev mask-val)))
+                        (let ((shift-amt (- 8 bit-shift)))
+                          (let ((shifted2 (ash masked shift-amt)))
+                            (let ((ored2 (logior cur2 shifted2)))
+                              (aset dst i (logand ored2 #xFF)))))))))))
             (setq i (+ i 1)))))))
 
 ;; SHA-512 sigma via byte arrays
@@ -535,9 +554,13 @@
     (if is-shift3
         (bytes8-shr src d3 r3)
         (bytes8-rotr src d3 r3))
-    ;; XOR all three
+    ;; XOR all three — flattened to avoid nested logxor/aref register clobber on arm32
     (dotimes (i 8)
-      (aset d1 i (logxor (aref d1 i) (logxor (aref d2 i) (aref d3 i)))))
+      (let ((v1 (aref d1 i)))
+        (let ((v2 (aref d2 i)))
+          (let ((v3 (aref d3 i)))
+            (let ((x23 (logxor v2 v3)))
+              (aset d1 i (logxor v1 x23)))))))
     (w64-from-bytes d1 0)))
 
 (defun sha512-sigma0 (x) (sha512-sigma-op x 28 34 39 nil))
@@ -664,8 +687,9 @@
         (let ((s0 (sha512-lsig0 (w64-wload w (* (- i 15) 8)))))
           (let ((w7 (w64-wload w (* (- i 7) 8))))
             (let ((w16 (w64-wload w (* (- i 16) 8))))
-              (w64-wstore w (* i 8)
-                (w64-add s1 (w64-add w7 (w64-add s0 w16))))))))
+              (let ((t0 (w64-add s0 w16)))
+                (let ((t1 (w64-add w7 t0)))
+                  (w64-wstore w (* i 8) (w64-add s1 t1))))))))
       (setq i (+ i 1))))
   ;; Initialize working variables
   (let ((a (w64-wload h 0))
@@ -682,7 +706,10 @@
         (let ((wi (w64-wload w (* i 8))))
           (let ((sig1 (sha512-sigma1 e)))
             (let ((ch-val (sha512-ch e f g)))
-              (let ((t1 (w64-add hh (w64-add sig1 (w64-add ch-val (w64-add ki wi))))))
+              (let ((s1 (w64-add ki wi)))
+              (let ((s2 (w64-add ch-val s1)))
+              (let ((s3 (w64-add sig1 s2)))
+              (let ((t1 (w64-add hh s3)))
                 (let ((sig0 (sha512-sigma0 a)))
                   (let ((maj-val (sha512-maj a b cc)))
                     (let ((t2 (w64-add sig0 maj-val)))
@@ -693,7 +720,7 @@
                       (setq d cc)
                       (setq cc b)
                       (setq b a)
-                      (setq a (w64-add t1 t2)))))))))))
+                      (setq a (w64-add t1 t2))))))))))))))
     ;; Add back
     (w64-wstore h 0 (w64-add (w64-wload h 0) a))
     (w64-wstore h 8 (w64-add (w64-wload h 8) b))
@@ -708,7 +735,8 @@
 (defun sha512 (msg)
   (let ((msg-len (array-length msg)))
     (let ((r (mod (+ msg-len 17) 128)))
-      (let ((total (+ msg-len 17 (if (zerop r) 0 (- 128 r)))))
+      (let ((pad-extra (if (zerop r) 0 (- 128 r))))
+      (let ((total (+ (+ msg-len 17) pad-extra)))
         (let ((padded (make-array total)))
           (dotimes (i total) (aset padded i 0))
           (dotimes (i msg-len) (aset padded i (aref msg i)))
@@ -744,7 +772,7 @@
                 (when (not (< offset total)) (return ()))
                 (sha512-block padded offset h ww)
                 (setq offset (+ offset 128))))
-            h))))))
+            h)))))))
 
 ;; ================================================================
 ;; Override buf-read-u32-le for Poly1305 on i386

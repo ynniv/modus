@@ -8,54 +8,15 @@
 ;;;;
 ;;;; Usage: sbcl --script mvm/build-compiler-test.lisp
 ;;;;
-;;;; Produces /tmp/modus64-compiler-test.bin — boot with:
+;;;; Produces /tmp/modus-compiler-test.bin — boot with:
 ;;;;   qemu-system-x86_64 -m 512 -nographic -no-reboot \
-;;;;     -kernel /tmp/modus64-compiler-test.bin
+;;;;     -kernel /tmp/modus-compiler-test.bin
 ;;;;
 ;;;; Expected output: FNV checksum + "PASS"
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Read source files
-;;; ============================================================
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
+(mvm-load "mvm/repl-source.lisp")
 
 (format t "Reading source files...~%")
 
@@ -96,7 +57,7 @@
 ;;; Compute expected FNV on SBCL
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 (format t "Computing expected FNV on SBCL...~%")
 
@@ -1301,7 +1262,7 @@
     cl-user::*prelude-source*
     cl-user::*mvm-source*
     cl-user::*compiler-source*
-    modus64.mvm::*repl-source*
+    modus.mvm::*repl-source*
     *adapter-source-filled*
     *kernel-main-source*))
 
@@ -1312,12 +1273,12 @@
 ;;; ============================================================
 
 ;; Install x64 translator
-(modus64.mvm.x64:install-x64-translator)
+(modus.mvm.x64:install-x64-translator)
 
 (format t "Building compiler test image (x86-64)...~%")
 
 (let ((image (build-image :target :x86-64 :source-text *full-source*)))
-  (write-kernel-image image "/tmp/modus64-compiler-test.bin")
+  (write-kernel-image image "/tmp/modus-compiler-test.bin")
   (format t "~%Expected FNV: ~D (~8,'0X)~%" *expected-fnv* *expected-fnv*)
   (format t "~%Done. Boot with:~%")
-  (format t "  qemu-system-x86_64 -m 512 -nographic -no-reboot -kernel /tmp/modus64-compiler-test.bin~%"))
+  (format t "  qemu-system-x86_64 -m 512 -nographic -no-reboot -kernel /tmp/modus-compiler-test.bin~%"))

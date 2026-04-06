@@ -34,7 +34,7 @@
 ;;;; Link Register (LR): branch-and-link target, used for call/return.
 ;;;; Count Register (CTR): used for indirect branches (mtctr/bctr).
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; PPC64 Physical Register Encoding
@@ -1022,6 +1022,43 @@
              (unless (ppc-vreg-phys vd)
                (ppc-store-vreg buf vd pd))))))
 
+      (#.+op-mul26lo+
+       (let ((vd (first operands))
+             (va (second operands))
+             (vb (third operands)))
+         ;; Low 26 bits of untag(Va)*untag(Vb), tagged
+         (let ((pa (vreg-or-scratch va +ppc-scratch1+))
+               (pb (vreg-or-scratch vb +ppc-scratch2+)))
+           (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+             (ppc-emit-shift-right-arith-imm buf +ppc-r0+ pa 1)  ; untag va
+             (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pb 1) ; untag vb
+             (ppc-emit-mul-word buf pd +ppc-r0+ +ppc-scratch2+)
+             ;; Mask to 26 bits: RLDICL rd, rs, 0, 38 (64-bit) or RLWINM rd, rs, 0, 6, 31 (32-bit)
+             (if *ppc-64-bit*
+                 (ppc-emit-rldicl buf pd pd 0 38)
+                 (ppc-emit-rlwinm buf pd pd 0 6 31))
+             ;; Retag: ADD pd, pd, pd (shift left 1)
+             (ppc-emit-add buf pd pd pd)
+             (unless (ppc-vreg-phys vd)
+               (ppc-store-vreg buf vd pd))))))
+
+      (#.+op-mul26hi+
+       (let ((vd (first operands))
+             (va (second operands))
+             (vb (third operands)))
+         ;; Bits 26+ of untag(Va)*untag(Vb), tagged
+         (let ((pa (vreg-or-scratch va +ppc-scratch1+))
+               (pb (vreg-or-scratch vb +ppc-scratch2+)))
+           (let ((pd (or (ppc-vreg-phys vd) +ppc-scratch1+)))
+             (ppc-emit-shift-right-arith-imm buf +ppc-r0+ pa 1)  ; untag va
+             (ppc-emit-shift-right-arith-imm buf +ppc-scratch2+ pb 1) ; untag vb
+             (ppc-emit-mul-word buf pd +ppc-r0+ +ppc-scratch2+)
+             (ppc-emit-shift-right-arith-imm buf pd pd 26) ; >>26
+             ;; Retag: ADD pd, pd, pd (shift left 1)
+             (ppc-emit-add buf pd pd pd)
+             (unless (ppc-vreg-phys vd)
+               (ppc-store-vreg buf vd pd))))))
+
       (#.+op-div+
        (let ((vd (first operands))
              (va (second operands))
@@ -1674,7 +1711,7 @@
                      ;; Check if this instruction has a branch offset
                      (cond
                        ;; Branches with offset only (br, beq, bne, etc.)
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (not (member :reg op-types)))
                         (let ((off (first operands)))
                           (let ((target (+ new-pc off)))
@@ -1682,7 +1719,7 @@
                               (setf (gethash target label-map)
                                     (mvm-make-label))))))
                        ;; Branches with reg + offset (bnull, bnnull)
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (member :reg op-types))
                         (let ((off (second operands)))
                           (let ((target (+ new-pc off)))

@@ -2,77 +2,73 @@
 
 A bare-metal Lisp operating system. Boots directly on hardware (or QEMU) into an interactive Lisp REPL with networking, SSH, and cryptography — no underlying OS.
 
-A self-hosting 64-bit system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.
+A self-hosting system with a portable virtual machine (MVM) targeting 9 CPU architectures, an Erlang-style actor model, SMP multicore support, and per-actor garbage collection.
 
 ## Feature matrix
 
 ### Platforms
 
-|                    | x86-64 QEMU | AArch64 QEMU virt | RPi 3B QEMU | Pi Zero 2 W | i386 QEMU |
-|--------------------|:-----------:|:-----------------:|:-----------:|:-----------:|:---------:|
-| Serial REPL        | Y | Y | Y | Y | Y |
-| E1000 networking   | Y | Y | - | - | - |
-| NE2000 networking  | - | - | - | - | Y |
-| USB CDC networking | - | - | Y | Y | - |
-| SSH server         | Y | Y | Y | Y | Y |
-| HTTP server/client | - | Y | - | Y | - |
-| Actors             | Y | Y | - | Y | - |
-| Actor isolation    | - | Y | - | - | - |
-| SMP (multi-core)   | Y | - | - | - | - |
-| Self-hosting       | Y | Y | - | - | Y |
-| USB HID            | - | - | Y | - | - |
-| GPIO/SPI/I2C       | - | - | Y | - | - |
-| GPU framebuffer    | - | - | Y | Y | - |
-| UART bootloader    | - | - | - | Y | - |
-| Real hardware      | - | - | - | Y | - |
+|                    | x86-64 QEMU | AArch64 QEMU virt | RPi 3B QEMU | Pi Zero 2 W | i386 QEMU | ARM32 QEMU | ThinkPad T420 |
+|--------------------|:-----------:|:-----------------:|:-----------:|:-----------:|:---------:|:----------:|:-------------:|
+| Serial REPL        | Y | Y | Y | Y | Y | Y | - |
+| VGA + PS/2 REPL    | - | - | - | - | - | - | Y |
+| E1000 networking   | Y | Y | - | - | - | - | Y |
+| NE2000 networking  | - | - | - | - | Y | - | - |
+| USB CDC networking | - | - | Y | Y | - | Y | - |
+| SSH server         | Y | Y | Y | Y | Y | Y | Y |
+| HTTP server/client | - | Y | - | Y | - | - | - |
+| Actors             | Y | Y | - | Y | - | - | - |
+| Actor isolation    | - | Y | - | - | - | - | - |
+| SMP (multi-core)   | Y | - | - | - | - | - | - |
+| Self-hosting       | Y | Y | - | - | Y | - | - |
+| USB HID            | - | - | Y | - | - | - | - |
+| GPIO/SPI/I2C       | - | - | Y | - | - | - | - |
+| GPU framebuffer    | - | - | Y | Y | - | - | Y (UEFI) |
+| UART bootloader    | - | - | - | Y | - | - | - |
+| EHCI USB (WIP)     | - | - | - | - | - | - | Y |
 
-NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB — host mode (CDC Ethernet) on QEMU raspi3b, device/gadget mode (CDC-ECM) on Pi Zero 2 W. i386 uses NE2000 ISA NIC (port I/O).
+NIC driver: x86-64 and AArch64 virt use Intel E1000 (PCI). RPi uses DWC2 USB — host mode (CDC Ethernet) on QEMU raspi3b, device/gadget mode (CDC-ECM) on Pi Zero 2 W. i386 uses NE2000 ISA NIC (port I/O). ARM32 uses DWC2 USB gadget (CDC-ECM) on QEMU raspi2b. T420 uses E1000 82579LM with BIOS-preserving init.
 
 ### MVM architectures
 
-All 9 architectures compile and produce correct output (factorial 3628800) in QEMU. x86-64 and AArch64 have full runtime support; i386 has REPL, SSH, and self-hosting.
+All 9 architectures compile and produce correct output (factorial 3628800) in QEMU. x86-64, AArch64, i386, and ARM32 have full runtime support with SSH.
 
 | Architecture | Bits | Endian | Translator | Boot | QEMU target | Status |
 |-------------|:----:|:------:|:----------:|:----:|-------------|--------|
 | x86-64      | 64 | little | translate-x64.lisp    | boot-x64.lisp    | `qemu-system-x86_64`    | Full (REPL, SSH, actors, self-hosting) |
 | AArch64     | 64 | little | translate-aarch64.lisp | boot-aarch64.lisp | `qemu-system-aarch64 -M virt` | Full (REPL, SSH, actors) |
 | AArch64 RPi | 64 | little | translate-aarch64.lisp | boot-rpi.lisp    | `qemu-system-aarch64 -M raspi3b` | Full (REPL, SSH, USB HID, real hardware) |
+| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Full (REPL, SSH, self-hosting, real hardware) |
+| ARM32       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M raspi2b` | Full (REPL, SSH) |
 | RISC-V 64   | 64 | little | translate-riscv.lisp  | boot-riscv.lisp  | `qemu-system-riscv64`   | Serial output |
 | PPC64       | 64 | big    | translate-ppc.lisp    | boot-ppc64.lisp  | `qemu-system-ppc64`     | Serial output |
 | PPC32       | 32 | big    | translate-ppc.lisp    | boot-ppc32.lisp  | `qemu-system-ppc`       | Serial output |
-| i386        | 32 | little | translate-i386.lisp   | boot-i386.lisp   | `qemu-system-i386`      | Full (REPL, SSH, self-hosting) |
-| ARM32 (v5)  | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M versatilepb` | Serial output |
-| ARMv7       | 32 | little | translate-arm32.lisp  | boot-arm32.lisp  | `qemu-system-arm -M virt` | Serial output |
 | 68k         | 32 | big    | translate-68k.lisp    | boot-68k.lisp    | `qemu-system-m68k -M an5206` | Serial output |
 
-### Run modes
+### Cross-architecture fixpoint
 
-| Mode | Description | Platforms |
-|------|-------------|-----------|
-| REPL | Interactive serial console with line editing | All 4 platforms |
-| SSH | Single-threaded SSH server (one connection) | All 4 platforms |
-| Actors | Cooperative multi-connection SSH via actor system | x86-64, AArch64 virt, Pi Zero 2 W |
-| Isolated | Qubes-like actor isolation (net-domain owns hardware) | AArch64 virt |
-| Self-host | Gen0 boots, compiles Gen1 from embedded source | x86-64, AArch64 virt |
-| HID | USB keyboard-driven REPL | RPi 3B QEMU |
+The fixpoint proof verifies that the MVM compiler produces identical output regardless of which architecture runs it. The chain (`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across x64, AArch64, i386, and ARM32 to verify SHA256 equalities — proving byte-identical native code regardless of host architecture. This includes i386 self-hosting (i386 compiles itself), cross-compilation between all four architectures, and SSH over the fixpoint chain.
 
 ## Building and running
 
 Requires SBCL and QEMU.
+
+### Quick test (any architecture)
+
+All SSH scripts support batch mode — pass an expression as the second argument:
+
+```bash
+./scripts/run-x64-ssh.sh 2222 "(+ 1 2)"       # → = 3
+./scripts/run-aarch64-ssh.sh 2222 "(+ 1 2)"    # → = 3
+./scripts/run-i386-ssh.sh 2222 "(+ 1 2)"       # → = 3
+./scripts/run-arm32-ssh.sh 2222 "(+ 1 2)"      # → = 3
+```
 
 ### x86-64
 
 ```bash
 ./scripts/run-x64-repl.sh      # boot to serial REPL
 ./scripts/run-x64-ssh.sh       # boot with SSH networking
-```
-
-### Self-hosted x86-64
-
-```bash
-./scripts/run-x64-gen1-ssh.sh          # Gen0 → Gen1, boot Gen1 with SSH
-./scripts/run-x64-gen1-repl.sh         # Gen1 REPL only
-./scripts/run-x64-gen1-repl.sh --rebuild  # force full rebuild
 ```
 
 ### AArch64 (QEMU virt)
@@ -82,8 +78,6 @@ Requires SBCL and QEMU.
 ./scripts/run-aarch64-ssh.sh   # AArch64 with SSH networking (E1000, port 2222)
 ```
 
-Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
-
 ### i386 (QEMU)
 
 ```bash
@@ -91,7 +85,12 @@ Connect to AArch64 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 ./scripts/run-i386-ssh.sh      # i386 SSH over NE2000 NIC (port 2222)
 ```
 
-Connect to i386 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
+### ARM32 (QEMU raspi2b)
+
+```bash
+./scripts/run-arm32-ssh.sh     # ARM32 SSH over DWC2 USB CDC (port 2222)
+./scripts/run-arm32-repl.sh    # ARM32 serial REPL
+```
 
 ### Raspberry Pi (QEMU raspi3b)
 
@@ -101,6 +100,26 @@ Connect to i386 SSH: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 ./scripts/run-rpi-hid.sh       # USB keyboard-driven REPL
 ```
 
+### UEFI x86-64 (real hardware)
+
+```bash
+sbcl --script mvm/build-uefi-repl.lisp   # build UEFI EFI application
+./scripts/run-uefi-repl.sh               # test in QEMU with OVMF
+./scripts/run-uefi-repl.sh "(+ 1 2)"     # eval expression
+./scripts/make-uefi-usb.sh               # create bootable USB image
+sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M  # write to USB stick
+```
+
+### ThinkPad T420 (real hardware, i386)
+
+Boots from USB mass storage via Pi Zero 2W gadget. VGA console + PS/2 keyboard REPL, E1000 82579LM SSH over direct Ethernet to RPi5.
+
+```bash
+sbcl --script mvm/build-i386-diag-ssh.lisp
+scp /tmp/modus-i386-diag-ssh.img modus@modulator:/home/modus/modus.img
+ssh -J modus@modus-pi test@10.0.2.15 "(+ 1 2)"   # → = 3
+```
+
 ### Raspberry Pi Zero 2 W (real hardware)
 
 The Pi Zero 2 W boots via USB (no SD card needed) using rpiboot, with SSH over USB CDC-ECM Ethernet.
@@ -108,88 +127,63 @@ The Pi Zero 2 W boots via USB (no SD card needed) using rpiboot, with SSH over U
 ```bash
 # One-time: program USB boot OTP fuse (irreversible, requires SD card)
 bash scripts/fuse-pizero2w.sh
-sudo dd if=/tmp/pizero2w-fuse.img of=/dev/sdX bs=4M  # boot once to program fuse
 
 # Build and deploy
 sbcl --script mvm/build-pizero2w-actors.lisp   # actor-based SSH + HTTP
-# or: sbcl --script mvm/build-pizero2w-ssh.lisp   # single-threaded SSH
-
-# Full workflow (build, USB boot or UART redeploy, network setup, SSH)
-bash scripts/boot-pizero2w.sh
-
-# Manual deployment via UART bootloader (fast iteration)
-scp /tmp/piboot/kernel8.img pi5:~/kernel8.img
-ssh pi5 'sudo python3 ~/deploy-kernel.py ~/kernel8.img'
-ssh pi5 'sudo ip addr add 10.0.0.1/24 dev usb0; sudo ip link set usb0 up'
-ssh -o ConnectTimeout=30 test@10.0.0.2
+bash scripts/boot-pizero2w.sh                   # full workflow
 ```
 
-SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely. Build artifacts are cached by content hash.
+### Self-hosted x86-64
+
+SBCL cross-compiles Gen0 via the MVM pipeline (Source → MVM bytecode → x86-64 native). Gen0 boots in QEMU, runs `(build-image)` to natively compile Gen1 from its own embedded source (~558KB), and Gen1 is extracted via QMP. Gen1 can repeat the process indefinitely.
+
+```bash
+./scripts/run-x64-gen1-ssh.sh          # Gen0 → Gen1, boot Gen1 with SSH
+```
+
+Connect to any SSH server: `ssh -p 2222 -o StrictHostKeyChecking=no test@localhost`
 
 ## Project structure
 
 ```
-cross/                 Cross-compiler, x64 assembler, runtime (build.lisp ~13K lines)
-net/                   Shared networking/crypto/SSH (arch-independent, ~8000 lines)
-  arch-x86.lisp        x86 PCI I/O, addresses
-  arch-aarch64.lisp    AArch64 ECAM PCI, addresses
-  arch-raspi3b.lisp    RPi 3B/Zero 2 W adapter (DWC2 addresses, PCI stubs)
-  e1000.lisp           E1000 network driver
-  dwc2.lisp            DWC2 USB host controller (QEMU raspi3b)
-  dwc2-device.lisp     DWC2 USB gadget + CDC-ECM Ethernet (Pi Zero 2 W)
-  usb.lisp             USB enumeration, hub support
-  cdc-ether.lisp       CDC Ethernet NIC (USB host mode)
-  hid.lisp             USB HID keyboard/mouse/tablet
-  ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
-  crypto.lisp          SHA-256, ChaCha20, Poly1305, X25519, SHA-512, Ed25519
-  crypto-32.lisp       32-bit field multiply (pair arithmetic for i386)
-  crypto-i386.lisp     i386 SHA-256/512, ChaCha20 (w32 pair arithmetic)
-  ssh.lisp             SSH server (multi-connection)
-  http.lisp            HTTP/1.0 server
-  http-client.lisp     HTTP client with URL parsing and DNS
-  actors.lisp          Actor system (spawn, yield, send, receive, scheduler)
-  arch-i386.lisp       i386 adapter (NE2000, state addresses, PCI stubs)
-  ne2000.lisp          NE2000 ISA NIC driver (i386)
-  i386-overrides.lisp  30-bit fixnum safety overrides for i386
-  isolated-net.lisp    Qubes-like isolation (net-domain owns all hardware)
-  bcm2835-periph.lisp  System timer, GPIO LED, GPU framebuffer
-  uart-bootloader.lisp UART serial bootloader protocol
-crypto/                CL reference implementations (not yet MVM-adapted)
-  aes.lisp             AES-128/256 block cipher
-  gcm.lisp             GCM authenticated encryption
-  secp256k1.lisp       secp256k1 elliptic curve
-  hmac.lisp            HMAC
-  hkdf.lisp            HKDF key derivation
-  aead.lisp            AEAD construction
-  sha384.lisp          SHA-384
-  sha512.lisp          SHA-512 (4x16-bit limb variant)
-  nip04.lisp           Nostr NIP-04 encryption
-  nip44.lisp           Nostr NIP-44 encryption
-proto/                 Protocol implementations (CL reference, not yet MVM-adapted)
-  tls13.lisp           TLS 1.3 client (RFC 8446)
-  websocket.lisp       WebSocket client (RFC 6455)
-  nostr.lisp           Nostr protocol (NIP-01)
-  nip46.lisp           Nostr NIP-46 nsecBunker
-lib/                   Utility libraries (CL reference, not yet MVM-adapted)
-  json.lisp            JSON parser and serializer
-  trace.lisp           Timing/profiling macros
 mvm/                   Modus Virtual Machine
   mvm.lisp             ISA definition (~50 opcodes, encoding/decoding)
   compiler.lisp        3-phase compiler (Source → IR → MVM bytecode)
   prelude.lisp         MVM-compilable CL library (hash tables, sort, mapcar)
-  translate-x64.lisp   x86-64 native translator
-  translate-riscv.lisp RISC-V translator
-  translate-aarch64.lisp AArch64 translator
-  translate-ppc.lisp   PowerPC 64 translator
-  translate-i386.lisp  i386 translator
-  translate-68k.lisp   Motorola 68k translator
-  translate-arm32.lisp ARM32/ARMv7 translator
+  translate-*.lisp     Native code translators (9 architectures)
   interp.lisp          MVM interpreter (bootstrapping)
   target.lisp          Architecture descriptors (9 targets)
-boot/                  Per-architecture boot sequences (9 targets)
-runtime/               Tags, subtags
-scripts/               Build, run, and deployment scripts
-docs/                  Design documents and presentations
+  cross.lisp           Universal cross-compilation pipeline
+  repl-source.lisp     Embedded REPL source for bare-metal builds
+  build-*.lisp         Build scripts for all platforms
+boot/                  Per-architecture boot sequences (9 targets + UEFI)
+net/                   Networking, crypto, SSH, USB, actors
+  ip.lisp              ARP, IP, UDP, TCP, DHCP, DNS, ICMP
+  crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
+  ssh.lisp             SSH-2 server (key exchange, auth, channels)
+  e1000.lisp           Intel E1000 NIC driver
+  ne2000.lisp          NE2000 ISA NIC driver
+  dwc2.lisp            DWC2 USB host controller (RPi 3B QEMU)
+  dwc2-device.lisp     DWC2 USB gadget + CDC-ECM (Pi Zero 2 W)
+  usb.lisp             USB enumeration + hub support
+  actors.lisp          Actor system (spawn, yield, send, receive)
+  i386-ehci.lisp       EHCI USB host controller (T420)
+  i386-e1000-raw.lisp  E1000 82579LM driver (T420)
+  i386-console.lisp    VGA console + PS/2 keyboard (T420)
+  http.lisp            HTTP/1.0 server
+  http-client.lisp     HTTP client with URL parsing
+  hid.lisp             USB HID keyboard/mouse/tablet
+  uefi-console.lisp    UEFI GOP framebuffer + PS/2 keyboard
+  bcm2835-periph.lisp  GPIO, SPI, I2C, system timer
+  uart-bootloader.lisp UART bootloader for rapid kernel redeploy
+cross/                 x64 assembler (used by MVM)
+runtime/               Tags, subtags, package definitions
+scripts/               Build, run, test, and deployment scripts
+tests/                 QEMU integration tests + SSH oracle
+docs/                  Design documents
+lib/                   Shared utilities (MVM loader, hash functions)
+crypto/                CL reference crypto implementations
+proto/                 CL reference protocol implementations (TLS 1.3, WebSocket, Nostr)
 ```
 
 ## Design
@@ -198,19 +192,13 @@ docs/                  Design documents and presentations
 
 MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the Lisp compiler from target architectures. The compiler is a 3-phase pipeline: Source → IR (virtual register operations) → MVM bytecode. Thin per-architecture translators (~1300-1900 lines each) convert MVM bytecode to native code.
 
-All 9 architectures produce correct output (factorial 3628800) in QEMU. The x86-64 target is the primary platform with full runtime support (networking, SSH, actors, self-hosting). AArch64 supports REPL and SSH via both QEMU virt (PCI ECAM + E1000) and real Pi hardware (DWC2 USB + CDC-ECM). i386 runs an SSH server over an NE2000 ISA NIC with 30-bit fixnum-safe crypto (pair arithmetic for SHA-256, ChaCha20, X25519, Ed25519), and achieves a self-hosting cross-compilation fixpoint across all three architectures. The other 6 targets boot and run serial output programs.
-
 ### Tagged objects
 
-4-bit tag scheme with 63-bit fixnums. Large enough for native 64-bit multiply, which makes 256-bit elliptic curve cryptography practical without bignums (4 limbs instead of 32).
+4-bit tag scheme with 63-bit fixnums (64-bit architectures) or 30-bit fixnums (32-bit). Large enough for native multiply, which makes 256-bit elliptic curve cryptography practical without bignums. 32-bit targets use pair arithmetic (carry chains) for crypto operations.
 
 ### Self-hosting
 
-The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap. The MVM compiler can also compile its own source to architecture-independent bytecode, proving the compilation pipeline is a fixed point.
-
-### Cross-architecture fixpoint
-
-The fixpoint proof chain (`scripts/run-fixpoint-i386.sh`) runs 8 QEMU steps across x64, AArch64, and i386 to verify 5 SHA256 equalities — proving that the same bytecodes produce byte-identical native code regardless of which architecture runs the translator. This includes i386 self-hosting (i386 compiles itself), i386→x64, and i386→AArch64 cross-compilation.
+The kernel carries its own source (~558KB, plain s-expressions with symbol names replaced by integer hashes) and includes a native compiler that rebuilds the entire kernel from it. Each generation copies the source blob into the next, so SBCL is only needed for the initial bootstrap.
 
 ### Actors and SMP
 

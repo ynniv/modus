@@ -8,50 +8,8 @@
 ;;;;     -device usb-net,netdev=net0 \
 ;;;;     -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Load REPL source + shared networking source
-;;; ============================================================
-
-(format t "Loading REPL + USB networking source...~%")
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
 (defun read-file-text (path)
@@ -68,13 +26,14 @@
 ;; + ip + crypto + ssh + overrides
 ;; Note: e1000.lisp is NOT loaded — cdc-ether.lisp provides the same interface
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-raspi3b.lisp" *net-dir*))
           (read-file-text (merge-pathnames "dwc2.lisp" *net-dir*))
           (read-file-text (merge-pathnames "usb.lisp" *net-dir*))
           (read-file-text (merge-pathnames "cdc-ether.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))))
 
@@ -82,15 +41,13 @@
 ;;; Build RPi SSH image (raspi3b + DWC2 USB + CDC Ethernet)
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)
 
-;; Combine: SSH kernel-main (entry point) + net source + REPL source
-;; kernel-main MUST be first: boot code falls through to it.
-;; Net source and REPL source follow (functions resolved via NFN table).
-;; Last defun of a given name wins — overrides loaded last take effect.
+;; Combine: net source + REPL source + SSH kernel-main
+;; SSH kernel-main MUST be LAST: "last-defun-wins" makes it the entry point.
 (let* ((ssh-main (format nil "~{~A~%~}"
                         (list
                          "(defun kernel-main ()"
@@ -98,6 +55,7 @@
                          "  (pci-assign-bars)"
                          ;; Initialize USB + CDC Ethernet (replaces e1000-probe)
                          "  (cdc-ether-init)"
+                         "  (dwc2-enable-host-irq)"
                          "  (write-byte 91) (write-byte 49) (write-byte 93)"
                          "  (sha256-init)"
                          "  (write-byte 91) (write-byte 50) (write-byte 93)"
@@ -107,7 +65,7 @@
                          "  (write-byte 91) (write-byte 52) (write-byte 93)"
                          "  (ssh-seed-random)"
                          "  (write-byte 91) (write-byte 53) (write-byte 93)"
-                         "  (dhcp-discover)"
+                         "  (dhcp-client)"
                          "  (write-byte 91) (write-byte 54) (write-byte 93)"
                          "  (ssh-seed-random)"
                          "  (ssh-init-strings)"
@@ -126,6 +84,8 @@
                          "    (setf (mem-ref (+ state #x748) :u32) #xA148C03A)"
                          "    (setf (mem-ref (+ state #x74C) :u32) #x29DA598B)"
                          "    (setf (mem-ref (+ state #x624) :u32) 1))"
+                         ;; Pre-compute ed25519 host key derivatives (s, prefix)
+                         "  (pre-compute-host-sign)"
                          "  (write-byte 83) (write-byte 83) (write-byte 72)"
                          "  (write-byte 58) (print-dec 22) (write-byte 10)"
                          "  (setf (mem-ref (+ (ssh-ipc-base) #x60438) :u32) 22)"
@@ -134,13 +94,16 @@
                          "      (when (>= i 4) (return 0))"
                          "      (setf (mem-ref (conn-base i) :u32) 0)"
                          "      (setq i (+ i 1))))"
+                         ;; Pre-compute server ephemeral X25519 key pair
+                         "  (pre-compute-server-eph (conn-ssh 0))"
+                         ;; Enable ARM timer for WFI-based io-delay (after all crypto init)
+                         "  (enable-rpi-timer)"
                          "  (net-actor-main))")))
-       ;; SSH kernel-main MUST be first: boot code falls through to it.
-       ;; Net source and REPL source follow (functions resolved via NFN table).
+       ;; SSH kernel-main MUST be LAST: "last-defun-wins" makes it the entry point.
        (combined-source (concatenate 'string
-                                      ssh-main
                                       cl-user::*net-source*
-                                      *repl-source*)))
+                                      *repl-source*
+                                      ssh-main)))
   (format t "Building RPi SSH image (raspi3b + DWC2 USB)...~%")
   (format t "Combined source: ~D chars~%" (length combined-source))
   (let ((image (build-image :target :rpi :source-text combined-source)))

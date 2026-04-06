@@ -1,9 +1,9 @@
-;;;; packages.lisp - Runtime package definition for Modus64
+;;;; packages.lisp - Runtime package definition for Modus
 ;;;;
 ;;;; This defines the runtime package. These files are compiled
 ;;;; by the cross-compiler and become part of the kernel image.
 
-(defpackage :modus64.runtime
+(defpackage :modus.runtime
   (:use)  ; Use nothing - we define everything from scratch
   (:export
    ;; Tag constants

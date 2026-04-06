@@ -1,4 +1,4 @@
-;;;; boot-ppc32.lisp - PPC32 Boot Sequence for Modus64
+;;;; boot-ppc32.lisp - PPC32 Boot Sequence for Modus
 ;;;;
 ;;;; PPC32 boot protocol (for qemu-system-ppc -machine ppce500):
 ;;;;   1. U-Boot or firmware hands off in real mode
@@ -12,7 +12,7 @@
 ;;;; UART: ppce500 maps a 16550-compatible UART in the CCSR space.
 ;;;; For QEMU ppce500, the UART is at 0xE0004500.
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; PPC32 Boot Constants

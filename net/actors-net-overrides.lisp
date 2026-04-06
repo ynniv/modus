@@ -66,8 +66,10 @@
                         (let ((proto (mem-ref (+ buf 23) :u8)))
                           (if (eq proto 1)
                               (icmp-handle buf 14)
-                              (when (eq proto 6)
-                                (net-handle-tcp buf pkt-len))))))
+                              (if (eq proto 17)
+                                  (udp-handle buf 14)
+                                  (when (eq proto 6)
+                                    (net-handle-tcp buf pkt-len)))))))
                   ())))))))
 
 ;;; ============================================================

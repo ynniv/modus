@@ -1,4 +1,4 @@
-;;;; boot-riscv.lisp - RISC-V Boot Sequence for Modus64
+;;;; boot-riscv.lisp - RISC-V Boot Sequence for Modus
 ;;;;
 ;;;; RISC-V boot protocol (for -machine virt with OpenSBI):
 ;;;;   1. Firmware (OpenSBI) hands off in M-mode or S-mode
@@ -14,7 +14,7 @@
 ;;;; SMP via SBI HSM extension:
 ;;;;   - sbi_hart_start(hartid, start_addr, opaque) to wake secondary harts
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; RISC-V Boot Constants

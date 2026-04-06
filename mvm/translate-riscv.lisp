@@ -14,7 +14,7 @@
 ;;;;
 ;;;; Scratch temporaries: t0-t6 (x5-x7, x28-x31)
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; RISC-V Physical Register Encoding
@@ -674,6 +674,32 @@
               (rb (resolve2 (vreg 2))))
          (rv-emit-srai buf +rv-t0+ ra 1)       ; untag first operand
          (rv-emit-mul buf +rv-t0+ +rv-t0+ rb)  ; multiply (result has one tag bit)
+         (store-result vd +rv-t0+)))
+
+      (#.+op-mul26lo+
+       ;; Low 26 bits of untag(Va)*untag(Vb), tagged
+       (let* ((vd (vreg 0))
+              (ra (resolve (vreg 1)))
+              (rb (resolve2 (vreg 2))))
+         (rv-emit-srai buf +rv-t0+ ra 1)        ; untag a
+         (rv-emit-srai buf +rv-t1+ rb 1)        ; untag b
+         (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+) ; 64-bit result
+         ;; Mask to 26 bits: SLLI 38, SRLI 38 (clears bits 26+)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 38)
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ 38)
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; retag
+         (store-result vd +rv-t0+)))
+
+      (#.+op-mul26hi+
+       ;; Bits 26+ of untag(Va)*untag(Vb), tagged
+       (let* ((vd (vreg 0))
+              (ra (resolve (vreg 1)))
+              (rb (resolve2 (vreg 2))))
+         (rv-emit-srai buf +rv-t0+ ra 1)        ; untag a
+         (rv-emit-srai buf +rv-t1+ rb 1)        ; untag b
+         (rv-emit-mul buf +rv-t0+ +rv-t0+ +rv-t1+) ; 64-bit result
+         (rv-emit-srli buf +rv-t0+ +rv-t0+ 26)  ; shift right 26
+         (rv-emit-slli buf +rv-t0+ +rv-t0+ 1)   ; retag
          (store-result vd +rv-t0+)))
 
       (#.+op-div+

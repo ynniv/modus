@@ -8,53 +8,11 @@
 ;;;; Or manually:
 ;;;;   sudo dd if=/tmp/pizero2w.img of=/dev/sdX bs=4M status=progress
 ;;;;
-;;;; Shows colored rectangles + "MODUS64" text on HDMI display.
+;;;; Shows colored rectangles + "MODUS" text on HDMI display.
 ;;;; No UART needed — pure HDMI output.
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Load REPL + framebuffer sources
-;;; ============================================================
-
-(format t "Loading REPL + framebuffer source...~%")
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
 (defun read-file-text (path)
@@ -89,7 +47,7 @@
 ;;; Build HDMI demo kernel
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)
@@ -113,7 +71,7 @@
                          "    (when (not (zerop fb-addr))"
                          ;; Clear to dark background
                          "      (fb-clear 16 16 32)"
-                         ;; === "MODUS64" in large block letters ===
+                         ;; === "MODUS" in large block letters ===
                          ;; Each letter is 80px wide, 120px tall, starting at y=80
                          ;; Total width: 7 letters * 80 + 6 gaps * 16 = 656px
                          ;; Center horizontally: (1280-656)/2 = 312

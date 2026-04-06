@@ -20,9 +20,9 @@ set -e
 cd "$(dirname "$0")/.."
 
 TIMEOUT=${FIXPOINT_TIMEOUT:-120}
-X64_IMAGE_SIZE=2621504    # 0x280000 + 64
-A64_IMAGE_SIZE=3145792    # 0x300000 + 64
-I386_IMAGE_SIZE=2621504   # 0x280000 + 64 (same layout as x64)
+X64_IMAGE_SIZE=3670080    # 0x380000 + 64
+A64_IMAGE_SIZE=4194368    # 0x400000 + 64
+I386_IMAGE_SIZE=3670080   # 0x380000 + 64 (same layout as x64)
 GEN0=/tmp/fixpoint-gen0.elf
 GEN1=/tmp/fixpoint-gen1.bin
 GEN2=/tmp/fixpoint-gen2.bin
@@ -145,7 +145,7 @@ echo ""
 echo "Step 4: Gen0(x64) → i386-A"
 GEN0_I386=/tmp/fixpoint-gen0-i386.elf
 cp "$GEN0" "$GEN0_I386"
-patch_target "$GEN0_I386" $((0x280000)) 2
+patch_target "$GEN0_I386" $((0x380000)) 2
 extract_image "$GEN0_I386" "$I386_A" "i386-A" \
   "qemu-system-x86_64 -m 512 -no-reboot" \
   134217728 $I386_IMAGE_SIZE
@@ -166,7 +166,7 @@ echo "Step 6: i386-A → i386-C (i386 self-hosting)"
 I386_C=/tmp/fixpoint-i386-self.bin
 I386_A_SELF=/tmp/fixpoint-i386a-self.bin
 cp "$I386_A" "$I386_A_SELF"
-patch_target "$I386_A_SELF" $((0x280000)) 2
+patch_target "$I386_A_SELF" $((0x380000)) 2
 extract_image "$I386_A_SELF" "$I386_C" "i386-C" \
   "qemu-system-i386 -m 256 -no-reboot" \
   134217728 $I386_IMAGE_SIZE
@@ -177,7 +177,7 @@ echo "Step 7: i386-A → x64-D (i386→x64 cross-compilation)"
 X64_D=/tmp/fixpoint-x64-from-i386.bin
 I386_A_X64=/tmp/fixpoint-i386a-x64.bin
 cp "$I386_A" "$I386_A_X64"
-patch_target "$I386_A_X64" $((0x280000)) 0
+patch_target "$I386_A_X64" $((0x380000)) 0
 extract_image "$I386_A_X64" "$X64_D" "x64-D" \
   "qemu-system-i386 -m 256 -no-reboot" \
   134217728 $X64_IMAGE_SIZE
@@ -188,7 +188,7 @@ echo "Step 8: i386-A → AArch64-E (i386→AArch64 cross-compilation)"
 A64_E=/tmp/fixpoint-a64-from-i386.bin
 I386_A_A64=/tmp/fixpoint-i386a-a64.bin
 cp "$I386_A" "$I386_A_A64"
-patch_target "$I386_A_A64" $((0x280000)) 1
+patch_target "$I386_A_A64" $((0x380000)) 1
 extract_image "$I386_A_A64" "$A64_E" "AArch64-E" \
   "qemu-system-i386 -m 256 -no-reboot" \
   134217728 $A64_IMAGE_SIZE

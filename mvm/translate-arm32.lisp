@@ -27,7 +27,7 @@
 ;;;; QEMU target: versatilepb -cpu arm926
 ;;;;   PL011 UART at 0x101F1000
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; ARMv5/ARMv7 Mode Selection
@@ -37,11 +37,25 @@
   "When T, emit ARMv7-A instructions (SDIV, MOVW/MOVT, DMB, LDREX/STREX).
    When NIL (default), emit ARMv5 instructions (software divide, SWP, MCR fence).")
 
+(defvar *arm32-uart-override* nil
+  "When non-NIL, use this UART base address instead of the default.")
+
+(defvar *arm32-labels-ht* nil
+  "Global hash table for ARM32 label positions (avoids buf corruption).")
+
+(defvar *arm32-fn-labels* nil
+  "Reusable array for per-function branch target labels (avoids hash table GC pressure).")
+
+(defvar *arm32-code-bytes* nil
+  "Pre-allocated byte array for ARM32 code output (1048576 bytes).")
+
 (defun arm32-uart-base ()
   "Return the UART base address for the current mode.
    ARMv5 versatilepb: PL011 at 0x101F1000
-   ARMv7 virt:        PL011 at 0x09000000"
-  (if *arm32-v7* #x09000000 #x101F1000))
+   ARMv7 virt:        PL011 at 0x09000000
+   ARMv7 RPi:         PL011 at 0x3F201000"
+  (or *arm32-uart-override*
+      (if *arm32-v7* #x09000000 #x101F1000)))
 
 ;;; ============================================================
 ;;; ARM32 Physical Register Constants
@@ -89,17 +103,22 @@
 (defconstant +arm32-max-inline+ 8
   "Virtual registers V0-V7 have dedicated physical registers.")
 
-(defconstant +arm32-frame-size+ 96
-  "Stack frame: 36 bytes save area + 32 bytes spill + 28 bytes pad = 96.
-   Must be 8-byte aligned.")
+(defconstant +arm32-frame-size+ 512
+  "Stack frame: 512 bytes (8-byte aligned).
+   Layout from SP: frame slots 0-119 at SP+0..SP+476 (via OBJ-REF VFP),
+   spill V8-V15 at SP+480..SP+508.
+   Previous 192-byte frame caused spill/slot overlap for 32+ param functions
+   (e.g., fe-mul-4 with 31 params: let bindings at slot 32 = SP+128
+   collided with V8 spill at SP+128).")
 
-(defconstant +arm32-spill-base+ -68
-  "Spill slots start at FP-68 (after 9 saved regs * 4 = 36 bytes save area).")
+(defconstant +arm32-spill-base+ 482
+  "Spill slots start at VFP+482 = SP+480, safely past max frame slot 119 at SP+476.
+   Spills V8-V15 use SP+480..SP+508 (8 slots * 4 bytes).")
 
 (defun arm32-spill-offset (vreg)
   "Compute the frame offset for a spilled virtual register."
   (let ((slot (- vreg +arm32-max-inline+)))
-    (- +arm32-spill-base+ (* slot 4))))
+    (+ +arm32-spill-base+ (* slot 4))))
 
 ;;; ============================================================
 ;;; ARM32 Condition Codes
@@ -127,7 +146,7 @@
 ;;; Buffer stores instruction words; converted to LE bytes at end.
 
 (defstruct arm32-buffer
-  (code (make-array 32768))             ; fixed-size, position tracks fill
+  (code (make-array 262144))            ; fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))
   (fixups nil)
   (div-label nil)    ; label ID for software divide routine
@@ -356,6 +375,17 @@
   "MUL Rd, Rm, Rs -> Rd = Rm * Rs  (Rd must not equal Rm on ARMv5!)"
   (arm32-emit buf (logior (ash +arm-cc-al+ 28)
                           (ash (logand rd #xF) 16)
+                          (ash (logand rs #xF) 8)
+                          (ash #b1001 4)
+                          (logand rm #xF))))
+
+(defun arm32-umull (buf rdlo rdhi rm rs)
+  "UMULL RdLo, RdHi, Rm, Rs -> RdHi:RdLo = Rm * Rs (unsigned 64-bit).
+   Constraints (ARMv5): RdHi != RdLo, RdHi != Rm, RdLo != Rm."
+  (arm32-emit buf (logior (ash +arm-cc-al+ 28)
+                          (ash #b100 21)
+                          (ash (logand rdhi #xF) 16)
+                          (ash (logand rdlo #xF) 12)
                           (ash (logand rs #xF) 8)
                           (ash #b1001 4)
                           (logand rm #xF))))
@@ -605,6 +635,11 @@
                           (ash #xF9 4)
                           (logand rm #xF))))
 
+(defun arm32-sev (buf)
+  "SEV  (ARMv7: Send Event hint)
+   Encoding: cond 0011 0010 0000 1111 0000 0000 0100"
+  (arm32-emit buf #xE320F004))
+
 (defun arm32-wfe (buf)
   "WFE  (ARMv7: Wait For Event hint)
    Encoding: cond 0011 0010 0000 1111 0000 0000 0010"
@@ -790,25 +825,29 @@
    After this, r11 (VFP) = SP - 2 (tagged with object tag 2),
    pointing into the allocated frame area below saved registers.
    obj-ref slot 0 maps to [SP], slot 1 to [SP+4], etc."
-  ;; PUSH {r4-r11, lr}
-  ;; Register list: bits 4-11 and bit 14
+  ;; PUSH {r4-r8, r11, lr}
+  ;; Register list: bits 4-8, 11, 14
+  ;; r9 (alloc ptr) and r10 (alloc limit) are global — must NOT be saved/restored
   (let ((reglist (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)
-                         (ash 1 8) (ash 1 9) (ash 1 10) (ash 1 11)
+                         (ash 1 8) (ash 1 11)
                          (ash 1 14))))
     (arm32-push buf reglist))
-  ;; SUB sp, sp, #32  (allocate frame: 8 slots * 4 bytes)
-  (arm32-sub-imm buf +arm-sp+ +arm-sp+ 0 32)
+  ;; SUB sp, sp, #512  (allocate frame)
+  ;; 512 = 0x200 = 2 ROR 24 → rotate=12, imm8=2
+  (arm32-sub-imm buf +arm-sp+ +arm-sp+ 12 2)
   ;; SUB r11, sp, #2  (VFP = SP - 2, tagged with object tag 2)
   ;; This ensures obj-ref slots access the frame area, not saved registers.
   (arm32-sub-imm buf +arm-r11+ +arm-sp+ 0 2))
 
 (defun arm32-emit-epilogue (buf)
   "Emit function epilogue: restore and return."
-  ;; ADD sp, sp, #32  (deallocate frame)
-  (arm32-add-imm buf +arm-sp+ +arm-sp+ 0 32)
-  ;; POP {r4-r11, pc}  (restore callee-saved, return via PC)
+  ;; ADD sp, sp, #512  (deallocate frame)
+  ;; 512 = 0x200 = 2 ROR 24 → rotate=12, imm8=2
+  (arm32-add-imm buf +arm-sp+ +arm-sp+ 12 2)
+  ;; POP {r4-r8, r11, pc}  (restore callee-saved, return via PC)
+  ;; r9/r10 not restored — they are global alloc ptr/limit
   (let ((reglist (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)
-                         (ash 1 8) (ash 1 9) (ash 1 10) (ash 1 11)
+                         (ash 1 8) (ash 1 11)
                          (ash 1 15))))   ; POP to PC = return
     (arm32-pop buf reglist)))
 
@@ -855,7 +894,18 @@
            (cond
              ((< code #x0100)
               ;; Frame-enter: emit function prologue (push regs, allocate frame)
-              (arm32-emit-prologue buf))
+              (arm32-emit-prologue buf)
+              ;; Copy overflow args (params 5+) from caller's stack to frame slots.
+              ;; After prologue: PUSH 7 regs (28 bytes) + SUB SP 512.
+              ;; Overflow arg k is at [SP + 540 + k*4].
+              ;; Compiler accesses param N (N>=4) via obj-ref VFP N → [SP + N*4].
+              (when (> code 4)
+                (loop for param-idx from 4 below code
+                      for k from 0
+                      do (let ((src-off (+ 540 (* k 4)))
+                               (dst-off (* param-idx 4)))
+                           (arm32-ldr buf +arm-r12+ +arm-sp+ src-off)
+                           (arm32-str buf +arm-r12+ +arm-sp+ dst-off)))))
              ((< code #x0300)
               nil) ; frame-alloc/frame-free: NOP for now
              ((= code #x0300)
@@ -867,6 +917,42 @@
               (arm32-load-imm32 buf +arm-lr+ (arm32-uart-base))
               ;; STRB r12, [r14, #0]
               (arm32-strb buf +arm-r12+ +arm-lr+ 0))
+             ((= code #x0301)
+              ;; Serial read: poll PL011 UART until byte available,
+              ;; return tagged fixnum char in r0.
+              ;; UARTFR at offset 0x18, RXFE = bit 4 (RX FIFO empty)
+              ;; Load UART base into r14
+              (arm32-load-imm32 buf +arm-lr+ (arm32-uart-base))
+              ;; Poll loop: LDRB r12, [r14, #0x18]  (read UARTFR)
+              (let ((poll-label (mvm-make-label)))
+                (arm32-emit-label buf poll-label)
+                (arm32-ldrb buf +arm-r12+ +arm-lr+ #x18)
+                ;; TST r12, #0x10  (test RXFE bit 4)
+                (arm32-dp-imm buf +arm-dp-tst+ 0 +arm-r12+ 0 #x10 :s 1)
+                ;; BNE poll-label  (loop while RXFE set)
+                (arm32-b-cond buf +arm-cc-ne+ poll-label))
+              ;; Read data byte: LDRB r0, [r14, #0]
+              (arm32-ldrb buf +arm-r0+ +arm-lr+ 0)
+              ;; Tag as fixnum: LSL r0, r0, #1
+              (arm32-lsl-imm buf +arm-r0+ +arm-r0+ 1))
+             ((= code #x0304)
+              ;; WFI: Wait For Interrupt
+              ;; ARM encoding: 0xE320F003 (cond=AL, WFI hint)
+              ;; Wakes on pending interrupt even with CPSR I-bit set
+              (arm32-emit buf #xE320F003))
+             ((= code #x0320)
+              ;; SETUP-IRQ: init ARM virtual timer on ARMv7
+              ;; CNTVTVAL = 62500 (1ms at 62.5MHz), CNTVCTL = 1 (enable)
+              (when *arm32-v7*
+                (arm32-movw buf +arm-r0+ #xF424)      ; r0 = 62500
+                (arm32-emit buf #xEE0E0F13)            ; MCR p15, 0, r0, c14, c3, 0
+                (arm32-movw buf +arm-r0+ 1)            ; r0 = 1
+                (arm32-emit buf #xEE0E0F33)))          ; MCR p15, 0, r0, c14, c3, 1
+             ((= code #x0321)
+              ;; TIMER-REARM: re-arm virtual timer on ARMv7
+              (when *arm32-v7*
+                (arm32-movw buf +arm-r0+ #xF424)      ; r0 = 62500
+                (arm32-emit buf #xEE0E0F13)))
              (t
               ;; Real trap: SWI
               (arm32-swi buf code)))))
@@ -1191,8 +1277,11 @@
              ;; Tag: ORR Rd, r9, #1
              (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 1)
              (arm32-store-vreg buf +arm-r12+ vd)
-             ;; Bump alloc pointer: ADD r9, r9, #8
-             (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 8))))
+             ;; Bump alloc pointer: ADD r9, r9, #16
+             ;; 16-byte alignment required: 4-bit tag uses low nibble.
+             ;; Cons is 8 bytes (2 words) but we need 16-byte stride so
+             ;; low 4 bits of alloc pointer stay 0x0 (not 0x8).
+             (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 16))))
 
         (#.+op-setcar+
          ;; STR Vs, [Vd, #-1]
@@ -1242,10 +1331,9 @@
            (arm32-load-imm32 buf +arm-r12+ (logior (ash size 8) subtag))
            ;; STR r12, [r9, #0]  (store header at alloc ptr)
            (arm32-str buf +arm-r12+ +arm-r9+ 0)
-           ;; Object tag = 2; pointer = alloc + 4 + tag
-           ;; ORR result, r9+4, #2 → ADD r12, r9, #4; ORR r12, r12, #2
-           (arm32-add-imm buf +arm-r12+ +arm-r9+ 0 4)
-           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 2)
+           ;; Object tag = 2; pointer = alloc | tag (like i386 uses alloc | 0x09)
+           ;; Header at alloc, slots at alloc+4+. OBJ-REF offset = 2 + idx*4.
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
            (arm32-store-vreg buf +arm-r12+ vd)
            ;; Bump alloc: total = (1 + size) * 4 bytes (header + slots)
            ;; Align to 16 bytes to keep cons alloc pointer aligned
@@ -1258,6 +1346,35 @@
                    (progn
                      (arm32-load-imm32 buf +arm-lr+ total)
                      (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))))))
+
+        (#.+op-alloc-array+
+         ;; (alloc-array Vd Vcount) — dynamic array allocation
+         ;; Vcount: UNTAGGED element count (compiler SAR'd it already)
+         ;; 32-bit: header = (count << 8) | 0x32, 4 bytes
+         ;; Allocates (count+1)*4 bytes, aligned to 16
+         ;; Result = VA | 2 (object tag)
+         (let ((vd (vreg 0))
+               (vcount (vreg 1)))
+           ;; Load count into R12
+           (arm32-load-vreg buf +arm-r12+ vcount)
+           ;; Save count in LR (can't push — frame is set)
+           (arm32-mov buf +arm-lr+ +arm-r12+)
+           ;; Build header: R12 = (count << 8) | 0x32
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 8)
+           (arm32-orr-imm buf +arm-r12+ +arm-r12+ 0 #x32)
+           ;; Store header at [R9] (alloc pointer)
+           (arm32-str buf +arm-r12+ +arm-r9+ 0)
+           ;; Result: R12 = R9 | 2 (object tag)
+           (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 2)
+           (arm32-store-vreg buf +arm-r12+ vd)
+           ;; Compute alloc size from saved count in LR
+           ;; total = (count + 1) * 4, aligned to 16
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 1)   ; count + 1
+           (arm32-lsl-imm buf +arm-lr+ +arm-lr+ 2)     ; * 4
+           (arm32-add-imm buf +arm-lr+ +arm-lr+ 0 15)  ; + 15
+           (arm32-bic-imm buf +arm-lr+ +arm-lr+ 0 15)  ; & ~15 (align to 16)
+           ;; Bump alloc pointer: R9 += LR
+           (arm32-add buf +arm-r9+ +arm-r9+ +arm-lr+)))
 
         (#.+op-obj-ref+
          ;; (obj-ref Vd Vobj idx)
@@ -1276,6 +1393,56 @@
            (with-src2 (pobj (vreg 0) +arm-r12+) (ps (vreg 2) +arm-lr+)
              (let ((off (+ 2 (* idx 4))))
                (arm32-str buf ps pobj off)))))
+
+        (#.+op-aref+
+         ;; (aref Vd Vobj Vidx) — variable-index array load (tagged word)
+         ;; Address = Vobj + Vidx*2 + 2 (matches OBJ-REF offset formula)
+         (let ((vd (vreg 0)))
+           (with-src2 (pidx (vreg 2) +arm-r12+) (pobj (vreg 1) +arm-lr+)
+             ;; R12 = Vidx * 2 (tagged idx → slot byte offset)
+             (arm32-lsl-imm buf +arm-r12+ pidx 1)
+             ;; R12 = R12 + Vobj
+             (arm32-add buf +arm-r12+ +arm-r12+ pobj)
+             ;; LDR R12, [R12, #2]
+             (arm32-ldr buf +arm-r12+ +arm-r12+ 2)
+             (arm32-store-vreg buf +arm-r12+ vd))))
+
+        (#.+op-aset+
+         ;; (aset Vobj Vidx Vs) — variable-index array store (tagged word)
+         ;; Address = Vobj + Vidx*2 + 2 (matches OBJ-SET offset formula)
+         (with-src (pval (vreg 2) +arm-lr+)
+           ;; Load Vidx into R12
+           (arm32-load-vreg buf +arm-r12+ (vreg 1))
+           ;; R12 = Vidx * 2
+           (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)
+           ;; Save value on stack
+           (arm32-str-pre buf pval +arm-sp+ -4)
+           ;; Load Vobj into LR
+           (arm32-load-vreg buf +arm-lr+ (vreg 0))
+           ;; R12 = R12 + Vobj
+           (arm32-add buf +arm-r12+ +arm-r12+ +arm-lr+)
+           ;; Restore value from stack
+           (arm32-ldr-post buf +arm-lr+ +arm-sp+ 4)
+           ;; STR value, [R12, #2]
+           (arm32-str buf +arm-lr+ +arm-r12+ 2)))
+
+        (#.+op-array-len+
+         ;; (array-len Vd Vobj) — extract element count from header
+         ;; Header at Vobj - 2 (object tag = 2)
+         ;; Header format: [subtag_half:8][count:24] — count = header >> 8
+         (let ((vd (vreg 0)))
+           (with-src (ps (vreg 1))
+             ;; SUB R12, Vobj, #2 (strip object tag)
+             (arm32-sub-imm buf +arm-r12+ ps 0 2)
+             ;; LDR R12, [R12] (load header word)
+             (arm32-ldr buf +arm-r12+ +arm-r12+ 0)
+             ;; LSR R12, R12, #8 (count = header >> 8)
+             (arm32-lsr-imm buf +arm-r12+ +arm-r12+ 8)
+             ;; BIC R12, R12, #0xFF000000 (mask to 24 bits — clear top byte)
+             (arm32-bic-imm buf +arm-r12+ +arm-r12+ 4 #xFF)
+             ;; LSL R12, R12, #1 (tag as fixnum)
+             (arm32-lsl-imm buf +arm-r12+ +arm-r12+ 1)
+             (arm32-store-vreg buf +arm-r12+ vd))))
 
         (#.+op-obj-tag+
          ;; Extract low 4 bits
@@ -1348,11 +1515,12 @@
          ;; (tailcall target:imm32) - operand is bytecode offset
          ;; Restore frame, then branch (not link)
          (let ((target-pc (vreg 0)))
-           ;; Restore frame
-           (arm32-mov buf +arm-sp+ +arm-r11+)
-           ;; POP {r4-r11, lr}  (restore callee-saved but DON'T return)
+           ;; Deallocate frame: ADD SP, SP, #512
+           (arm32-add-imm buf +arm-sp+ +arm-sp+ 12 2)
+           ;; POP {r4-r8, r11, lr}  (restore callee-saved but DON'T return)
+           ;; r9/r10 not restored — global alloc ptr/limit
            (let ((reglist (logior (ash 1 4) (ash 1 5) (ash 1 6) (ash 1 7)
-                                  (ash 1 8) (ash 1 9) (ash 1 10) (ash 1 11)
+                                  (ash 1 8) (ash 1 11)
                                   (ash 1 14))))
              (arm32-pop buf reglist))
            ;; B target
@@ -1362,12 +1530,13 @@
 
         (#.+op-alloc-cons+
          ;; (alloc-cons Vd) — allocate cons cell without filling
+         ;; 16-byte alignment for 4-bit tag (same as CONS)
          (let ((vd (vreg 0)))
            ;; Tag: ORR Rd, r9, #1
            (arm32-orr-imm buf +arm-r12+ +arm-r9+ 0 1)
            (arm32-store-vreg buf +arm-r12+ vd)
-           ;; Bump: ADD r9, r9, #8
-           (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 8)))
+           ;; Bump: ADD r9, r9, #16
+           (arm32-add-imm buf +arm-r9+ +arm-r9+ 0 16)))
 
         (#.+op-gc-check+
          ;; CMP r9(VA), r10(VL); trap if VA >= VL
@@ -1400,9 +1569,9 @@
          (arm32-ldr buf +arm-r3+ +arm-r11+ -16))
 
         (#.+op-yield+
-         (if *arm32-v7*
-             (arm32-wfe buf)         ; ARMv7: WFE (Wait For Event)
-             (arm32-nop buf)))       ; ARMv5: NOP (no WFE instruction)
+         ;; NOP on all ARM32 variants. WFE halts the CPU on QEMU raspi2b
+         ;; with no wake event, causing 0% CPU hang in polling loops.
+         (arm32-nop buf))
 
         (#.+op-atomic-xchg+
          (let ((vd (vreg 0)))
@@ -1484,6 +1653,62 @@
              (arm32-load-imm32 buf +arm-r12+ offset)
              (arm32-str buf ps +arm-r12+ 0))))
 
+        (#.+op-mul26lo+
+         ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
+         ;; Uses UMULL for 32x32→64 unsigned multiply, extracts low 26 bits.
+         ;; Needs 3 scratch regs: r12, lr, r4 (saved/restored via PUSH/POP).
+         (let ((vd (vreg 0))
+               (va (vreg 1))
+               (vb (vreg 2)))
+           ;; Save r4 (may hold V4)
+           (arm32-push buf (ash 1 4))   ; PUSH {r4}
+           ;; Load Va → r12, Vb → r4
+           (arm32-load-vreg buf +arm-r12+ va)
+           (arm32-load-vreg buf 4 vb)   ; r4
+           ;; Untag both
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-asr-imm buf 4 4 1)    ; ASR r4, r4, #1
+           ;; UMULL lr, r12, r4, r12 → r12:lr = r4 * r12
+           ;; Constraints: RdLo(lr)!=Rm(r4) ✓, RdHi(r12)!=Rm(r4) ✓
+           (arm32-umull buf +arm-lr+ +arm-r12+ 4 +arm-r12+)
+           ;; Extract low 26 bits: BIC lr, lr, #0xFC000000
+           ;; 0xFC000000 = 0xFC ROR 8, rotate=4, imm8=0xFC
+           (arm32-bic-imm buf +arm-lr+ +arm-lr+ 4 #xFC)
+           ;; Re-tag: LSL r12, lr, #1
+           (arm32-lsl-imm buf +arm-r12+ +arm-lr+ 1)
+           ;; Restore r4
+           (arm32-pop buf (ash 1 4))    ; POP {r4}
+           ;; Store result
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
+        (#.+op-mul26hi+
+         ;; (mul26hi Vd Va Vb) — bits 26+ of untag(Va)*untag(Vb), tagged
+         ;; UMULL then extract (RdHi << 6) | (RdLo >> 26).
+         (let ((vd (vreg 0))
+               (va (vreg 1))
+               (vb (vreg 2)))
+           ;; Save r4
+           (arm32-push buf (ash 1 4))   ; PUSH {r4}
+           ;; Load Va → r12, Vb → r4
+           (arm32-load-vreg buf +arm-r12+ va)
+           (arm32-load-vreg buf 4 vb)   ; r4
+           ;; Untag both
+           (arm32-asr-imm buf +arm-r12+ +arm-r12+ 1)
+           (arm32-asr-imm buf 4 4 1)    ; ASR r4, r4, #1
+           ;; UMULL lr, r12, r4, r12 → r12:lr = r4 * r12
+           (arm32-umull buf +arm-lr+ +arm-r12+ 4 +arm-r12+)
+           ;; Extract bits 26+: (r12 << 6) | (lr >> 26)
+           (arm32-lsr-imm buf +arm-lr+ +arm-lr+ 26)
+           ;; ORR lr, lr, r12, LSL #6
+           (arm32-dp-reg buf +arm-dp-orr+ +arm-lr+ +arm-lr+ +arm-r12+
+                         :shift-type +arm-shift-lsl+ :shift-amt 6)
+           ;; Re-tag: LSL r12, lr, #1
+           (arm32-lsl-imm buf +arm-r12+ +arm-lr+ 1)
+           ;; Restore r4
+           (arm32-pop buf (ash 1 4))    ; POP {r4}
+           ;; Store result
+           (arm32-store-vreg buf +arm-r12+ vd)))
+
         (otherwise
          ;; Unknown opcode: emit NOP
          (arm32-nop buf))))))
@@ -1520,14 +1745,14 @@
                  (when info
                    (let ((op-types (opcode-info-operands info)))
                      (cond
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (not (member :reg op-types)))
                         (let* ((off (first operands))
                                (target (+ new-pc off)))
                           (unless (gethash target label-map)
                             (setf (gethash target label-map)
                                   (mvm-make-label)))))
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (member :reg op-types))
                         (let* ((off (second operands))
                                (target (+ new-pc off)))
@@ -1537,12 +1762,12 @@
                (setf pc new-pc)))
 
     ;; Register function entry points
+    ;; function-table is a list of (name offset length) — same format as i386
     (when function-table
-      (maphash (lambda (idx mvm-offset)
-                 (declare (ignore idx))
-                 (unless (gethash mvm-offset label-map)
-                   (setf (gethash mvm-offset label-map) (mvm-make-label))))
-               function-table))
+      (dolist (entry function-table)
+        (let ((mvm-offset (second entry)))
+          (unless (gethash mvm-offset label-map)
+            (setf (gethash mvm-offset label-map) (mvm-make-label))))))
 
     ;; Second pass: translate instructions
     (setf pc 0)
@@ -1566,7 +1791,19 @@
     ;; Resolve branch fixups
     (arm32-resolve-fixups buf)
 
-    buf))
+    ;; Build fn-map: name → resolved native position
+    (let ((fn-map (make-hash-table :test 'equal)))
+      (when function-table
+        (dolist (entry function-table)
+          (let* ((name (first entry))
+                 (mvm-offset (second entry))
+                 (label (gethash mvm-offset label-map)))
+            (when label
+              ;; Label positions are instruction indices (word count),
+              ;; convert to byte offsets for cross.lisp
+              (setf (gethash name fn-map)
+                    (* (gethash label (arm32-buffer-labels buf)) 4))))))
+      (values buf fn-map))))
 
 ;;; ============================================================
 ;;; Installer
@@ -1592,6 +1829,23 @@
     (setf (target-translate-fn target)
           (lambda (bytecode function-table)
             (translate-mvm-to-arm32 bytecode function-table :v7 t)))
+    (setf (target-emit-prologue target)
+          (lambda (target buf)
+            (declare (ignore target))
+            (let ((*arm32-v7* t)) (arm32-emit-prologue buf))))
+    (setf (target-emit-epilogue target)
+          (lambda (target buf)
+            (declare (ignore target))
+            (let ((*arm32-v7* t)) (arm32-emit-epilogue buf))))
+    target))
+
+(defun install-armv7-rpi-translator ()
+  "Install the ARMv7-A RPi translator (PL011 UART at 0x3F201000)."
+  (let ((target *target-armv7-rpi*))
+    (setf (target-translate-fn target)
+          (lambda (bytecode function-table)
+            (let ((*arm32-uart-override* #x3F201000))
+              (translate-mvm-to-arm32 bytecode function-table :v7 t))))
     (setf (target-emit-prologue target)
           (lambda (target buf)
             (declare (ignore target))

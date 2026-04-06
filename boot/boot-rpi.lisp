@@ -1,4 +1,4 @@
-;;;; boot-rpi.lisp - Raspberry Pi (AArch64) Boot Sequence for Modus64
+;;;; boot-rpi.lisp - Raspberry Pi (AArch64) Boot Sequence for Modus
 ;;;;
 ;;;; Raspberry Pi boot protocol (kernel8.img loaded by GPU firmware):
 ;;;;   1. GPU loads kernel8.img to 0x80000 (or 0x200000 with config.txt)
@@ -12,7 +12,7 @@
 ;;;;   0x01000  ISR code (hand-assembled AArch64, ~500 bytes)
 ;;;;   0x01400  Native code (kernel-main)
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Raspberry Pi Boot Constants

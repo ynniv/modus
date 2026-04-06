@@ -1,4 +1,4 @@
-;;;; tags.lisp - Object Tagging for Modus64
+;;;; tags.lisp - Object Tagging for Modus
 ;;;;
 ;;;; Tagging scheme (4-bit):
 ;;;;   xxx0 = Fixnum (63-bit signed, low bit is 0)
@@ -9,7 +9,7 @@
 ;;;;
 ;;;; This file defines tag constants and predicates.
 
-(in-package :modus64.runtime)
+(in-package :modus.runtime)
 
 ;;; ============================================================
 ;;; Tag Constants

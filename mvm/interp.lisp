@@ -8,10 +8,10 @@
 ;;;;   Stack -> CL list       Heap -> CL cons cells / vectors
 ;;;;   Memory -> hash-table   Flags -> keyword (:eq :lt :gt)
 ;;;;
-;;;; Tagging (mirrors Modus64):
+;;;; Tagging (mirrors Modus):
 ;;;;   Fixnum: value << 1, Cons: pointer|0x1, Object: pointer|0x9, NIL: 0
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; Tag constants and helpers
 
@@ -77,7 +77,7 @@
 
 ;;; Bytecode fetch helpers
 
-(declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s16 fetch-u32 fetch-u64))
+(declaim (inline fetch-byte fetch-reg fetch-u16 fetch-s32 fetch-u32 fetch-u64))
 
 (defun fetch-byte (bc pc)
   (values (aref bc pc) (1+ pc)))
@@ -89,9 +89,10 @@
   (values (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8))
           (+ pc 2)))
 
-(defun fetch-s16 (bc pc)
-  (let ((val (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8))))
-    (values (if (>= val #x8000) (- val #x10000) val) (+ pc 2))))
+(defun fetch-s32 (bc pc)
+  (let ((val (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
+                     (ash (aref bc (+ pc 2)) 16) (ash (aref bc (+ pc 3)) 24))))
+    (values (if (>= val #x80000000) (- val #x100000000) val) (+ pc 4))))
 
 (defun fetch-u32 (bc pc)
   (values (logior (aref bc pc) (ash (aref bc (+ pc 1)) 8)
@@ -150,12 +151,18 @@
            ;; The low 8 bits encode param-count; the high 8 bits encode local-count.
            ;; Allocate a frame object in VFP with enough slots for params + locals.
            (multiple-value-bind (code npc) (fetch-u16 bc pc)
-             (let* ((params (logand code #xFF))
-                    (locals (ash code -8))
-                    (frame-size (+ params locals 4)))   ; extra slots for safety
-               (setf (svref regs +vreg-vfp+)
-                     (make-array frame-size :initial-element 0)))
-             (setf pc npc)))
+             (cond
+               ((= code #x0310)
+                ;; RDTSC: Read timestamp counter — return fake value in interpreter
+                (setf (svref regs +vreg-vr+) 0)
+                (setf pc npc))
+               (t
+                (let* ((params (logand code #xFF))
+                       (locals (ash code -8))
+                       (frame-size (+ params locals 4)))   ; extra slots for safety
+                  (setf (svref regs +vreg-vfp+)
+                        (make-array frame-size :initial-element 0)))
+                (setf pc npc)))))
 
           ;; --- Data Movement ---
           (#.+op-mov+
@@ -200,6 +207,62 @@
                  (setf (svref regs vd)
                        (tag-fixnum (* (untag-fixnum (svref regs va))
                                       (untag-fixnum (svref regs vb)))))
+                 (setf pc npc3)))))
+
+          (#.+op-mul26lo+
+           ;; low 26 bits of untag(a)*untag(b), tagged
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (let ((product (* (untag-fixnum (svref regs va))
+                                   (untag-fixnum (svref regs vb)))))
+                   (setf (svref regs vd) (tag-fixnum (logand product #x3FFFFFF))))
+                 (setf pc npc3)))))
+
+          (#.+op-mul26hi+
+           ;; bits 26+ of untag(a)*untag(b), tagged
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (let ((product (* (untag-fixnum (svref regs va))
+                                   (untag-fixnum (svref regs vb)))))
+                   (setf (svref regs vd) (tag-fixnum (ash product -26))))
+                 (setf pc npc3)))))
+
+          (#.+op-mul64lo+
+           ;; low 64 bits of raw Va*Vb (no tag/untag)
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (logand (* (svref regs va) (svref regs vb))
+                               #xFFFFFFFFFFFFFFFF))
+                 (setf pc npc3)))))
+
+          (#.+op-mul64hi+
+           ;; high 64 bits of raw Va*Vb (no tag/untag)
+           (multiple-value-bind (vd npc) (fetch-reg bc pc)
+             (multiple-value-bind (va npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vb npc3) (fetch-reg bc npc2)
+                 (setf (svref regs vd)
+                       (ash (* (svref regs va) (svref regs vb)) -64))
+                 (setf pc npc3)))))
+
+          (#.+op-acc128+
+           ;; mem128[Vaddr] += Vhi:Vlo (raw 128-bit accumulate)
+           (multiple-value-bind (vaddr npc) (fetch-reg bc pc)
+             (multiple-value-bind (vlo npc2) (fetch-reg bc npc)
+               (multiple-value-bind (vhi npc3) (fetch-reg bc npc2)
+                 (let* ((addr (svref regs vaddr))
+                        (cur-lo (mem-read state addr 3))
+                        (cur-hi (mem-read state (+ addr 8) 3))
+                        (sum-lo (+ cur-lo (svref regs vlo)))
+                        (carry (if (> sum-lo #xFFFFFFFFFFFFFFFF) 1 0))
+                        (new-lo (logand sum-lo #xFFFFFFFFFFFFFFFF))
+                        (new-hi (logand (+ cur-hi (svref regs vhi) carry)
+                                        #xFFFFFFFFFFFFFFFF)))
+                   (mem-write state addr new-lo 3)
+                   (mem-write state (+ addr 8) new-hi 3))
                  (setf pc npc3)))))
 
           (#.+op-div+
@@ -334,41 +397,41 @@
 
           ;; --- Branches (offsets relative to end of instruction) ---
           (#.+op-br+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (+ npc off))))
 
           (#.+op-beq+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (eq (mvm-flags state) :eq) (+ npc off) npc))))
 
           (#.+op-bne+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (not (eq (mvm-flags state) :eq)) (+ npc off) npc))))
 
           (#.+op-blt+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (eq (mvm-flags state) :lt) (+ npc off) npc))))
 
           (#.+op-bge+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (member (mvm-flags state) '(:eq :gt)) (+ npc off) npc))))
 
           (#.+op-ble+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (member (mvm-flags state) '(:eq :lt)) (+ npc off) npc))))
 
           (#.+op-bgt+
-           (multiple-value-bind (off npc) (fetch-s16 bc pc)
+           (multiple-value-bind (off npc) (fetch-s32 bc pc)
              (setf pc (if (eq (mvm-flags state) :gt) (+ npc off) npc))))
 
           (#.+op-bnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
-             (multiple-value-bind (off npc2) (fetch-s16 bc npc)
+             (multiple-value-bind (off npc2) (fetch-s32 bc npc)
                (setf pc (if (mvm-nil-p (svref regs vs)) (+ npc2 off) npc2)))))
 
           (#.+op-bnnull+
            (multiple-value-bind (vs npc) (fetch-reg bc pc)
-             (multiple-value-bind (off npc2) (fetch-s16 bc npc)
+             (multiple-value-bind (off npc2) (fetch-s32 bc npc)
                (setf pc (if (not (mvm-nil-p (svref regs vs))) (+ npc2 off) npc2)))))
 
           ;; --- List Operations ---

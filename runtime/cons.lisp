@@ -1,10 +1,10 @@
-;;;; cons.lisp - Cons Cell Operations for Modus64
+;;;; cons.lisp - Cons Cell Operations for Modus
 ;;;;
 ;;;; Cons cell layout (16 bytes):
 ;;;;   +0: CAR (8 bytes, tagged value)
 ;;;;   +8: CDR (8 bytes, tagged value)
 
-(in-package :modus64.runtime)
+(in-package :modus.runtime)
 
 ;;; ============================================================
 ;;; Basic Accessors

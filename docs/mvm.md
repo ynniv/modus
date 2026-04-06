@@ -8,7 +8,7 @@ MVM is a portable register-based bytecode ISA (~50 opcodes) that decouples the L
 
 ### Motivation
 
-Modus64 originally had two x86-64-only compilers sharing zero code: `cross-compile.lisp` (SBCL-side, ~1845 lines) and `rt-compile-*` in `build.lisp` (self-hosting, ~2500 lines), both with hundreds of hardcoded hex bytes. MVM replaces the cross-compiler side with a target-independent pipeline. The self-hosting native compiler remains (it compiles Gen1+ from source at runtime).
+Modus originally had two x86-64-only compilers sharing zero code: `cross-compile.lisp` (SBCL-side, ~1845 lines) and `rt-compile-*` in `build.lisp` (self-hosting, ~2500 lines), both with hundreds of hardcoded hex bytes. MVM replaces the cross-compiler side with a target-independent pipeline. The self-hosting native compiler remains (it compiles Gen1+ from source at runtime).
 
 Inspired by Genera's Ivory processor (256-opcode tagged ISA, architecture mixins) but designed for AOT register-machine translation rather than hardware interpretation.
 

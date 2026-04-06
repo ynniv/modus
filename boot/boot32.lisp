@@ -8,7 +8,7 @@
 ;;;;
 ;;;; All code here is 32-bit, emitted directly as bytes.
 
-(in-package :modus64.cross)
+(in-package :modus.cross)
 
 ;;; ============================================================
 ;;; Memory Layout

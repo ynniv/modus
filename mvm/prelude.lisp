@@ -12,7 +12,7 @@
 ;;;; - Arithmetic, comparisons, logand, logior, logxor, ash
 ;;;; - write-byte, mem-ref
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; List Utilities
@@ -524,14 +524,16 @@
 ;;;
 ;;; The MVM compiler emits calls to SYMBOL-VALUE and SET-SYMBOL-VALUE
 ;;; for defvar/defparameter globals. On bare metal, we implement these
-;;; using an alist stored at fixed address 0x400000.
+;;; using an alist stored at fixed address 0x600000.
+;;; (Was 0x400000 but image+fn-table can extend past 0x400000 for large
+;;; builds like fixpoint-ssh. 0x600000 is above page tables at 0x500000.)
 ;;; Keys are tagged name hashes (fixnums), values are arbitrary.
 ;;; mem-ref :u64 returns raw bits, which for tagged Lisp values is
 ;;; the value itself (cons pointers, fixnums, etc.).
 
 (defun symbol-value (name-hash)
   "Look up a global variable by its tagged name hash."
-  (let ((head (mem-ref #x400000 :u64)))
+  (let ((head (mem-ref #x600000 :u64)))
     (if (zerop head)
         nil
         (let ((cur head))
@@ -544,16 +546,16 @@
 
 (defun set-symbol-value (name-hash value)
   "Set a global variable by its tagged name hash."
-  (let ((head (mem-ref #x400000 :u64)))
+  (let ((head (mem-ref #x600000 :u64)))
     (if (zerop head)
         (progn
-          (setf (mem-ref #x400000 :u64)
+          (setf (mem-ref #x600000 :u64)
                 (cons (cons name-hash value) nil))
           value)
         (let ((cur head))
           (loop
             (when (null cur)
-              (setf (mem-ref #x400000 :u64)
+              (setf (mem-ref #x600000 :u64)
                     (cons (cons name-hash value) head))
               (return value))
             (let ((pair (car cur)))

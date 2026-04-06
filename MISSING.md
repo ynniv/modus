@@ -1,4 +1,4 @@
-# What Modus64 Doesn't Have
+# What Modus Doesn't Have
 
 ## Language
 - No macros at the REPL (defmacro works in cross-compiler and MVM, not in native compiler)

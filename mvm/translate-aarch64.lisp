@@ -21,7 +21,7 @@
 ;;;;   x17 (IP1) - intra-procedure scratch 1
 ;;;;   x30 (LR)  - link register
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Configurable UART Base Address
@@ -50,6 +50,10 @@
   "Scheduler lock address for RESTORE-CONTEXT unlock. Nil = skip (no actors).
    Set to the sched-lock-addr value for actor builds (e.g. #x41200200 for QEMU virt,
    #x02000200 for RPi). Non-actor builds get zero overhead.")
+
+(defvar *aarch64-setup-irq-enable* nil
+  "When non-nil, TRAP #x0320 (setup-irq) emits GICv2 + virtual timer init.
+   Set to t for QEMU virt standalone builds. Nil for fixpoint (no GIC access).")
 
 ;;; ============================================================
 ;;; AArch64 Physical Register Numbers
@@ -492,6 +496,27 @@
                         (ash rn 5)
                         rd)))
 
+(defun a64-umulh (buf rd rn rm)
+  "UMULH Xd, Xn, Xm — high 64 bits of unsigned Xn*Xm.
+   Encoding: 1|00|11011|1|10|Rm|0|Ra(=11111)|Rn|Rd"
+  (a64-emit buf (logior (ash 1 31)            ; sf=1
+                        (ash #b0011011110 21) ; UMULH
+                        (ash rm 16)
+                        (ash 0 15)            ; o0=0
+                        (ash +a64-xzr+ 10)   ; Ra=XZR
+                        (ash rn 5)
+                        rd)))
+
+(defun a64-adc (buf rd rn rm)
+  "ADC Xd, Xn, Xm — add with carry (uses C flag from previous ADDS).
+   Encoding: 1|00|11010000|Rm|000000|Rn|Rd"
+  (a64-emit buf (logior (ash 1 31)            ; sf=1
+                        (ash #b0011010000 21)
+                        (ash rm 16)
+                        (ash 0 10)
+                        (ash rn 5)
+                        rd)))
+
 (defun a64-sdiv (buf rd rn rm)
   "SDIV Xd, Xn, Xm"
   (a64-emit buf (logior (ash 1 31)
@@ -845,6 +870,7 @@
 
 (defconstant +sysreg-tpidr-el1+ #xC684 "TPIDR_EL1: S3_0_C13_C0_4")
 (defconstant +sysreg-vbar-el1+  #xC600 "VBAR_EL1: S3_0_C12_C0_0")
+(defconstant +sysreg-cntpct-el0+ #xDF01 "CNTPCT_EL0: S3_3_C14_C0_1")
 
 ;;; --- Atomic exchange (LDXR/STXR pair) ---
 ;;; LDXR Xt, [Xn]: size|001000|0|1|0|Rs(11111)|0|Rt2(11111)|Rn|Rt
@@ -1148,6 +1174,56 @@
                 ;; Jump to address: untag V0 (ASR 1), BR x0
                 (a64-asr-imm buf +a64-x0+ +a64-x0+ 1)
                 (a64-br buf +a64-x0+))
+               ((= code #x0304)
+                ;; WFI: Wait For Interrupt (sleep until next IRQ)
+                (a64-emit buf #xD503207F))
+               ((= code #x0310)
+                ;; RDTSC equivalent: read CNTPCT_EL0 (physical timer counter) into X0 (VR)
+                (a64-mrs buf +a64-x0+ +sysreg-cntpct-el0+))
+               ((= code #x0320)
+                ;; SETUP-IRQ: virtual timer init (always) + GICv2 (conditional)
+                ;; Save x0/x16 — TRAP is inline, compiler doesn't know we clobber them
+                (a64-str-pre buf +a64-x0+ +a64-sp+ -16)
+                (a64-str-pre buf +a64-x16+ +a64-sp+ -16)
+                ;; GICv2 only on QEMU virt (not RPi, not fixpoint)
+                (when *aarch64-setup-irq-enable*
+                  ;; GIC distributor enable: GICD_CTLR = 1
+                  (a64-load-imm64 buf +a64-x16+ #x08000000)
+                  (a64-load-imm64 buf +a64-x0+ 1)
+                  (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)
+                  ;; Enable virtual timer PPI (INTID 27): GICD_ISENABLER0[27] = 1
+                  ;; GICD_ISENABLER0 at GICD_base+0x100 — load full address (STUR max offset=255)
+                  (a64-load-imm64 buf +a64-x16+ #x08000100)
+                  (a64-load-imm64 buf +a64-x0+ #x08000000)  ; 1<<27
+                  (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)
+                  ;; Enable E1000 PCI INTA SPI (INTID 35): GICD_ISENABLER1[3] = 1
+                  ;; GICD_ISENABLER1 at GICD_base+0x104 — covers INTIDs 32-63
+                  (a64-load-imm64 buf +a64-x16+ #x08000104)
+                  (a64-load-imm64 buf +a64-x0+ 8)  ; 1<<3 = INTID 35
+                  (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)
+                  ;; GIC CPU interface enable: GICC_CTLR = 1
+                  (a64-load-imm64 buf +a64-x16+ #x08010000)
+                  (a64-load-imm64 buf +a64-x0+ 1)
+                  (a64-str-width buf +a64-x0+ +a64-x16+ 0 2)
+                  ;; GICC_PMR = 0xFF (accept all priorities)
+                  (a64-load-imm64 buf +a64-x0+ #xFF)
+                  (a64-str-width buf +a64-x0+ +a64-x16+ 4 2))
+                ;; Virtual timer: always init (works on virt, RPi, fixpoint)
+                ;; CNTV_TVAL_EL0 = 62500 (1ms at 62.5MHz)
+                (a64-load-imm64 buf +a64-x0+ 62500)
+                (a64-emit buf #xD51BE300)  ; MSR CNTV_TVAL_EL0, x0
+                ;; Enable timer: CNTV_CTL_EL0 = 1
+                (a64-load-imm64 buf +a64-x0+ 1)
+                (a64-emit buf #xD51BE320)  ; MSR CNTV_CTL_EL0, x0
+                ;; NOTE: IRQs stay masked. WFI wakes on pending timer PPI
+                ;; even with PSTATE.I=1. io-delay re-arms timer before WFI.
+                ;; Restore x16/x0 (reverse order)
+                (a64-ldr-post buf +a64-x16+ +a64-sp+ 16)
+                (a64-ldr-post buf +a64-x0+ +a64-sp+ 16))
+               ((= code #x0321)
+                ;; TIMER-REARM: re-arm virtual timer (always emit on AArch64)
+                (a64-load-imm64 buf +a64-x0+ 62500)
+                (a64-emit buf #xD51BE300))  ; MSR CNTV_TVAL_EL0, x0
                ((= code #x0400)
                 ;; switch-idle-stack: set SP to per-CPU idle-stack-top
                 (a64-mrs buf +a64-x16+ +sysreg-tpidr-el1+)
@@ -1223,6 +1299,92 @@
              (a64-mul buf pd +a64-x16+ pb)
              (unless (a64-phys-reg vd)
                (store-dst pd vd))))
+
+          ;; ---- MUL26LO Vd, Va, Vb ----
+          ;; Low 26 bits of untag(Va)*untag(Vb), tagged
+          ((= op +op-mul26lo+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x16+ pa 1)  ; untag va
+             (a64-asr-imm buf +a64-x17+ pb 1)  ; untag vb
+             (a64-mul buf pd +a64-x16+ +a64-x17+) ; 64-bit result
+             ;; UBFX pd, pd, #0, #26 → UBFM pd, pd, #0, #25
+             (a64-ubfm buf pd pd 0 25)          ; mask to 26 bits
+             (a64-lsl-imm buf pd pd 1)          ; retag
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- MUL26HI Vd, Va, Vb ----
+          ;; Bits 26+ of untag(Va)*untag(Vb), tagged
+          ((= op +op-mul26hi+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             (a64-asr-imm buf +a64-x16+ pa 1)  ; untag va
+             (a64-asr-imm buf +a64-x17+ pb 1)  ; untag vb
+             (a64-mul buf pd +a64-x16+ +a64-x17+) ; 64-bit result
+             (a64-lsr-imm buf pd pd 26)         ; shift right 26
+             (a64-lsl-imm buf pd pd 1)          ; retag
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- MUL64LO Vd, Va, Vb ----
+          ;; Low 64 bits of raw Va*Vb (no tag/untag)
+          ((= op +op-mul64lo+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; MUL Xd, Xa, Xb — raw 64-bit multiply, no untag/retag
+             (a64-mul buf pd pa pb)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- MUL64HI Vd, Va, Vb ----
+          ;; High 64 bits of raw Va*Vb (no tag/untag)
+          ((= op +op-mul64hi+)
+           (let* ((vd (vr 0))
+                  (pa (ensure-src (vr 1) +a64-x16+))
+                  (pb (ensure-src (vr 2) +a64-x17+))
+                  (pd (or (a64-phys-reg vd) +a64-x16+)))
+             ;; UMULH Xd, Xa, Xb — upper 64 bits of unsigned multiply
+             (a64-umulh buf pd pa pb)
+             (unless (a64-phys-reg vd)
+               (store-dst pd vd))))
+
+          ;; ---- ACC128 Vaddr, Vlo, Vhi ----
+          ;; mem128[Vaddr] += Vhi:Vlo  (128-bit accumulate, raw)
+          ;; Strategy: push hi to stack, addr→x30, lo→x16, then:
+          ;;   load mem[addr+0]→x17, ADDS x17,x17,x16, store back
+          ;;   load mem[addr+8]→x16, pop hi→x17, ADC x16,x16,x17, store back
+          ((= op +op-acc128+)
+           (let* ((vaddr (vr 0))
+                  (vlo (vr 1))
+                  (vhi (vr 2)))
+             ;; Step 1: Load hi into x17 and push to stack
+             (let ((phi (ensure-src vhi +a64-x17+)))
+               (unless (= phi +a64-x17+)
+                 (a64-mov-reg buf +a64-x17+ phi)))
+             (a64-stp-pre buf +a64-x17+ +a64-xzr+ +a64-sp+ -16)
+             ;; Step 2: Load addr→x30, lo→x16
+             (let ((paddr (ensure-src vaddr +a64-x16+)))
+               (a64-mov-reg buf +a64-x30+ paddr))
+             (let ((plo (ensure-src vlo +a64-x16+)))
+               (unless (= plo +a64-x16+)
+                 (a64-mov-reg buf +a64-x16+ plo)))
+             ;; Now: x30=addr, x16=lo_add, stack[0]=hi_add
+             ;; Step 3: Load mem_lo, ADDS, store
+             (a64-ldur buf +a64-x17+ +a64-x30+ 0)       ; x17 = mem[addr+0]
+             (a64-adds-reg buf +a64-x17+ +a64-x17+ +a64-x16+ 0 0) ; x17 += lo_add, sets C
+             (a64-stur buf +a64-x17+ +a64-x30+ 0)       ; mem[addr+0] = x17
+             ;; Step 4: Load mem_hi, pop hi_add, ADC, store
+             (a64-ldur buf +a64-x16+ +a64-x30+ 8)       ; x16 = mem[addr+8]
+             (a64-ldp-post buf +a64-x17+ +a64-xzr+ +a64-sp+ 16)  ; pop hi_add→x17
+             (a64-adc buf +a64-x16+ +a64-x16+ +a64-x17+) ; x16 += hi_add + carry
+             (a64-stur buf +a64-x16+ +a64-x30+ 8)))
 
           ;; ---- DIV Vd, Va, Vb ----
           ;; Tagged fixnum divide: result = (Va / Vb) then re-tag
@@ -2079,7 +2241,8 @@
    FUNCTION-TABLE is a hash table mapping function index → MVM byte offset,
    or NIL if translation is for a single function body.
 
-   Returns an a64-buffer containing the native instruction stream.
+   Returns (values a64-buffer fn-offset-map) where fn-offset-map maps
+   MVM bytecode offset → native byte offset for each function entry point.
 
    The translation proceeds in multiple passes:
      1. Decode all MVM instructions
@@ -2095,14 +2258,19 @@
          ;; Pre-assign labels for all MVM byte offsets that might be
          ;; branch targets. We assign labels for every instruction
          ;; position conservatively.
-         (mvm-offset-to-native-index (make-hash-table :test 'eql)))
+         (mvm-offset-to-native-index (make-hash-table :test 'eql))
+         ;; Track function entry positions: bytecode-offset → native-byte-offset
+         (fn-entry-offsets (make-hash-table :test 'eql))
+         (fn-bc-offsets (make-hash-table :test 'eql)))
 
     ;; Pre-register function entry points in the label table
     (when function-table
       (maphash (lambda (func-idx mvm-offset)
                  (let ((label (incf *mvm-label-counter*)))
                    (setf (gethash (list :func func-idx) mvm-to-native-label) label)
-                   (setf (gethash mvm-offset mvm-to-native-label) label)))
+                   (setf (gethash mvm-offset mvm-to-native-label) label)
+                   ;; Remember this bytecode offset is a function entry
+                   (setf (gethash mvm-offset fn-bc-offsets) t)))
                function-table))
 
     ;; Pre-pass: register labels for ALL branch targets (including backward branches)
@@ -2127,6 +2295,10 @@
         (let ((label (gethash mvm-off mvm-to-native-label)))
           (when label
             (a64-set-label buf label)))
+        ;; Record native position for function entries
+        (when (gethash mvm-off fn-bc-offsets)
+          (setf (gethash mvm-off fn-entry-offsets)
+                (* (a64-current-index buf) 4)))  ; instruction index → byte offset
         ;; Record MVM offset → native index mapping
         (setf (gethash mvm-off mvm-offset-to-native-index)
               (a64-current-index buf))
@@ -2142,7 +2314,7 @@
     ;; Pass 2: Resolve all branch fixups
     (a64-resolve-fixups buf)
 
-    buf))
+    (values buf fn-entry-offsets)))
 
 (defun translate-mvm-function (bytecode)
   "Translate a single MVM function body to AArch64 native code.

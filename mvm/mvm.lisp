@@ -18,7 +18,7 @@
 
 (in-package :cl-user)
 
-(defpackage :modus64.mvm
+(defpackage :modus.mvm
   (:use :cl)
   (:export
    ;; Virtual registers
@@ -50,6 +50,8 @@
    #:+op-io-read+ #:+op-io-write+ #:+op-halt+
    #:+op-cli+ #:+op-sti+ #:+op-percpu-ref+ #:+op-percpu-set+
    #:+op-fn-addr+
+   #:+op-mul26lo+ #:+op-mul26hi+
+   #:+op-mul64lo+ #:+op-mul64hi+ #:+op-acc128+
    #:+op-trap+
    ;; Instruction metadata
    #:*opcode-table* #:opcode-info #:make-opcode-info
@@ -58,7 +60,7 @@
    #:encode-instruction #:decode-instruction
    #:make-mvm-buffer #:mvm-buffer-bytes #:mvm-buffer-used-bytes #:mvm-buffer-position #:mvm-buffer-labels
    #:mvm-emit-byte #:mvm-emit-u16 #:mvm-emit-u32 #:mvm-emit-u64
-   #:mvm-emit-s16
+   #:mvm-emit-s16 #:mvm-emit-s32
    ;; Labels
    #:mvm-make-label #:*mvm-label-counter*
    #:mvm-emit-label #:mvm-emit-branch-to-label #:mvm-fixup-labels
@@ -85,7 +87,9 @@
    #:mvm-io-read #:mvm-io-write #:mvm-halt
    #:mvm-cli #:mvm-sti #:mvm-percpu-ref #:mvm-percpu-set
    #:mvm-fn-addr
-   #:mvm-trap
+   #:mvm-trap #:mvm-rdtsc
+   #:mvm-mul26lo #:mvm-mul26hi
+   #:mvm-mul64lo #:mvm-mul64hi #:mvm-acc128
    ;; Tagging (from compiler.lisp, shared across modules)
    #:+tag-fixnum+ #:+tag-cons+ #:+tag-object+ #:+tag-immediate+ #:+tag-forward+
    #:+fixnum-shift+ #:tag-fixnum #:+mvm-nil+ #:+mvm-t+
@@ -122,13 +126,13 @@
    #:kernel-image-native-code #:kernel-image-boot-code
    #:compile-source-to-module #:translate-module-to-native
    #:assemble-kernel-image #:build-image #:write-kernel-image
-   #:test-cross-compilation #:read-all-forms #:compute-name-hash
+   #:test-cross-compilation #:read-all-forms #:read-all-forms-with-locations #:compute-name-hash
    #:compiled-module-to-mvm-module
    ;; Translator installers
    #:install-riscv-translator #:install-aarch64-translator
    #:install-ppc-translator #:install-68k-translator))
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Virtual Register Definitions
@@ -207,7 +211,7 @@
 ;;;   :imm16  - 16-bit immediate
 ;;;   :imm32  - 32-bit immediate
 ;;;   :imm64  - 64-bit immediate
-;;;   :off16  - 16-bit signed branch offset
+;;;   :off32  - 32-bit signed branch offset
 ;;;   :width  - 2-bit memory width (0=u8, 1=u16, 2=u32, 3=u64)
 
 ;; Special / NOP
@@ -247,15 +251,15 @@
 (defconstant +op-test+   #x31)  ; (test Va Vb) - 2 reg (AND, sets flags)
 
 ;; Branch
-(defconstant +op-br+     #x40)  ; (br off16) - unconditional
-(defconstant +op-beq+    #x41)  ; (beq off16) - branch if equal
-(defconstant +op-bne+    #x42)  ; (bne off16) - branch if not equal
-(defconstant +op-blt+    #x43)  ; (blt off16) - branch if less than
-(defconstant +op-bge+    #x44)  ; (bge off16) - branch if greater or equal
-(defconstant +op-ble+    #x45)  ; (ble off16) - branch if less or equal
-(defconstant +op-bgt+    #x46)  ; (bgt off16) - branch if greater than
-(defconstant +op-bnull+  #x47)  ; (bnull Vs off16) - branch if nil
-(defconstant +op-bnnull+ #x48)  ; (bnnull Vs off16) - branch if non-nil
+(defconstant +op-br+     #x40)  ; (br off32) - unconditional
+(defconstant +op-beq+    #x41)  ; (beq off32) - branch if equal
+(defconstant +op-bne+    #x42)  ; (bne off32) - branch if not equal
+(defconstant +op-blt+    #x43)  ; (blt off32) - branch if less than
+(defconstant +op-bge+    #x44)  ; (bge off32) - branch if greater or equal
+(defconstant +op-ble+    #x45)  ; (ble off32) - branch if less or equal
+(defconstant +op-bgt+    #x46)  ; (bgt off32) - branch if greater than
+(defconstant +op-bnull+  #x47)  ; (bnull Vs off32) - branch if nil
+(defconstant +op-bnnull+ #x48)  ; (bnnull Vs off32) - branch if non-nil
 
 ;; List operations (tagged, type-checking)
 (defconstant +op-car+    #x50)  ; (car Vd Vs) - 2 reg
@@ -309,12 +313,22 @@
 (defconstant +op-percpu-set+ #xA6)  ; (percpu-set offset:imm16 Vs) - imm16 + reg
 (defconstant +op-fn-addr+   #xA7)  ; (fn-addr Vd target:imm32) - load tagged function address
 
+;; Wide multiply with 26-bit split (for crypto field arithmetic on 32-bit targets)
+(defconstant +op-mul26lo+  #xA8)  ; (mul26lo Vd Va Vb) - low 26 bits of untag(Va)*untag(Vb), tagged
+(defconstant +op-mul26hi+  #xA9)  ; (mul26hi Vd Va Vb) - bits 26+ of untag(Va)*untag(Vb), tagged
+
+;; Raw 64-bit multiply (for donna64 crypto on 64-bit targets)
+;; All values are raw u64 (no tag/untag) — use with mem-ref :u64
+(defconstant +op-mul64lo+  #xAA)  ; (mul64lo Vd Va Vb) - low 64 bits of Va*Vb, raw
+(defconstant +op-mul64hi+  #xAB)  ; (mul64hi Vd Va Vb) - high 64 bits of Va*Vb, raw
+(defconstant +op-acc128+   #xAC)  ; (acc128 Vaddr Vlo Vhi) - mem128[Vaddr] += Vhi:Vlo
+
 ;;; ============================================================
 ;;; Opcode Metadata Table
 ;;; ============================================================
 ;;;
 ;;; Format: (opcode name operand-types description)
-;;; Operand types: :reg :imm8 :imm16 :imm32 :imm64 :off16 :width
+;;; Operand types: :reg :imm8 :imm16 :imm32 :imm64 :off32 :width
 
 (defstruct opcode-info
   code          ; numeric opcode
@@ -367,15 +381,15 @@
 (defopcode :test   #x31 (:reg :reg)           "Test (AND without storing)")
 
 ;; Branch
-(defopcode :br     #x40 (:off16)              "Unconditional branch")
-(defopcode :beq    #x41 (:off16)              "Branch if equal")
-(defopcode :bne    #x42 (:off16)              "Branch if not equal")
-(defopcode :blt    #x43 (:off16)              "Branch if less than")
-(defopcode :bge    #x44 (:off16)              "Branch if greater or equal")
-(defopcode :ble    #x45 (:off16)              "Branch if less or equal")
-(defopcode :bgt    #x46 (:off16)              "Branch if greater than")
-(defopcode :bnull  #x47 (:reg :off16)         "Branch if nil")
-(defopcode :bnnull #x48 (:reg :off16)         "Branch if non-nil")
+(defopcode :br     #x40 (:off32)              "Unconditional branch")
+(defopcode :beq    #x41 (:off32)              "Branch if equal")
+(defopcode :bne    #x42 (:off32)              "Branch if not equal")
+(defopcode :blt    #x43 (:off32)              "Branch if less than")
+(defopcode :bge    #x44 (:off32)              "Branch if greater or equal")
+(defopcode :ble    #x45 (:off32)              "Branch if less or equal")
+(defopcode :bgt    #x46 (:off32)              "Branch if greater than")
+(defopcode :bnull  #x47 (:reg :off32)         "Branch if nil")
+(defopcode :bnnull #x48 (:reg :off32)         "Branch if non-nil")
 
 ;; List operations
 (defopcode :car    #x50 (:reg :reg)           "Load car (trap on non-cons)")
@@ -429,6 +443,13 @@
 (defopcode :percpu-set #xA6 (:imm16 :reg)         "Per-CPU data write")
 (defopcode :fn-addr   #xA7 (:reg :imm32)          "Load tagged function address")
 
+;; Wide multiply with 26-bit split (crypto field arithmetic)
+(defopcode :mul26lo  #xA8 (:reg :reg :reg)        "Low 26 bits of wide multiply, tagged")
+(defopcode :mul26hi  #xA9 (:reg :reg :reg)        "High bits (>>26) of wide multiply, tagged")
+(defopcode :mul64lo  #xAA (:reg :reg :reg)        "Low 64 bits of raw multiply")
+(defopcode :mul64hi  #xAB (:reg :reg :reg)        "High 64 bits of raw multiply")
+(defopcode :acc128   #xAC (:reg :reg :reg)        "128-bit accumulate: mem[Va] += Vc:Vb")
+
 ;;; ============================================================
 ;;; Memory Width Constants
 ;;; ============================================================
@@ -443,7 +464,7 @@
 ;;; ============================================================
 
 (defstruct mvm-buffer
-  (bytes (make-array 2097152))              ; 2MB fixed-size, position tracks fill
+  (bytes (make-array 3145728))              ; 3MB fixed-size, position tracks fill
   (labels (make-hash-table :test 'eql))     ; label-id → position
   (fixups nil)                               ; list of (position label-id offset-from)
   (position 0))
@@ -470,6 +491,10 @@
 (defun mvm-emit-s16 (buf val)
   "Emit a 16-bit signed value (little-endian)"
   (mvm-emit-u16 buf (if (minusp val) (logand val #xFFFF) val)))
+
+(defun mvm-emit-s32 (buf val)
+  "Emit a 32-bit signed value (little-endian)"
+  (mvm-emit-u32 buf (if (minusp val) (logand val #xFFFFFFFF) val)))
 
 (defun mvm-emit-u32 (buf val)
   "Emit a 32-bit value (little-endian)"
@@ -526,7 +551,7 @@
                (:imm16  (mvm-emit-u16 buf op-val))
                (:imm32  (mvm-emit-u32 buf op-val))
                (:imm64  (mvm-emit-u64 buf op-val))
-               (:off16  (mvm-emit-s16 buf op-val))
+               (:off32  (mvm-emit-s32 buf op-val))
                (:width  (mvm-emit-byte buf op-val))))))
 
 ;;; ============================================================
@@ -551,6 +576,13 @@
           (ash (aref bytes (+ pos 1)) 8)
           (ash (aref bytes (+ pos 2)) 16)
           (ash (aref bytes (+ pos 3)) 24)))
+
+(defun decode-s32 (bytes pos)
+  "Decode a 32-bit signed little-endian value"
+  (let ((val (decode-u32 bytes pos)))
+    (if (>= val #x80000000)
+        (- val #x100000000)
+        val)))
 
 (defun decode-u64 (bytes pos)
   "Decode a 64-bit little-endian value"
@@ -582,9 +614,9 @@
         (:imm64
          (push (decode-u64 bytes cur) operands)
          (incf cur 8))
-        (:off16
-         (push (decode-s16 bytes cur) operands)
-         (incf cur 2))
+        (:off32
+         (push (decode-s32 bytes cur) operands)
+         (incf cur 4))
         (:width
          (push (aref bytes cur) operands)
          (incf cur 1))))
@@ -604,6 +636,10 @@
 
 (defun mvm-trap (buf code)
   (encode-instruction buf +op-trap+ code))
+
+(defun mvm-rdtsc (buf)
+  "Read timestamp counter, return 64-bit cycles in VR (RAX)."
+  (encode-instruction buf +op-trap+ #x0310))
 
 ;; Data movement
 (defun mvm-mov (buf vd vs)
@@ -827,6 +863,21 @@
 (defun mvm-fn-addr (buf vd target)
   (encode-instruction buf +op-fn-addr+ vd target))
 
+(defun mvm-mul26lo (buf vd va vb)
+  (encode-instruction buf +op-mul26lo+ vd va vb))
+
+(defun mvm-mul26hi (buf vd va vb)
+  (encode-instruction buf +op-mul26hi+ vd va vb))
+
+(defun mvm-mul64lo (buf vd va vb)
+  (encode-instruction buf +op-mul64lo+ vd va vb))
+
+(defun mvm-mul64hi (buf vd va vb)
+  (encode-instruction buf +op-mul64hi+ vd va vb))
+
+(defun mvm-acc128 (buf vaddr vlo vhi)
+  (encode-instruction buf +op-acc128+ vaddr vlo vhi))
+
 ;;; ============================================================
 ;;; Disassembler
 ;;; ============================================================
@@ -850,7 +901,7 @@
                                      for spec in (opcode-info-operands info)
                                      collect (case spec
                                                (:reg (vreg-name op))
-                                               (:off16 (format nil "@~D" (+ new-pos op)))
+                                               (:off32 (format nil "@~D" (+ new-pos op)))
                                                (otherwise (format nil "~D" op)))))
                        (format t "  ~4D: UNKNOWN(#x~2,'0X)~{ ~D~}~%"
                                ipos opcode operands)))
@@ -878,9 +929,9 @@
     ;; For bnull/bnnull, the register operand is already emitted by caller
     ;; Record fixup: (position-of-offset label-id offset-from-position)
     (push (list (mvm-buffer-position buf) label-id
-                (+ (mvm-buffer-position buf) 2))  ; offset relative to end of s16
+                (+ (mvm-buffer-position buf) 4))  ; offset relative to end of s32
           (mvm-buffer-fixups buf))
-    (mvm-emit-s16 buf 0)))  ; placeholder
+    (mvm-emit-s32 buf 0)))  ; placeholder
 
 (defun mvm-fixup-labels (buf)
   "Resolve all branch label references in the bytecode buffer"
@@ -889,11 +940,13 @@
       (destructuring-bind (offset-pos label-id rel-from) fixup
         (let* ((target (gethash label-id (mvm-buffer-labels buf)))
                (rel (- target rel-from))
-               (urel (if (minusp rel) (logand rel #xFFFF) rel)))
+               (urel (if (minusp rel) (logand rel #xFFFFFFFF) rel)))
           (unless target
             (error "MVM: Undefined label ~D" label-id))
           (setf (aref bytes offset-pos) (logand urel #xFF))
-          (setf (aref bytes (1+ offset-pos)) (logand (ash urel -8) #xFF)))))))
+          (setf (aref bytes (+ offset-pos 1)) (logand (ash urel -8) #xFF))
+          (setf (aref bytes (+ offset-pos 2)) (logand (ash urel -16) #xFF))
+          (setf (aref bytes (+ offset-pos 3)) (logand (ash urel -24) #xFF)))))))
 
 ;;; ============================================================
 ;;; Instruction Size Calculation
@@ -910,6 +963,6 @@
                           (:imm16 2)
                           (:imm32 4)
                           (:imm64 8)
-                          (:off16 2)
+                          (:off32 4)
                           (:width 1))))
         1)))  ; unknown opcode = 1 byte

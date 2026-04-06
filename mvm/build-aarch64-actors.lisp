@@ -2,56 +2,14 @@
 ;;;;
 ;;;; Usage: sbcl --script mvm/build-aarch64-actors.lisp
 ;;;;
-;;;; Produces /tmp/modus64-aarch64-actors.bin — boot with:
+;;;; Produces /tmp/modus-aarch64-actors.bin — boot with:
 ;;;;   qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-;;;;     -kernel /tmp/modus64-aarch64-actors.bin -nographic -semihosting \
+;;;;     -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \
 ;;;;     -device 'e1000,netdev=net0,romfile=,rombar=0' \
 ;;;;     -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Load REPL source + networking + actor source
-;;; ============================================================
-
-(format t "Loading REPL + networking + actor source...~%")
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
 (defun read-file-text (path)
@@ -74,12 +32,13 @@
 ;; 7. aarch64-overrides.lisp - line editor, buffer reader, SSH overrides
 ;; 8. actors-net-overrides.lisp - actor-aware receive/spawn/exit overrides
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-aarch64.lisp" *net-dir*))
           (read-file-text (merge-pathnames "actors.lisp" *net-dir*))
           (read-file-text (merge-pathnames "e1000.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "crypto-fast.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http-client.lisp" *net-dir*))
@@ -90,7 +49,7 @@
 ;;; Build AArch64 Actors+SSH image (virt + E1000)
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 (install-aarch64-translator)
 
@@ -116,7 +75,7 @@
                          "  (write-byte 91) (write-byte 52) (write-byte 93)"
                          "  (ssh-seed-random)"
                          "  (write-byte 91) (write-byte 53) (write-byte 93)"
-                         "  (dhcp-discover)"
+                         "  (dhcp-client)"
                          "  (write-byte 91) (write-byte 54) (write-byte 93)"
                          "  (ssh-seed-random)"
                          "  (ssh-init-strings)"
@@ -160,9 +119,9 @@
     (format t "Entry point offset: ~A~%" (kernel-image-entry-point image))
     (format t "Native code size: ~D~%" (length (kernel-image-native-code image)))
     (format t "Boot code size: ~D~%" (length (kernel-image-boot-code image)))
-    (write-kernel-image image "/tmp/modus64-aarch64-actors.bin")
+    (write-kernel-image image "/tmp/modus-aarch64-actors.bin")
     (format t "Done. Boot with:~%")
     (format t "  qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \\~%")
-    (format t "    -kernel /tmp/modus64-aarch64-actors.bin -nographic -semihosting \\~%")
+    (format t "    -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \\~%")
     (format t "    -device 'e1000,netdev=net0,romfile=,rombar=0' \\~%")
     (format t "    -netdev 'user,id=net0,hostfwd=tcp::2222-:22'~%")))

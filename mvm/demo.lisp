@@ -23,14 +23,14 @@
     (pathname modus-dir)))
 
 (defun mvm-load (relative-path)
-  "Load a file relative to the modus64 directory."
+  "Load a file relative to the modus directory."
   (let ((path (merge-pathnames relative-path *modus-base*)))
     (format t "  Loading ~A~%" relative-path)
     (load path :verbose nil :print nil)))
 
 (format t "Loading MVM system...~%")
 
-;; Package definitions (provides :modus64.asm for the x64 translator)
+;; Package definitions (provides :modus.asm for the x64 translator)
 (mvm-load "cross/packages.lisp")
 
 ;; x86-64 assembler (needed by translate-x64.lisp)
@@ -69,10 +69,10 @@
 ;;; ============================================================
 
 (format t "~%Installing translators...~%")
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install each translator into its target descriptor
-(handler-case (modus64.mvm.x64:install-x64-translator)
+(handler-case (modus.mvm.x64:install-x64-translator)
   (error (e) (format t "  x86-64: skipped (~A)~%" e)))
 (handler-case (install-riscv-translator)
   (error (e) (format t "  RISC-V: skipped (~A)~%" e)))
@@ -80,7 +80,7 @@
   (error (e) (format t "  AArch64: skipped (~A)~%" e)))
 (handler-case (install-ppc-translator)
   (error (e) (format t "  PPC64: skipped (~A)~%" e)))
-(handler-case (modus64.mvm.i386:install-i386-translator)
+(handler-case (modus.mvm.i386:install-i386-translator)
   (error (e) (format t "  i386: skipped (~A)~%" e)))
 (handler-case (install-68k-translator)
   (error (e) (format t "  68k: skipped (~A)~%" e)))

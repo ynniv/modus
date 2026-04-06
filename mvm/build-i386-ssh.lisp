@@ -2,59 +2,17 @@
 ;;;;
 ;;;; Usage: sbcl --script mvm/build-i386-ssh.lisp
 ;;;;
-;;;; Produces /tmp/modus64-i386-ssh.bin — boot with:
+;;;; Produces /tmp/modus-i386-ssh.bin — boot with:
 ;;;;   qemu-system-i386 -m 128 -nographic -no-reboot \
-;;;;     -kernel /tmp/modus64-i386-ssh.bin \
+;;;;     -kernel /tmp/modus-i386-ssh.bin \
 ;;;;     -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
 ;;;;     -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 ;;;;
 ;;;; Uses NE2000 ISA NIC (fixnum-safe port I/O) instead of E1000 PCI.
-;;;; All 32-bit crypto uses (hi16 . lo16) pair arithmetic (crypto-i386.lisp).
+;;;; All 32-bit crypto uses (hi16 . lo16) pair arithmetic (crypto-w32.lisp).
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Load REPL source + networking source
-;;; ============================================================
-
-(format t "Loading REPL + networking source...~%")
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 (mvm-load "mvm/repl-source.lisp")
 
 (defun read-file-text (path)
@@ -68,35 +26,36 @@
   (merge-pathnames "net/" *modus-base*))
 
 ;;; Source load order:
-;;;   arch-i386 → ne2000 → ip → crypto → crypto-32 → crypto-i386 → ssh →
+;;;   arch-i386 → ne2000 → ip → crypto → crypto-32 → crypto-w32 → ssh →
 ;;;   http → aarch64-overrides
 ;;;
-;;; crypto-i386.lisp MUST come after crypto.lisp + crypto-32.lisp
+;;; crypto-w32.lisp MUST come after crypto.lisp + crypto-32.lisp
 ;;; (last-defun-wins overrides sha256, chacha20, sha512 with pair arithmetic)
 ;;;
 ;;; aarch64-overrides.lisp works on i386: its :u64 mem-ref compiles to
 ;;; 32-bit load/store (width=3 on i386), storing/loading tagged fixnums raw.
 (defvar *net-source*
-  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
+  (format nil "~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%~A~%"
           (read-file-text (merge-pathnames "arch-i386.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ne2000.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ip.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto.lisp" *net-dir*))
           (read-file-text (merge-pathnames "crypto-32.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "crypto-i386.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "crypto-w32.lisp" *net-dir*))
           (read-file-text (merge-pathnames "ssh.lisp" *net-dir*))
           (read-file-text (merge-pathnames "http.lisp" *net-dir*))
           (read-file-text (merge-pathnames "aarch64-overrides.lisp" *net-dir*))
-          (read-file-text (merge-pathnames "i386-overrides.lisp" *net-dir*))))
+          (read-file-text (merge-pathnames "32bit-overrides.lisp" *net-dir*))
+          (read-file-text (merge-pathnames "crypto-32-fast.lisp" *net-dir*))))
 
 ;;; ============================================================
 ;;; Build i386 SSH image (NE2000 ISA NIC)
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the i386 translator
-(modus64.mvm.i386:install-i386-translator)
+(modus.mvm.i386:install-i386-translator)
 
 ;; Ed25519 public key for private key = all zeros (32 bytes, little-endian)
 ;; 3B6A27BC CEB6A42D 62A3A8D0 2A6F0D73 65321577 1DE243A6 3AC048A1 8B59DA29
@@ -275,6 +234,8 @@
                          "    (setf (mem-ref (+ state #x701) :u8) #xF8)"
                          "    (setf (mem-ref (+ state #x702) :u8) #xA2)"
                          "    (setf (mem-ref (+ state #x703) :u8) #x09))"
+                         ;; Enable PIT timer for HLT-based io-delay (after all crypto init)
+                         "  (enable-pit-timer)"
                          "  (net-actor-main))"
                          ;; Override net-actor-main to not call yield (unresolved on i386)
                          "(defun net-actor-main ()"
@@ -339,9 +300,9 @@
     (format t "Entry point offset: ~A~%" (kernel-image-entry-point image))
     (format t "Native code size: ~D~%" (length (kernel-image-native-code image)))
     (format t "Boot code size: ~D~%" (length (kernel-image-boot-code image)))
-    (write-kernel-image image "/tmp/modus64-i386-ssh.bin")
+    (write-kernel-image image "/tmp/modus-i386-ssh.bin")
     (format t "Done. Boot with:~%")
     (format t "  qemu-system-i386 -m 128 -nographic -no-reboot \\~%")
-    (format t "    -kernel /tmp/modus64-i386-ssh.bin \\~%")
+    (format t "    -kernel /tmp/modus-i386-ssh.bin \\~%")
     (format t "    -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \\~%")
     (format t "    -netdev 'user,id=net0,hostfwd=tcp::2222-:22'~%")))

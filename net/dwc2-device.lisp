@@ -202,7 +202,7 @@
 ;;; Layout:  desc-base+0x000: Device descriptor (18 bytes)
 ;;;          desc-base+0x020: Config descriptor (71 bytes)
 ;;;          desc-base+0x080: String 0 - Language (4 bytes)
-;;;          desc-base+0x090: String 1 - "Modus64" (16 bytes)
+;;;          desc-base+0x090: String 1 - "Modus" (12 bytes)
 ;;;          desc-base+0x0A0: String 2 - "USB Ether" (20 bytes)
 ;;;          desc-base+0x0C0: String 3 - "000001" (14 bytes)
 ;;;          desc-base+0x0E0: String 4 - MAC "020000000001" (26 bytes)
@@ -330,17 +330,15 @@
     (setf (mem-ref (+ s 1) :u8) 3)
     (setf (mem-ref (+ s 2) :u8) 9)
     (setf (mem-ref (+ s 3) :u8) 4))
-  ;; String 1: "Modus64" (16 bytes) at +0x90
+  ;; String 1: "Modus" (12 bytes) at +0x90
   (let ((s (+ (desc-base) #x90)))
-    (setf (mem-ref s :u8) 16)
+    (setf (mem-ref s :u8) 12)
     (setf (mem-ref (+ s 1) :u8) 3)
     (setf (mem-ref (+ s 2) :u8) 77)(setf (mem-ref (+ s 3) :u8) 0)
     (setf (mem-ref (+ s 4) :u8) 111)(setf (mem-ref (+ s 5) :u8) 0)
     (setf (mem-ref (+ s 6) :u8) 100)(setf (mem-ref (+ s 7) :u8) 0)
     (setf (mem-ref (+ s 8) :u8) 117)(setf (mem-ref (+ s 9) :u8) 0)
-    (setf (mem-ref (+ s 10) :u8) 115)(setf (mem-ref (+ s 11) :u8) 0)
-    (setf (mem-ref (+ s 12) :u8) 54)(setf (mem-ref (+ s 13) :u8) 0)
-    (setf (mem-ref (+ s 14) :u8) 52)(setf (mem-ref (+ s 15) :u8) 0))
+    (setf (mem-ref (+ s 10) :u8) 115)(setf (mem-ref (+ s 11) :u8) 0))
   ;; String 2: "USB Ether" (20 bytes) at +0xA0
   (let ((s (+ (desc-base) #xA0)))
     (setf (mem-ref s :u8) 20)
@@ -1007,14 +1005,41 @@
 ;;; NIC API (same interface as e1000.lisp / cdc-ether.lisp)
 ;;; ============================================================
 
+(defun ring-receive ()
+  ;; Check ISR ring buffer for a completed frame.
+  ;; ISR writes frames to ring slots at usb-ring-base + 0x800 + idx*0x800.
+  ;; Copy to e1000-rx-buf-base (where networking stack expects it).
+  (let ((base (usb-ring-base)))
+    (let ((wi (mem-ref base :u32)))
+      (let ((ri (mem-ref (+ base 4) :u32)))
+        (if (= wi ri)
+            0
+            (let ((len (mem-ref (+ base (+ 8 (* ri 4))) :u32)))
+              (let ((src (+ base (+ #x800 (* ri #x800)))))
+                (let ((dst (e1000-rx-buf-base)))
+                  (let ((i 0))
+                    (loop
+                      (when (>= i len) (return 0))
+                      (setf (mem-ref (+ dst i) :u8) (mem-ref (+ src i) :u8))
+                      (setq i (+ i 1))))))
+              (setf (mem-ref (+ base 4) :u32) (logand (+ ri 1) 3))
+              len))))))
+
 (defun e1000-receive ()
-  ;; Poll USB events, then check if an Ethernet frame is ready
-  (gadget-poll)
-  (if (not (zerop (gadget-rx-ready)))
-      (let ((len (gadget-rx-len)))
-        (gadget-set-rx-ready 0)
-        len)
-      0))
+  ;; Try ISR ring buffer first (interrupt-driven path).
+  ;; If ring is empty, fall back to polling (handles pre-IRQ enumeration
+  ;; and the case where gadget-enable-irq hasn't been called yet).
+  (let ((rlen (ring-receive)))
+    (if (not (zerop rlen))
+        rlen
+        (progn
+          (gadget-check-deferred)
+          (gadget-poll)
+          (if (not (zerop (gadget-rx-ready)))
+              (let ((len (gadget-rx-len)))
+                (gadget-set-rx-ready 0)
+                len)
+              0)))))
 
 (defun e1000-rx-buf ()
   (e1000-rx-buf-base))
@@ -1184,4 +1209,7 @@
   ;; Final EP2 re-arm — ensure it's properly armed after all probe activity
   (gadget-arm-ep2)
   (write-byte 80)(write-byte 82)(write-byte 66)(write-byte 10)  ;; "PRB\n" = probe done
+  ;; Enable interrupt-driven USB: ISR drains RX FIFO to ring buffer,
+  ;; allowing USB to stay responsive during long crypto operations.
+  (gadget-enable-irq)
   1)

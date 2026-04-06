@@ -7,7 +7,8 @@ set -e
 cd "$(dirname "$0")/.."
 
 PORT=${1:-2222}
-LOGFILE="/tmp/modus64-aarch64-ssh.log"
+EXPR="${2:-}"
+LOGFILE="/tmp/modus-aarch64-ssh.log"
 QEMU_PID=""
 
 cleanup() {
@@ -24,7 +25,7 @@ echo "Building AArch64 SSH kernel..."
 sbcl --script mvm/build-aarch64-ssh.lisp
 echo "Build complete."
 
-pkill -9 -f 'qemu-system-aarch64.*modus64-aarch64-ssh' 2>/dev/null || true
+pkill -9 -f 'qemu-system-aarch64.*modus-aarch64-ssh' 2>/dev/null || true
 sleep 0.5
 
 # Start QEMU in background
@@ -33,7 +34,7 @@ qemu-system-aarch64 \
     -machine virt \
     -cpu cortex-a57 \
     -m 512 \
-    -kernel /tmp/modus64-aarch64-ssh.bin \
+    -kernel /tmp/modus-aarch64-ssh.bin \
     -nographic \
     -semihosting \
     -device 'e1000,netdev=net0,romfile=,rombar=0' \
@@ -64,12 +65,19 @@ if ! grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
     exit 1
 fi
 
-echo ""
-echo "Modus64 AArch64 SSH server ready on port $PORT."
-echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
-echo ""
-echo "Press Ctrl-C to stop."
+if [ -n "$EXPR" ]; then
+    # Batch mode: run expression, print result, exit
+    sleep 5
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 -p "$PORT" test@localhost "$EXPR" 2>/dev/null || true
+    cleanup
+else
+    echo ""
+    echo "Modus AArch64 SSH server ready on port $PORT."
+    echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
+    echo ""
+    echo "Press Ctrl-C to stop."
 
-# Wait for QEMU to exit or Ctrl-C
-wait "$QEMU_PID" 2>/dev/null
-QEMU_PID=""
+    # Wait for QEMU to exit or Ctrl-C
+    wait "$QEMU_PID" 2>/dev/null
+    QEMU_PID=""
+fi

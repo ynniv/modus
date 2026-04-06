@@ -93,7 +93,7 @@
 ;;; Build Pi Zero 2 W Actors+SSH image (DWC2 USB gadget + CDC-ECM)
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)

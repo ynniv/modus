@@ -1,4 +1,4 @@
-;;;; http-client.lisp - HTTP/1.0 client for bare-metal Modus64
+;;;; http-client.lisp - HTTP/1.0 client for bare-metal Modus
 ;;;;
 ;;;; Outbound HTTP GET requests with URL parsing and DNS resolution.
 ;;;; Uses the single-connection TCP client (e1000-state-base+0x30..0x44).

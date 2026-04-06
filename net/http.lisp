@@ -1,4 +1,4 @@
-;;;; http.lisp - HTTP/1.0 server for bare-metal Modus64
+;;;; http.lisp - HTTP/1.0 server for bare-metal Modus
 ;;;;
 ;;;; Minimal HTTP server on port 80. One request-response per connection.
 ;;;; Shares connection slots (0-3) with SSH; protocol determined by dst-port.
@@ -85,34 +85,34 @@
 ;;; ============================================================
 
 (defun http-build-index-body ()
-  ;; "<html><body><h1>modus64</h1><p>Pi Zero 2 W bare-metal Lisp</p></body></html>"
+  ;; "<html><body><h1>modus</h1><p>Pi Zero 2 W bare-metal Lisp</p></body></html>"
   ;; Returns (cons array length)
-  (let ((arr (make-array 80)))
-    ;; <html><body><h1>modus64</h1><p>Pi Zero 2 W bare-metal Lisp</p></body></html>
+  (let ((arr (make-array 74)))
+    ;; <html><body><h1>modus</h1><p>Pi Zero 2 W bare-metal Lisp</p></body></html>
     (aset arr 0 60) (aset arr 1 104) (aset arr 2 116) (aset arr 3 109)
     (aset arr 4 108) (aset arr 5 62)          ;; <html>
     (aset arr 6 60) (aset arr 7 98) (aset arr 8 111) (aset arr 9 100)
     (aset arr 10 121) (aset arr 11 62)        ;; <body>
     (aset arr 12 60) (aset arr 13 104) (aset arr 14 49) (aset arr 15 62)  ;; <h1>
     (aset arr 16 109) (aset arr 17 111) (aset arr 18 100) (aset arr 19 117)
-    (aset arr 20 115) (aset arr 21 54) (aset arr 22 52)  ;; modus64
-    (aset arr 23 60) (aset arr 24 47) (aset arr 25 104) (aset arr 26 49)
-    (aset arr 27 62)                          ;; </h1>
-    (aset arr 28 60) (aset arr 29 112) (aset arr 30 62)  ;; <p>
+    (aset arr 20 115)                         ;; modus
+    (aset arr 21 60) (aset arr 22 47) (aset arr 23 104) (aset arr 24 49)
+    (aset arr 25 62)                          ;; </h1>
+    (aset arr 26 60) (aset arr 27 112) (aset arr 28 62)  ;; <p>
     ;; Pi Zero 2 W bare-metal Lisp
-    (aset arr 31 80) (aset arr 32 105) (aset arr 33 32) (aset arr 34 90)
-    (aset arr 35 101) (aset arr 36 114) (aset arr 37 111) (aset arr 38 32)
-    (aset arr 39 50) (aset arr 40 32) (aset arr 41 87) (aset arr 42 32)
-    (aset arr 43 98) (aset arr 44 97) (aset arr 45 114) (aset arr 46 101)
-    (aset arr 47 45) (aset arr 48 109) (aset arr 49 101) (aset arr 50 116)
-    (aset arr 51 97) (aset arr 52 108) (aset arr 53 32)
-    (aset arr 54 76) (aset arr 55 105) (aset arr 56 115) (aset arr 57 112)
-    (aset arr 58 60) (aset arr 59 47) (aset arr 60 112) (aset arr 61 62)  ;; </p>
-    (aset arr 62 60) (aset arr 63 47) (aset arr 64 98) (aset arr 65 111)
-    (aset arr 66 100) (aset arr 67 121) (aset arr 68 62)  ;; </body>
-    (aset arr 69 60) (aset arr 70 47) (aset arr 71 104) (aset arr 72 116)
-    (aset arr 73 109) (aset arr 74 108) (aset arr 75 62)  ;; </html>
-    (cons arr 76)))
+    (aset arr 29 80) (aset arr 30 105) (aset arr 31 32) (aset arr 32 90)
+    (aset arr 33 101) (aset arr 34 114) (aset arr 35 111) (aset arr 36 32)
+    (aset arr 37 50) (aset arr 38 32) (aset arr 39 87) (aset arr 40 32)
+    (aset arr 41 98) (aset arr 42 97) (aset arr 43 114) (aset arr 44 101)
+    (aset arr 45 45) (aset arr 46 109) (aset arr 47 101) (aset arr 48 116)
+    (aset arr 49 97) (aset arr 50 108) (aset arr 51 32)
+    (aset arr 52 76) (aset arr 53 105) (aset arr 54 115) (aset arr 55 112)
+    (aset arr 56 60) (aset arr 57 47) (aset arr 58 112) (aset arr 59 62)  ;; </p>
+    (aset arr 60 60) (aset arr 61 47) (aset arr 62 98) (aset arr 63 111)
+    (aset arr 64 100) (aset arr 65 121) (aset arr 66 62)  ;; </body>
+    (aset arr 67 60) (aset arr 68 47) (aset arr 69 104) (aset arr 70 116)
+    (aset arr 71 109) (aset arr 72 108) (aset arr 73 62)  ;; </html>
+    (cons arr 74)))
 
 ;;; ============================================================
 ;;; HTTP request handling

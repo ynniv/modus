@@ -2,7 +2,7 @@
 
 ## Overview
 
-Modus64 runs on AArch64 QEMU `virt` with E1000 networking and an SSH server. The networking stack (~4800 lines) is shared between x86-64 and AArch64 via thin architecture adapters. The AArch64 build uses the MVM compiler pipeline (Source → MVM bytecode → AArch64 native) and runs single-threaded (no actor model, no runtime compiler).
+Modus runs on AArch64 QEMU `virt` with E1000 networking and an SSH server. The networking stack (~4800 lines) is shared between x86-64 and AArch64 via thin architecture adapters. The AArch64 build uses the MVM compiler pipeline (Source → MVM bytecode → AArch64 native) and runs single-threaded (no actor model, no runtime compiler).
 
 ```bash
 # Build and run
@@ -11,11 +11,11 @@ Modus64 runs on AArch64 QEMU `virt` with E1000 networking and an SSH server. The
 # Connect
 ssh -p 2222 -o StrictHostKeyChecking=no test@localhost
 
-modus64> (+ 1 2)
+modus> (+ 1 2)
 = 3
-modus64> (defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1)))))
+modus> (defun fact (n) (if (<= n 1) 1 (* n (fact (- n 1)))))
 = FACT
-modus64> (fact 10)
+modus> (fact 10)
 = 3628800
 ```
 
@@ -97,7 +97,7 @@ QEMU `virt` machine, 512MB RAM starting at 0x40000000.
 +0x12800    Line editor: line length (u64)
 +0x12808    Line editor: cursor position (u64)
 +0x12810    Line editor: escape sequence state (u64)
-+0x12A00    Prompt mode flag (u64, 0 = "> ", nonzero = "modus64> ")
++0x12A00    Prompt mode flag (u64, 0 = "> ", nonzero = "modus> ")
 +0x12A08    Return code (u64, 1 = enter, 2 = ctrl-d)
 +0x60000    Persistent globals pointer for eval (u64)
 ```
@@ -148,6 +148,16 @@ During eval, both bits are set. The captured bytes are sent as a single SSH chan
 ### SHLV/SARV variable shifts
 
 The MVM ISA originally only had SHL/SAR with immediate shift counts. Variable-count shifts (used in Ed25519 scalar multiplication and X25519 Montgomery ladder) silently treated register IDs as literal shift amounts. Fixed by adding SHLV (#x2F) and SARV (#x32) opcodes to all 7 translators.
+
+### Timer flag / ephemeral key address collision
+
+`enable-gic-timer` in `net/arch-aarch64.lisp` wrote a timer-enabled flag to `state+0x700`. The ephemeral X25519 public key occupies `state+0x6E4..0x703` (32 bytes). The flag overwrote the last 4 bytes of the key with `01 00 00 00`, causing the SSH client to compute a different shared secret and fail signature verification.
+
+**Symptom**: `ssh_dispatch_run_fatal: incorrect signature` on every SSH connection.
+
+**Fix**: Moved the timer flag from `state+0x700` to `state+0x704`.
+
+**Diagnostic**: `python3 tests/ssh-kex-dump.py localhost 2222` — performs key exchange manually, dumps raw KEXDH_REPLY bytes, and independently verifies the Ed25519 signature. Before the fix, reported the ephemeral key ending in `...01000000` instead of `...09f8a209`.
 
 ### Pre-computed host key
 

@@ -11,9 +11,13 @@
 ;; DWC2 USB controller base address (BCM2837)
 (defun dwc2-base () #x3F980000)
 
-;; I/O delay: read UART to yield to QEMU event loop
+;; I/O delay: WFI when timer configured, UART spin otherwise
+;; timer-rearm re-arms ARM virtual timer (~1ms), WFI sleeps until it fires.
+;; Flag at usb-ring-base+0x10: 1=timer active (set by enable-rpi-timer).
 (defun io-delay ()
-  (dotimes (d 5000) (mem-ref #x3F201000 :u8)))
+  (if (zerop (mem-ref (+ #x01090000 #x10) :u32))
+      (dotimes (d 5000) (mem-ref #x3F201000 :u8))
+      (progn (timer-rearm) (wfi))))
 
 ;; write-byte: capture-aware for SSH output routing
 ;; Flags at ssh-ipc-base+0x14: bit0=capture-to-buffer, bit1=suppress-serial
@@ -135,13 +139,50 @@
   (eq obj (logand obj (- 0 1))))
 
 ;; ============================================================
+;; ARM virtual timer for WFI-based io-delay
+;; ============================================================
+;; setup-irq initializes CNTV_TVAL_EL0/CNTV_CTL_EL0 (1ms at 62.5MHz).
+;; No GIC needed — timer PPI wakes WFI directly on the core.
+;; Call after all crypto init (before net-actor-main).
+
+(defun enable-rpi-timer ()
+  (setup-irq)
+  (setf (mem-ref (+ #x01090000 #x10) :u32) 1))
+
+;; ============================================================
+;; DWC2 host-mode interrupt enable (WFI-based waking)
+;; ============================================================
+;;
+;; Enable DWC2 host channel interrupts so WFI wakes on USB activity.
+;; Does NOT require an ISR — WFI wakes on pending interrupt even with
+;; IRQs masked (PSTATE.I=1). Main loop polls HCINT after waking.
+;; Call after dwc2-init + USB enumeration + CDC setup.
+
+(defun dwc2-enable-host-irq ()
+  ;; HCINTMSK[0..2]: XFERCOMPL(0) + CHHLTD(1) + STALL(3) + NAK(4)
+  (let ((mask (logior 1 (logior 2 (logior 8 16)))))
+    (setf (mem-ref (+ #x3F98050C) :u32) mask)
+    (setf (mem-ref (+ #x3F98052C) :u32) mask)
+    (setf (mem-ref (+ #x3F98054C) :u32) mask))
+  ;; GINTMSK bit 25 = HCINT (host channel interrupt)
+  (setf (mem-ref (+ #x3F980018) :u32) #x02000000)
+  ;; BCM Enable_IRQs_1: bit 9 = USB
+  (setf (mem-ref #x3F00B210 :u32) #x200)
+  ;; Set WFI flag at usb-ring-base+0x0C
+  (setf (mem-ref (+ #x01090000 #x0C) :u32) 1))
+
+;; ============================================================
 ;; Single-threaded stubs for RPi MVM (no actors/SMP)
 ;; ============================================================
 
 ;; Actor model stubs -- single-threaded, no spawn/receive/yield
 (defun actor-spawn (fn) nil)
 (defun actor-exit () nil)
-(defun yield () (io-delay))
+;; yield: WFI when host interrupts configured, busy-wait otherwise
+(defun yield ()
+  (if (zerop (mem-ref (+ #x01090000 #x0C) :u32))
+      (io-delay)
+      (wfi)))
 (defun receive ()
   ;; Single-threaded: poll NIC for incoming data
   (e1000-receive)
@@ -181,8 +222,7 @@
       (progn
         (write-byte 109) (write-byte 111)
         (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 54)
-        (write-byte 52) (write-byte 62) (write-byte 32))))
+        (write-byte 115) (write-byte 62) (write-byte 32))))
 
 ;; ============================================================
 ;; Actor system address hooks (RPi 3B / Pi Zero 2 W memory layout)

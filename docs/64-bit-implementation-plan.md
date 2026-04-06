@@ -106,7 +106,7 @@ Tasks:
 [1.5.2] Cross-compile boot/*.lisp
 [1.5.3] Cross-compile drivers/serial.lisp
 [1.5.4] Link into bootable image
-[1.5.5] Write modus64-kernel.img
+[1.5.5] Write modus-kernel.img
 
 Dependencies: 1.0, 1.1, 1.2, 1.3, 1.4
 Verification:
@@ -672,7 +672,7 @@ Verification:
                               │ produces
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│ modus64-kernel.img                                                  │
+│ modus-kernel.img                                                  │
 │ • Boots to REPL                                                     │
 │ • Has reader + tree-walking eval                                    │
 │ • Can (load "file.lisp")                                            │
@@ -682,7 +682,7 @@ Verification:
                               ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │ NATIVE COMPILER (compiler/)                             │
-│ • Runs on Modus64                                                   │
+│ • Runs on Modus                                                   │
 │ • Full-featured                                                     │
 │ • Self-hosting                                                      │
 │ • This is the "real" compiler                                       │

@@ -9,7 +9,7 @@
 ;;;; Since the MVM compiler has no global variables, mutable state (the
 ;;;; defun alist) is threaded through as a "globals" cons cell parameter.
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 (defvar *repl-source*
 "
@@ -17,18 +17,49 @@
 ;;; Entry point (MUST be first defun — boot code falls through)
 ;;; ============================================================
 
+(defun spin-delay (n)
+  (let ((i n))
+    (loop
+      (when (<= i 0) (return 0))
+      (setq i (- i 1)))))
+
+(defun beep-start ()
+  (io-out-byte #x43 #xB6)
+  (io-out-byte #x42 #xA9)
+  (io-out-byte #x42 #x04)
+  (io-out-byte #x61 (logior (io-in-byte #x61) 3)))
+
+(defun beep-stop ()
+  (io-out-byte #x61 (logand (io-in-byte #x61) #xFC)))
+
+(defun beep-short ()
+  (beep-start)
+  (spin-delay 2000000)
+  (beep-stop)
+  (spin-delay 1500000))
+
+(defun beep-version (n)
+  (if (<= n 0) 0
+    (progn (beep-short) (beep-version (- n 1)))))
+
+(defun beep-success ()
+  (spin-delay 2000000)
+  (beep-start)
+  (halt-loop))
+
 (defun kernel-main ()
-  (write-string-codes (cons 77 (cons 111 (cons 100 (cons 117 (cons 115 (cons 54 (cons 52 (cons 32 (cons 82 (cons 69 (cons 80 (cons 76 nil)))))))))))))
+  ;; v31e: Fix BDSM(0xB0) + fill BDSM+DSPASURF + BAR2+DSPASURF (no reprogram)
   (write-newline)
   (let ((globals (cons nil nil)))
     (repl globals)))
 
 ;;; ============================================================
-;;; Input indirection: read-char-input defaults to serial UART.
-;;; HID build overrides this (loaded last wins) to poll USB keyboard.
+;;; I/O indirection: defaults to serial UART.
+;;; Override read-char-input for keyboard, write-char-output for framebuffer.
 ;;; ============================================================
 
 (defun read-char-input () (read-char-serial))
+(defun write-char-output (c) (write-char-serial c))
 
 ;;; ============================================================
 ;;; Output helpers
@@ -38,12 +69,12 @@
   (if (null chars)
       0
     (progn
-      (write-char-serial (car chars))
+      (write-char-output (car chars))
       (write-string-codes (cdr chars)))))
 
 (defun write-newline ()
-  (write-char-serial 13)
-  (write-char-serial 10))
+  (write-char-output 13)
+  (write-char-output 10))
 
 ;;; ============================================================
 ;;; Numeric output
@@ -55,15 +86,15 @@
       (print-fixnum-pos q)))
   (let ((d (mod n 10)))
     (let ((ch (+ d 48)))
-      (write-char-serial ch))))
+      (write-char-output ch))))
 
 (defun print-fixnum (n)
   (if (< n 0)
       (progn
-        (write-char-serial 45)
+        (write-char-output 45)
         (print-fixnum-pos (- 0 n)))
     (if (= n 0)
-        (write-char-serial 48)
+        (write-char-output 48)
       (print-fixnum-pos n))))
 
 ;;; ============================================================
@@ -72,35 +103,35 @@
 
 (defun print-list-tail (xs)
   (if (null xs)
-      (write-char-serial 41)
+      (write-char-output 41)
     (if (consp xs)
         (progn
-          (write-char-serial 32)
+          (write-char-output 32)
           (print-sexp (car xs))
           (print-list-tail (cdr xs)))
       (progn
-        (write-char-serial 32)
-        (write-char-serial 46)
-        (write-char-serial 32)
+        (write-char-output 32)
+        (write-char-output 46)
+        (write-char-output 32)
         (print-sexp xs)
-        (write-char-serial 41)))))
+        (write-char-output 41)))))
 
 (defun print-sexp (x)
   (if (null x)
       (progn
-        (write-char-serial 110)
-        (write-char-serial 105)
-        (write-char-serial 108))
+        (write-char-output 110)
+        (write-char-output 105)
+        (write-char-output 108))
     (if (fixnump x)
         (print-fixnum x)
       (if (consp x)
           (if (= (car x) 9999)
               (write-string-codes (cdr x))
             (progn
-              (write-char-serial 40)
+              (write-char-output 40)
               (print-sexp (car x))
               (print-list-tail (cdr x))))
-        (write-char-serial 63)))))
+        (write-char-output 63)))))
 
 ;;; ============================================================
 ;;; Input helpers
@@ -128,7 +159,7 @@
           (write-newline)
           (halt-loop))
       (progn
-        (write-char-serial c)
+        (write-char-output c)
         (if (is-whitespace c)
             (read-skip-ws)
           c)))))
@@ -147,12 +178,12 @@
   (let ((c (read-char-input)))
     (if (is-digit c)
         (progn
-          (write-char-serial c)
+          (write-char-output c)
           (let ((next (- c 48)))
             (let ((new-acc (+ (* acc 10) next)))
               (read-number-rest new-acc))))
       (progn
-        (write-char-serial c)
+        (write-char-output c)
         (cons acc c)))))
 
 (defun upcase (c)
@@ -164,10 +195,10 @@
   (let ((c (read-char-input)))
     (if (is-delimiter c)
         (progn
-          (write-char-serial c)
+          (write-char-output c)
           (cons nil c))
       (progn
-        (write-char-serial c)
+        (write-char-output c)
         (let ((rest-result (read-symbol-chars)))
           (let ((chars (car rest-result))
                 (term (cdr rest-result)))
@@ -204,7 +235,7 @@
        (let ((c2 (read-char-input)))
          (if (is-digit c2)
              (progn
-               (write-char-serial c2)
+               (write-char-output c2)
                (let ((result (read-number c2)))
                  (let ((n (car result))
                        (term (cdr result)))
@@ -212,7 +243,7 @@
            (if (is-delimiter c2)
                (cons (mksym (cons 45 nil)) c2)
              (progn
-               (write-char-serial c2)
+               (write-char-output c2)
                (let ((rest-result (read-symbol-chars)))
                  (let ((chars (car rest-result))
                        (term (cdr rest-result)))
@@ -242,7 +273,7 @@
      (let ((c2 (read-char-input)))
        (if (is-digit c2)
            (progn
-             (write-char-serial c2)
+             (write-char-output c2)
              (let ((result (read-number c2)))
                (let ((n (car result))
                      (term (cdr result)))
@@ -250,7 +281,7 @@
          (if (is-delimiter c2)
              (cons (mksym (cons 45 nil)) c2)
            (progn
-             (write-char-serial c2)
+             (write-char-output c2)
              (let ((rest-result (read-symbol-chars)))
                (let ((chars (car rest-result))
                      (term (cdr rest-result)))
@@ -300,12 +331,14 @@
 ;;; Functions that modify globals use set-cdr on it.
 
 (defun lookup (sym env globals)
-  (if (null env)
-      (lookup-in-alist sym (cdr globals))
-    (let ((binding (car env)))
-      (if (symbol-eq sym (car binding))
-          (cdr binding)
-        (lookup sym (cdr env) globals)))))
+  (let ((s0 sym))
+    (let ((g0 globals))
+      (if (null env)
+          (lookup-in-alist s0 (cdr g0))
+        (let ((binding (car env)))
+          (if (symbol-eq s0 (car binding))
+              (cdr binding)
+            (lookup s0 (cdr env) g0)))))))
 
 (defun lookup-in-alist (sym alist)
   (if (null alist)
@@ -333,24 +366,30 @@
   (and (consp x) (= (car x) 9999)))
 
 (defun eval-args (args env globals)
-  (if (null args)
-      nil
-    (let ((v (eval-sexp (car args) env globals)))
-      (cons v (eval-args (cdr args) env globals)))))
+  (let ((aa args))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null aa)
+            nil
+          (let ((v (eval-sexp (car aa) ee gg)))
+            (cons v (eval-args (cdr aa) ee gg))))))))
 
 (defun eval-sexp (x env globals)
-  (cond
-    ((null x) nil)
-    ((fixnump x) x)
-    ((is-sym x)
-     (lookup (sym-name x) env globals))
-    ((not (consp x)) x)
-    (t
-     (let ((op (car x)))
-       (if (not (is-sym op))
-           (eval-call op (cdr x) env globals)
-         (let ((name (sym-name op)))
-           (eval-special name x env globals)))))))
+  (let ((xx x))
+    (let ((ee env))
+      (let ((gg globals))
+        (cond
+          ((null xx) nil)
+          ((fixnump xx) xx)
+          ((is-sym xx)
+           (lookup (sym-name xx) ee gg))
+          ((not (consp xx)) xx)
+          (t
+           (let ((op (car xx)))
+             (if (not (is-sym op))
+                 (eval-call op (cdr xx) ee gg)
+               (let ((name (sym-name op)))
+                 (eval-special name xx ee gg))))))))))
 
 (defun fold-add (vals acc)
   (if (null vals)
@@ -374,170 +413,200 @@
         (cons 8888 c3)))))
 
 (defun eval-defun (x env globals)
-  (let ((fname (sym-name (cadr x))))
-    (let ((params (cadr (cdr x))))
-      (let ((body (cdr (cddr x))))
-        (let ((closure (make-closure params body env)))
-          (define-global globals fname closure)
-          (cons 9999 fname))))))
+  (let ((xx x))
+    (let ((ee env))
+      (let ((gg globals))
+        (let ((fname (sym-name (cadr xx))))
+          (let ((params (cadr (cdr xx))))
+            (let ((body (cdr (cddr xx))))
+              (let ((closure (make-closure params body ee)))
+                (define-global gg fname closure)
+                (cons 9999 fname)))))))))
 
 (defun eval-special (name x env globals)
+  (let ((nm name))
+    (let ((xx x))
+      (let ((ee env))
+        (let ((gg globals))
   (cond
     ;; QUOTE
-    ((symbol-eq name (cons 81 (cons 85 (cons 79 (cons 84 (cons 69 nil))))))
-     (cadr x))
+    ((symbol-eq nm (cons 81 (cons 85 (cons 79 (cons 84 (cons 69 nil))))))
+     (cadr xx))
     ;; IF
-    ((symbol-eq name (cons 73 (cons 70 nil)))
-     (let ((test-val (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 73 (cons 70 nil)))
+     (let ((test-val (eval-sexp (cadr xx) ee gg)))
        (if test-val
-           (eval-sexp (cadr (cdr x)) env globals)
-         (if (cdr (cddr x))
-             (eval-sexp (cadr (cddr x)) env globals)
+           (eval-sexp (cadr (cdr xx)) ee gg)
+         (if (cdr (cddr xx))
+             (eval-sexp (cadr (cddr xx)) ee gg)
            nil))))
     ;; WHEN
-    ((symbol-eq name (cons 87 (cons 72 (cons 69 (cons 78 nil)))))
-     (let ((test-val (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 87 (cons 72 (cons 69 (cons 78 nil)))))
+     (let ((test-val (eval-sexp (cadr xx) ee gg)))
        (if test-val
-           (eval-body (cddr x) env globals)
+           (eval-body (cddr xx) ee gg)
          nil)))
     ;; PROGN
-    ((symbol-eq name (cons 80 (cons 82 (cons 79 (cons 71 (cons 78 nil))))))
-     (eval-body (cdr x) env globals))
+    ((symbol-eq nm (cons 80 (cons 82 (cons 79 (cons 71 (cons 78 nil))))))
+     (eval-body (cdr xx) ee gg))
     ;; LET
-    ((symbol-eq name (cons 76 (cons 69 (cons 84 nil))))
-     (eval-let (cadr x) (cddr x) env globals))
+    ((symbol-eq nm (cons 76 (cons 69 (cons 84 nil))))
+     (eval-let (cadr xx) (cddr xx) ee gg))
     ;; DEFUN
-    ((symbol-eq name (cons 68 (cons 69 (cons 70 (cons 85 (cons 78 nil))))))
-     (eval-defun x env globals))
+    ((symbol-eq nm (cons 68 (cons 69 (cons 70 (cons 85 (cons 78 nil))))))
+     (eval-defun xx ee gg))
     ;; LAMBDA
-    ((symbol-eq name (cons 76 (cons 65 (cons 77 (cons 66 (cons 68 (cons 65 nil)))))))
-     (let ((params (cadr x))
-           (body (cddr x)))
-       (cons 8888 (cons params (cons body (cons env nil))))))
+    ((symbol-eq nm (cons 76 (cons 65 (cons 77 (cons 66 (cons 68 (cons 65 nil)))))))
+     (let ((params (cadr xx))
+           (body (cddr xx)))
+       (cons 8888 (cons params (cons body (cons ee nil))))))
     ;; +
-    ((symbol-eq name (cons 43 nil))
-     (fold-add (eval-args (cdr x) env globals) 0))
+    ((symbol-eq nm (cons 43 nil))
+     (fold-add (eval-args (cdr xx) ee gg) 0))
     ;; -
-    ((symbol-eq name (cons 45 nil))
-     (let ((vals (eval-args (cdr x) env globals)))
+    ((symbol-eq nm (cons 45 nil))
+     (let ((vals (eval-args (cdr xx) ee gg)))
        (if (null (cdr vals))
            (- 0 (car vals))
          (fold-sub (cdr vals) (car vals)))))
     ;; *
-    ((symbol-eq name (cons 42 nil))
-     (fold-mul (eval-args (cdr x) env globals) 1))
+    ((symbol-eq nm (cons 42 nil))
+     (fold-mul (eval-args (cdr xx) ee gg) 1))
     ;; TRUNCATE
-    ((symbol-eq name (cons 84 (cons 82 (cons 85 (cons 78 (cons 67 (cons 65 (cons 84 (cons 69 nil)))))))))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 84 (cons 82 (cons 85 (cons 78 (cons 67 (cons 65 (cons 84 (cons 69 nil)))))))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (truncate a b)))
     ;; MOD
-    ((symbol-eq name (cons 77 (cons 79 (cons 68 nil))))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 77 (cons 79 (cons 68 nil))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (mod a b)))
     ;; <
-    ((symbol-eq name (cons 60 nil))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 60 nil))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (< a b) 1 nil)))
     ;; >
-    ((symbol-eq name (cons 62 nil))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 62 nil))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (> a b) 1 nil)))
     ;; =
-    ((symbol-eq name (cons 61 nil))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 61 nil))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (= a b) 1 nil)))
     ;; <=
-    ((symbol-eq name (cons 60 (cons 61 nil)))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 60 (cons 61 nil)))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (<= a b) 1 nil)))
     ;; >=
-    ((symbol-eq name (cons 62 (cons 61 nil)))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 62 (cons 61 nil)))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (>= a b) 1 nil)))
     ;; CONS
-    ((symbol-eq name (cons 67 (cons 79 (cons 78 (cons 83 nil)))))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 67 (cons 79 (cons 78 (cons 83 nil)))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (cons a b)))
     ;; CAR
-    ((symbol-eq name (cons 67 (cons 65 (cons 82 nil))))
-     (car (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 67 (cons 65 (cons 82 nil))))
+     (car (eval-sexp (cadr xx) ee gg)))
     ;; CDR
-    ((symbol-eq name (cons 67 (cons 68 (cons 82 nil))))
-     (cdr (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 67 (cons 68 (cons 82 nil))))
+     (cdr (eval-sexp (cadr xx) ee gg)))
     ;; NULL
-    ((symbol-eq name (cons 78 (cons 85 (cons 76 (cons 76 nil)))))
-     (if (null (eval-sexp (cadr x) env globals)) 1 nil))
+    ((symbol-eq nm (cons 78 (cons 85 (cons 76 (cons 76 nil)))))
+     (if (null (eval-sexp (cadr xx) ee gg)) 1 nil))
     ;; CONSP
-    ((symbol-eq name (cons 67 (cons 79 (cons 78 (cons 83 (cons 80 nil))))))
-     (if (consp (eval-sexp (cadr x) env globals)) 1 nil))
+    ((symbol-eq nm (cons 67 (cons 79 (cons 78 (cons 83 (cons 80 nil))))))
+     (if (consp (eval-sexp (cadr xx) ee gg)) 1 nil))
     ;; ATOM
-    ((symbol-eq name (cons 65 (cons 84 (cons 79 (cons 77 nil)))))
-     (if (atom (eval-sexp (cadr x) env globals)) 1 nil))
+    ((symbol-eq nm (cons 65 (cons 84 (cons 79 (cons 77 nil)))))
+     (if (atom (eval-sexp (cadr xx) ee gg)) 1 nil))
     ;; LIST
-    ((symbol-eq name (cons 76 (cons 73 (cons 83 (cons 84 nil)))))
-     (eval-args (cdr x) env globals))
+    ((symbol-eq nm (cons 76 (cons 73 (cons 83 (cons 84 nil)))))
+     (eval-args (cdr xx) ee gg))
     ;; 1+
-    ((symbol-eq name (cons 49 (cons 43 nil)))
-     (1+ (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 49 (cons 43 nil)))
+     (1+ (eval-sexp (cadr xx) ee gg)))
     ;; 1-
-    ((symbol-eq name (cons 49 (cons 45 nil)))
-     (1- (eval-sexp (cadr x) env globals)))
+    ((symbol-eq nm (cons 49 (cons 45 nil)))
+     (1- (eval-sexp (cadr xx) ee gg)))
     ;; EQ
-    ((symbol-eq name (cons 69 (cons 81 nil)))
-     (let ((a (eval-sexp (cadr x) env globals))
-           (b (eval-sexp (cadr (cdr x)) env globals)))
+    ((symbol-eq nm (cons 69 (cons 81 nil)))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
        (if (eq a b) 1 nil)))
     ;; NOT
-    ((symbol-eq name (cons 78 (cons 79 (cons 84 nil))))
-     (if (eval-sexp (cadr x) env globals) nil 1))
+    ((symbol-eq nm (cons 78 (cons 79 (cons 84 nil))))
+     (if (eval-sexp (cadr xx) ee gg) nil 1))
     ;; AND
-    ((symbol-eq name (cons 65 (cons 78 (cons 68 nil))))
-     (eval-and (cdr x) env globals))
+    ((symbol-eq nm (cons 65 (cons 78 (cons 68 nil))))
+     (eval-and (cdr xx) ee gg))
     ;; OR
-    ((symbol-eq name (cons 79 (cons 82 nil)))
-     (eval-or (cdr x) env globals))
+    ((symbol-eq nm (cons 79 (cons 82 nil)))
+     (eval-or (cdr xx) ee gg))
     ;; COND
-    ((symbol-eq name (cons 67 (cons 79 (cons 78 (cons 68 nil)))))
-     (eval-cond (cdr x) env globals))
+    ((symbol-eq nm (cons 67 (cons 79 (cons 78 (cons 68 nil)))))
+     (eval-cond (cdr xx) ee gg))
     ;; SETQ  (sets in global env)
-    ((symbol-eq name (cons 83 (cons 69 (cons 84 (cons 81 nil)))))
-     (let ((var-name (sym-name (cadr x)))
-           (val (eval-sexp (cadr (cdr x)) env globals)))
-       (define-global globals var-name val)
+    ((symbol-eq nm (cons 83 (cons 69 (cons 84 (cons 81 nil)))))
+     (let ((var-name (sym-name (cadr xx)))
+           (val (eval-sexp (cadr (cdr xx)) ee gg)))
+       (define-global gg var-name val)
        val))
-    ;; Otherwise: function call via global lookup
+    ;; LOGAND
+    ((symbol-eq nm (cons 76 (cons 79 (cons 71 (cons 65 (cons 78 (cons 68 nil)))))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
+       (logand a b)))
+    ;; LOGIOR
+    ((symbol-eq nm (cons 76 (cons 79 (cons 71 (cons 73 (cons 79 (cons 82 nil)))))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
+       (logior a b)))
+    ;; ASH
+    ((symbol-eq nm (cons 65 (cons 83 (cons 72 nil))))
+     (let ((a (eval-sexp (cadr xx) ee gg))
+           (b (eval-sexp (cadr (cdr xx)) ee gg)))
+       (ash a b)))
+    ;; Otherwise: platform call, then global lookup
     (t
-     (let ((fn (lookup name env globals)))
-       (if (null fn)
-           (progn
-             (write-string-codes (cons 69 (cons 82 (cons 82 (cons 58 (cons 32 nil))))))
-             (write-string-codes name)
-             (write-newline)
-             nil)
-         (let ((args (eval-args (cdr x) env globals)))
-           (apply-closure fn args globals)))))))
+     (let ((evaled (eval-args (cdr xx) ee gg)))
+       (let ((pres (eval-platform-call nm evaled)))
+         (if (consp pres)
+             (car pres)
+           (let ((fn (lookup nm ee gg)))
+             (if (null fn)
+                 (progn
+                   (write-string-codes (cons 69 (cons 82 (cons 82 (cons 58 (cons 32 nil))))))
+                   (write-string-codes nm)
+                   (write-newline)
+                   nil)
+               (apply-closure fn evaled gg)))))))))))))
+
 
 (defun eval-call (op args env globals)
-  (let ((fn (eval-sexp op env globals))
-        (evaled-args (eval-args args env globals)))
-    (apply-closure fn evaled-args globals)))
+  (let ((a0 args))
+    (let ((e0 env))
+      (let ((g0 globals))
+        (let ((fn (eval-sexp op e0 g0)))
+          (let ((evaled-args (eval-args a0 e0 g0)))
+            (apply-closure fn evaled-args g0)))))))
 
 (defun apply-closure (fn args globals)
-  (if (and (consp fn) (= (car fn) 8888))
-      (let ((params (cadr fn))
-            (body (cadr (cdr fn)))
-            (closed-env (cadr (cddr fn))))
-        (let ((new-env (bind-params params args closed-env)))
-          (eval-body body new-env globals)))
-    nil))
+  (let ((g0 globals))
+    (if (and (consp fn) (= (car fn) 8888))
+        (let ((params (cadr fn))
+              (body (cadr (cdr fn)))
+              (closed-env (cadr (cddr fn))))
+          (let ((new-env (bind-params params args closed-env)))
+            (eval-body body new-env g0)))
+      nil)))
 
 (defun bind-params (params args env)
   (if (null params)
@@ -548,66 +617,92 @@
         (cons (cons name a) (bind-params (cdr params) (cdr args) env))))))
 
 (defun eval-body (forms env globals)
-  (if (null forms)
-      nil
-    (if (null (cdr forms))
-        (eval-sexp (car forms) env globals)
-      (progn
-        (eval-sexp (car forms) env globals)
-        (eval-body (cdr forms) env globals)))))
+  (let ((ff forms))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null ff)
+            nil
+          (if (null (cdr ff))
+              (eval-sexp (car ff) ee gg)
+            (progn
+              (eval-sexp (car ff) ee gg)
+              (eval-body (cdr ff) ee gg))))))))
 
 (defun eval-let (bindings body env globals)
-  (let ((new-env (eval-let-bindings bindings env globals)))
-    (eval-body body new-env globals)))
+  (let ((b0 body))
+    (let ((g0 globals))
+      (let ((new-env (eval-let-bindings bindings env g0)))
+        (eval-body b0 new-env g0)))))
 
 (defun eval-let-bindings (bindings env globals)
-  (if (null bindings)
-      env
-    (let ((b (car bindings)))
-      (let ((var-name (if (is-sym (car b)) (sym-name (car b)) (car b)))
-            (val (eval-sexp (cadr b) env globals)))
-        (let ((new-env (cons (cons var-name val) env)))
-          (eval-let-bindings (cdr bindings) new-env globals))))))
+  (let ((bb bindings))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null bb)
+            ee
+          (let ((b (car bb)))
+            (let ((var-name (if (is-sym (car b)) (sym-name (car b)) (car b)))
+                  (val (eval-sexp (cadr b) ee gg)))
+              (let ((new-env (cons (cons var-name val) ee)))
+                (eval-let-bindings (cdr bb) new-env gg)))))))))
 
 (defun eval-and (args env globals)
-  (if (null args)
-      1
-    (let ((v (eval-sexp (car args) env globals)))
-      (if (null v)
-          nil
-        (if (null (cdr args))
-            v
-          (eval-and (cdr args) env globals))))))
+  (let ((aa args))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null aa)
+            1
+          (let ((v (eval-sexp (car aa) ee gg)))
+            (if (null v)
+                nil
+              (if (null (cdr aa))
+                  v
+                (eval-and (cdr aa) ee gg)))))))))
 
 (defun eval-or (args env globals)
-  (if (null args)
-      nil
-    (let ((v (eval-sexp (car args) env globals)))
-      (if v
-          v
-        (eval-or (cdr args) env globals)))))
+  (let ((aa args))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null aa)
+            nil
+          (let ((v (eval-sexp (car aa) ee gg)))
+            (if v
+                v
+              (eval-or (cdr aa) ee gg))))))))
 
 (defun eval-cond (clauses env globals)
-  (if (null clauses)
-      nil
-    (let ((clause (car clauses)))
-      (let ((test-val (eval-sexp (car clause) env globals)))
-        (if test-val
-            (eval-body (cdr clause) env globals)
-          (eval-cond (cdr clauses) env globals))))))
+  (let ((cc clauses))
+    (let ((ee env))
+      (let ((gg globals))
+        (if (null cc)
+            nil
+          (let ((clause (car cc)))
+            (let ((test-val (eval-sexp (car clause) ee gg)))
+              (if test-val
+                  (eval-body (cdr clause) ee gg)
+                (eval-cond (cdr cc) ee gg)))))))))
+
+;;; ============================================================
+;;; Platform call hook (override in platform-specific console source)
+;;; Returns (cons result nil) if handled, nil if not handled.
+;;; ============================================================
+
+(defun eval-platform-call (name evaled-args)
+  nil)
 
 ;;; ============================================================
 ;;; REPL
 ;;; ============================================================
 
 (defun repl (globals)
-  (write-char-serial 62)
-  (write-char-serial 32)
-  (let ((expr (read-sexp)))
-    (write-newline)
-    (let ((result (eval-sexp expr nil globals)))
-      (print-sexp result)
+  (let ((g globals))
+    (write-char-output 62)
+    (write-char-output 32)
+    (let ((expr (read-sexp)))
       (write-newline)
-      (repl globals))))
+      (let ((result (eval-sexp expr nil g)))
+        (print-sexp result)
+        (write-newline)
+        (repl g)))))
 
 ")

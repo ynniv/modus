@@ -1,4 +1,4 @@
-;;;; boot-68k.lisp - Motorola 68k Boot Sequence for Modus64
+;;;; boot-68k.lisp - Motorola 68k Boot Sequence for Modus
 ;;;;
 ;;;; 68k boot protocol (for qemu-system-m68k -machine virt -kernel):
 ;;;;   1. QEMU loads kernel image at load address
@@ -23,7 +23,7 @@
 ;;;;   A0, A1 = scratch (caller-saved)
 ;;;;   D0-D7 = data registers (mapped to V0-V7)
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; 68k Boot Constants

@@ -21,9 +21,13 @@
                                          (logand reg #xFFC)))))))
     (setf (mem-ref addr :u32) val)))
 
-;; I/O delay: read UART to yield to QEMU event loop
+;; I/O delay: WFI when GIC timer configured, UART spin otherwise
+;; WFI wakes on pending timer PPI (~1ms). IRQs stay masked (no ISR).
+;; timer-rearm clears pending interrupt and sets new countdown.
 (defun io-delay ()
-  (dotimes (d 5000) (mem-ref #x09000000 :u8)))
+  (if (zerop (mem-ref #x41060704 :u32))
+      (dotimes (d 5000) (mem-ref #x09000000 :u8))
+      (progn (timer-rearm) (wfi))))
 
 ;; write-byte: capture-aware for SSH output routing
 ;; Flags at (ssh-ipc-base)+0x14: bit0=capture-to-buffer, bit1=suppress-serial
@@ -85,6 +89,7 @@
 
 ;; DMA and state base addresses for AArch64 virt
 (defun e1000-state-base () #x41060000)
+(defun fe-scratch-base () #x41060900)
 (defun e1000-rx-desc-base () #x41000000)
 (defun e1000-rx-buf-base () #x41001000)
 (defun e1000-tx-desc-base () #x41041000)
@@ -156,6 +161,23 @@
   (eq obj (logand obj (- 0 1))))
 
 ;; ============================================================
+;; GICv2 timer interrupt for WFI-based io-delay
+;; ============================================================
+;; Boot code sets up GIC + virtual timer (1ms at 62.5MHz).
+;; ISR re-arms timer on each tick. Call this after init to
+;; unmask IRQs and enable WFI in io-delay.
+;;
+;; Timer flag at state+0x704. MUST NOT collide with:
+;;   +0x6C4..0x6E3  eph X25519 private key (32B)
+;;   +0x6E4..0x703  eph X25519 public key (32B)
+;;   +0x710..0x72F  host private key (32B)
+;;   +0x730..0x74F  host public key (32B)
+
+(defun enable-gic-timer ()
+  (setup-irq)
+  (setf (mem-ref #x41060704 :u32) 1))
+
+;; ============================================================
 ;; Single-threaded stubs for AArch64 MVM (no actors/SMP)
 ;; ============================================================
 
@@ -203,8 +225,7 @@
       (progn
         (write-byte 109) (write-byte 111)
         (write-byte 100) (write-byte 117)
-        (write-byte 115) (write-byte 54)
-        (write-byte 52) (write-byte 62) (write-byte 32))))
+        (write-byte 115) (write-byte 62) (write-byte 32))))
 
 ;; ============================================================
 ;; Actor system address hooks (QEMU virt memory layout)

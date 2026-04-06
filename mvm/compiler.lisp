@@ -21,7 +21,7 @@
 ;;;;   VSP:    stack pointer
 ;;;;   VFP:    frame pointer
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Tagging Constants (mirror cross-compile.lisp)
@@ -101,9 +101,18 @@
 (defvar *temp-reg-counter* 0
   "Next temporary register to allocate (cycles through V4-V15)")
 
+(defvar *arith-push-depth* 0
+  "Depth of arithmetic PUSH/POP nesting. When > 0, we are inside an
+   arithmetic operation that has pushed an intermediate result.
+   Compiling a function call at depth > 0 risks register clobber
+   from the call's save/restore interacting with the arithmetic stack.")
+
 (defvar *pending-flet-ir* nil
   "Collects (info . ir) pairs from flet/labels function compilations.
    These are drained by mvm-compile-all into all-ir after each top-level form.")
+
+(defvar *current-source-location* nil
+  "Current source location string, set by mvm-compile-all for each form.")
 
 ;;; ============================================================
 ;;; Structures
@@ -114,7 +123,8 @@
   param-count     ; number of formal parameters
   bytecode-offset ; offset in the module bytecode vector
   bytecode-length ; length of this function's bytecode
-  stack-frame-size) ; number of stack slots used
+  stack-frame-size ; number of stack slots used
+  source-location) ; string describing where defined (e.g. "form#123")
 
 (defstruct compile-env
   (bindings nil)       ; list of binding structs
@@ -169,6 +179,147 @@
 (defun current-temp-count ()
   "Return how many temp regs are currently in use"
   *temp-reg-counter*)
+
+;;; ============================================================
+;;; Arithmetic nesting safety check
+;;; ============================================================
+;;;
+;;; The PUSH/POP pattern used by arithmetic ops (+, *, logand, etc.)
+;;; interacts badly with function call save/restore when nested.
+;;; Example of what breaks:
+;;;   (+ (* (f x) (g y))        ; outer + pushes first arg
+;;;      (+ (* (h a) (k b))     ; inner +,* also push/pop
+;;;         (* (m c) (n d))))   ; call save/restore corrupts stack
+;;;
+;;; The fix: bind each multiply to a let variable, then sum variables.
+;;; We detect this at compile time and error out with a clear message.
+
+(defparameter *arith-ops*
+  '(+ - * logand logior logxor ash)
+  "Operators that use PUSH/POP for multi-arg evaluation")
+
+(defun form-contains-call-p (form)
+  "Return T if FORM contains a function call (not just arithmetic/variables/constants).
+   Used to detect dangerous nesting patterns."
+  (cond
+    ((not (consp form)) nil)
+    ((not (symbolp (car form))) nil)
+    ;; Known safe forms that don't generate calls — but recurse into subforms
+    ((member (car form) '(quote function)) nil)
+    ;; Arithmetic ops: recurse into their args
+    ((member (car form) *arith-ops*)
+     (some #'form-contains-call-p (cdr form)))
+    ;; Inline ops: safe themselves but recurse into arg forms
+    ((member (car form) '(car cdr cons list
+                          cadr cdar cddr
+                          aref aset
+                          not null
+                          1+ 1-
+                          = < > <= >= /= eq eql equal
+                          zerop
+                          length
+                          mem-ref %setf-mem-ref))
+     (some #'form-contains-call-p (cdr form)))
+    ;; Control flow: recurse into all subforms
+    ((member (car form) '(if when unless cond and or
+                          progn block return return-from
+                          setq setf))
+     (some #'form-contains-call-p (cdr form)))
+    ;; let/let*: recurse into binding values and body
+    ((member (car form) '(let let*))
+     (or (and (consp (cadr form))
+              (some (lambda (b)
+                      (and (consp b) (cdr b)
+                           (form-contains-call-p (cadr b))))
+                    (cadr form)))
+         (some #'form-contains-call-p (cddr form))))
+    ;; the: recurse into value
+    ((member (car form) '(the declare)) nil)
+    ;; Everything else is a function call
+    (t t)))
+
+(defun form-arith-call-depth (form)
+  "Return the nesting depth of arithmetic ops containing function calls.
+   Returns 0 if no function calls, or the max depth at which a call appears.
+   Depth 1 = call inside one arithmetic op (safe — save-count stays <= 1).
+   Depth 2+ = call inside nested arithmetic (DANGEROUS — stack corruption)."
+  (cond
+    ((not (consp form)) 0)
+    ((not (symbolp (car form))) 0)
+    ((member (car form) '(quote function)) 0)
+    ;; Arithmetic op with multiple args: each non-first arg is inside a PUSH/POP
+    ((and (member (car form) *arith-ops*)
+          (cddr form))  ; has 2+ args
+     ;; The first arg is NOT inside a push/pop, only subsequent args are
+     (max (form-arith-call-depth (car (cdr form)))  ; first arg: no depth increase
+          (reduce #'max (mapcar (lambda (arg)
+                                  (let ((d (form-arith-call-depth arg)))
+                                    (if (form-contains-call-p arg)
+                                        (1+ d)  ; call is inside this arithmetic's push/pop
+                                        d)))
+                                (cddr form))
+                  :initial-value 0)))
+    ;; Single-arg arithmetic: no push/pop
+    ((member (car form) *arith-ops*)
+     (if (cdr form) (form-arith-call-depth (cadr form)) 0))
+    ;; Recurse into control flow / inline ops
+    ((member (car form) '(if when unless cond and or not null
+                          progn block return return-from
+                          setq setf
+                          car cdr cons list cadr cdar cddr
+                          aref aset 1+ 1-
+                          = < > <= >= /= eq eql equal zerop length
+                          mem-ref %setf-mem-ref))
+     (reduce #'max (mapcar #'form-arith-call-depth (cdr form))
+             :initial-value 0))
+    ;; let/let*
+    ((member (car form) '(let let*))
+     (max (if (consp (cadr form))
+              (reduce #'max
+                      (mapcar (lambda (b)
+                                (if (and (consp b) (cdr b))
+                                    (form-arith-call-depth (cadr b))
+                                    0))
+                              (cadr form))
+                      :initial-value 0)
+              0)
+          (reduce #'max (mapcar #'form-arith-call-depth (cddr form))
+                  :initial-value 0)))
+    ;; Function call: leaf — depth 0 (the call itself is counted by parent)
+    (t 0)))
+
+(defun check-arith-nesting (op operand)
+  "Check that OPERAND is safe to compile inside an arithmetic PUSH/POP.
+   At *arith-push-depth* >= 1, the operand must not itself push again
+   with a function call inside (which would reach effective depth 2+)."
+  (let ((inner-depth (form-arith-call-depth operand)))
+    ;; Only error if the operand actually contains function calls.
+    ;; Pure arithmetic nesting without calls is safe — no save/restore interference.
+    (when (and (>= (+ *arith-push-depth* inner-depth) 2)
+               (form-contains-call-p operand))
+      (error "MVM compiler: nested arithmetic with function calls will miscompile.~%~
+              In function ~A: operator ~A at depth ~D, operand adds ~D more levels.~%~
+              Effective depth ~D >= 2: stack corruption will occur.~%~
+              Fix: bind function call results to let variables first.~%~
+              Offending operand: ~S"
+             *current-function-name* op *arith-push-depth* inner-depth
+             (+ *arith-push-depth* inner-depth) operand))))
+
+(defparameter *let-binding-limit* 120
+  "Maximum number of bindings in a single let/let* form.
+   The x64 frame has 128 slots; leave headroom for nested scopes.
+   Beyond this, stack slots overflow the frame causing corruption.")
+
+(defun check-frame-overflow (n-bindings form-type env)
+  "Error if total stack depth would exceed the frame slot limit."
+  (let ((current-depth (if env (compile-env-stack-depth env) 0))
+        (new-depth (+ (if env (compile-env-stack-depth env) 0) n-bindings)))
+    (when (> new-depth *let-binding-limit*)
+      (error "MVM compiler: ~A with ~D bindings at depth ~D would use ~D frame slots (limit ~D).~%~
+              In function ~A.~%~
+              Fix: split into helper functions to reduce total nesting depth."
+             form-type n-bindings current-depth new-depth *let-binding-limit*
+             *current-function-name*))))
 
 ;;; ============================================================
 ;;; IR Instruction Representation
@@ -582,7 +733,7 @@
                 ;; Generic struct accessor: (setf (foo-bar x) v) → (set-foo-bar x v)
                 ((consp place)
                  (let ((setter (intern (format nil "SET-~A" (symbol-name (car place)))
-                                       :modus64.mvm)))
+                                       :modus.mvm)))
                    `(,setter ,(cadr place) ,value)))))))))
 
   ;; LDB — extract byte field from integer
@@ -986,6 +1137,11 @@
       ((= op-name 701100176259851453)       (compile-1+ (cadr form) env dest))
       ((= op-name 593011189432099851)       (compile-1- (cadr form) env dest))
       ((= op-name 219259789038689217) (compile-truncate (cdr form) env dest))
+      ((= op-name 1047143422370414916) (compile-mul26lo (cdr form) env dest))
+      ((= op-name 3053449675996246) (compile-mul26hi (cdr form) env dest))
+      ((= op-name 13026604224746835194) (compile-mul64lo (cdr form) env dest))
+      ((= op-name 12591721202407133616) (compile-mul64hi (cdr form) env dest))
+      ((= op-name 920227542902379435) (compile-acc128 (cdr form) env dest))
       ((= op-name 654425922550660137)      (compile-mod (cdr form) env dest))
 
       ;; --- Comparisons ---
@@ -1056,8 +1212,33 @@
       ((= op-name 821056500804198866) (compile-write-char-serial (cdr form) env dest))
       ((= op-name 602746553318600181)  (compile-read-char-serial dest))
 
+      ;; --- Timestamp Counter ---
+      ((= op-name 580098868411189197) (compile-rdtsc dest))
+
+      ;; --- Wait For Interrupt ---
+      ((= op-name 703562642750212015) (compile-wfi dest))
+
+      ;; --- Setup IRQ ---
+      ((= op-name 208317008853653791)  (compile-setup-irq dest))
+      ;; --- Timer Rearm ---
+      ((= op-name 590227155880225484) (compile-timer-rearm dest))
+
+      ;; --- NIC Interrupt Setup ---
+      ((= op-name 1009685354534069733) (compile-setup-nic-idt dest))
+      ((= op-name 739607750214719398)  (compile-nic-irq-unmask dest))
+
+      ;; --- MMIO (raw 32-bit address at 0x600140, result at 0x600148) ---
+      ((= op-name 372079205816461105)  (compile-mmio-do-read32 dest))
+      ((= op-name 186965853563265998) (compile-mmio-do-write32 dest))
+      ;; --- Raw I/O port read (port in low 16 of [0x600140], result at 0x600148) ---
+      ((= op-name 581371924726892981) (compile-io-in-dword-raw dest))
+      ;; --- PCI config read (V0=addr without enable, result at 0x600148) ---
+      ((= op-name 587268234776988492) (compile-pci-config-read-raw (cadr form) env dest))
+
       ;; --- Memory Barrier ---
       ((= op-name 1082210422183761822) (compile-memory-barrier dest))
+      ;; --- Cache Flush (WBINVD on x86, NOP on others) ---
+      ((= op-name 70198493141306239) (compile-wbinvd dest))
 
       ;; --- System Registers ---
       ((= op-name 756709414635220786)   (compile-get-alloc-ptr dest))
@@ -1197,6 +1378,7 @@
 (defun compile-let (bindings body env dest)
   "Compile (let ((var val)*) body*).
    All values are evaluated in the outer environment, then bound."
+  (check-frame-overflow (length bindings) "let" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))
         (new-env env)
@@ -1242,6 +1424,7 @@
 (defun compile-let* (bindings body env dest)
   "Compile (let* ((var val)*) body*).
    Values are evaluated sequentially; each can see earlier bindings."
+  (check-frame-overflow (length bindings) "let*" env)
   (let ((body (strip-declares body))
         (n-bindings (length bindings))
         (new-env env))
@@ -1954,7 +2137,9 @@
      ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
+       (check-arith-nesting '+ arg)
+       (let ((temp (alloc-temp-reg))
+             (*arith-push-depth* (1+ *arith-push-depth*)))
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
@@ -1977,7 +2162,9 @@
      ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
+       (check-arith-nesting '- arg)
+       (let ((temp (alloc-temp-reg))
+             (*arith-push-depth* (1+ *arith-push-depth*)))
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
@@ -1999,12 +2186,69 @@
      ;; across function calls in later args.
      (compile-form (car args) env dest)
      (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
+       (check-arith-nesting '* arg)
+       (let ((temp (alloc-temp-reg))
+             (*arith-push-depth* (1+ *arith-push-depth*)))
          (emit-ir :push dest)
          (compile-form arg env temp)
          (emit-ir :pop dest)
          (emit-ir :mul dest dest temp)
          (free-temp-reg))))))
+
+(defun compile-mul26lo (args env dest)
+  "Compile (mul26lo a b) — low 26 bits of untag(a)*untag(b), tagged.
+   Uses MUL26LO opcode for hardware wide multiply on 32-bit targets."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :mul26lo dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-mul26hi (args env dest)
+  "Compile (mul26hi a b) — bits 26+ of untag(a)*untag(b), tagged.
+   Uses MUL26HI opcode for hardware wide multiply on 32-bit targets."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :mul26hi dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-mul64lo (args env dest)
+  "Compile (mul64lo a b) — low 64 bits of raw a*b. No tag/untag."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :mul64lo dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-mul64hi (args env dest)
+  "Compile (mul64hi a b) — high 64 bits of raw a*b. No tag/untag."
+  (compile-form (car args) env dest)
+  (let ((temp (alloc-temp-reg)))
+    (emit-ir :push dest)
+    (compile-form (cadr args) env temp)
+    (emit-ir :pop dest)
+    (emit-ir :mul64hi dest dest temp)
+    (free-temp-reg)))
+
+(defun compile-acc128 (args env dest)
+  "Compile (acc128 addr lo hi) — mem128[addr] += hi:lo. Raw u64 values."
+  (let ((addr-reg (alloc-temp-reg))
+        (lo-reg (alloc-temp-reg))
+        (hi-reg (alloc-temp-reg)))
+    (compile-form (car args) env addr-reg)
+    (compile-form (cadr args) env lo-reg)
+    (compile-form (caddr args) env hi-reg)
+    (emit-ir :acc128 addr-reg lo-reg hi-reg)
+    (free-temp-reg)
+    (free-temp-reg)
+    (free-temp-reg)))
 
 (defun compile-div (args env dest)
   "Compile (/ a b). Truncating integer division for tagged fixnums.
@@ -2195,60 +2439,88 @@
 ;;; Bitwise Operations
 ;;; ============================================================
 
+(defun flatten-arith-args (op args)
+  "Flatten nested associative arithmetic: (op A (op B C)) → (op A B C).
+   Only flattens when the nested form uses the SAME operator.
+   This prevents push/pop stack corruption from deeply nested arithmetic
+   with function call operands."
+  (let ((result nil))
+    (dolist (arg args)
+      (if (and (consp arg)
+               (symbolp (car arg))
+               (eq (car arg) op))
+          ;; Recursively flatten: (logior A (logior B (logior C D))) → (A B C D)
+          (dolist (inner (flatten-arith-args op (cdr arg)))
+            (push inner result))
+          (push arg result)))
+    (nreverse result)))
+
 (defun compile-logand (args env dest)
   "Compile (logand args...).
+   Flattens nested logand to prevent push/pop stack corruption.
    Push/pop dest around each operand to survive function calls."
-  (cond
-    ((null args)
-     ;; (logand) = -1
-     (emit-ir :li dest -1))
-    ((null (cdr args))
-     (compile-form (car args) env dest))
-    (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-ir :and dest dest temp)
-         (free-temp-reg))))))
+  (let ((flat-args (flatten-arith-args 'logand args)))
+    (cond
+      ((null flat-args)
+       ;; (logand) = -1
+       (emit-ir :li dest -1))
+      ((null (cdr flat-args))
+       (compile-form (car flat-args) env dest))
+      (t
+       (compile-form (car flat-args) env dest)
+       (dolist (arg (cdr flat-args))
+         (check-arith-nesting 'logand arg)
+         (let ((temp (alloc-temp-reg))
+               (*arith-push-depth* (1+ *arith-push-depth*)))
+           (emit-ir :push dest)
+           (compile-form arg env temp)
+           (emit-ir :pop dest)
+           (emit-ir :and dest dest temp)
+           (free-temp-reg)))))))
 
 (defun compile-logior (args env dest)
   "Compile (logior args...).
+   Flattens nested logior to prevent push/pop stack corruption.
    Push/pop dest around each operand to survive function calls."
-  (cond
-    ((null args)
-     (compile-integer 0 dest))
-    ((null (cdr args))
-     (compile-form (car args) env dest))
-    (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-ir :or dest dest temp)
-         (free-temp-reg))))))
+  (let ((flat-args (flatten-arith-args 'logior args)))
+    (cond
+      ((null flat-args)
+       (compile-integer 0 dest))
+      ((null (cdr flat-args))
+       (compile-form (car flat-args) env dest))
+      (t
+       (compile-form (car flat-args) env dest)
+       (dolist (arg (cdr flat-args))
+         (check-arith-nesting 'logior arg)
+         (let ((temp (alloc-temp-reg))
+               (*arith-push-depth* (1+ *arith-push-depth*)))
+           (emit-ir :push dest)
+           (compile-form arg env temp)
+           (emit-ir :pop dest)
+           (emit-ir :or dest dest temp)
+           (free-temp-reg)))))))
 
 (defun compile-logxor (args env dest)
   "Compile (logxor args...).
+   Flattens nested logxor to prevent push/pop stack corruption.
    Push/pop dest around each operand to survive function calls."
-  (cond
-    ((null args)
-     (compile-integer 0 dest))
-    ((null (cdr args))
-     (compile-form (car args) env dest))
-    (t
-     (compile-form (car args) env dest)
-     (dolist (arg (cdr args))
-       (let ((temp (alloc-temp-reg)))
-         (emit-ir :push dest)
-         (compile-form arg env temp)
-         (emit-ir :pop dest)
-         (emit-ir :xor dest dest temp)
-         (free-temp-reg))))))
+  (let ((flat-args (flatten-arith-args 'logxor args)))
+    (cond
+      ((null flat-args)
+       (compile-integer 0 dest))
+      ((null (cdr flat-args))
+       (compile-form (car flat-args) env dest))
+      (t
+       (compile-form (car flat-args) env dest)
+       (dolist (arg (cdr flat-args))
+         (check-arith-nesting 'logxor arg)
+         (let ((temp (alloc-temp-reg))
+               (*arith-push-depth* (1+ *arith-push-depth*)))
+           (emit-ir :push dest)
+           (compile-form arg env temp)
+           (emit-ir :pop dest)
+           (emit-ir :xor dest dest temp)
+           (free-temp-reg)))))))
 
 (defun compile-ash (value-form count-form env dest)
   "Compile (ash value count) - arithmetic shift.
@@ -2271,10 +2543,12 @@
              (free-temp-reg)))))
     ;; Variable shift count
     (t
+     (check-arith-nesting 'ash count-form)
      (let ((count-reg (alloc-temp-reg))
            (pos-label (make-compiler-label))
            (neg-label (make-compiler-label))
-           (done-label (make-compiler-label)))
+           (done-label (make-compiler-label))
+           (*arith-push-depth* (1+ *arith-push-depth*)))
        ;; Push/pop dest around count evaluation to survive function calls
        (emit-ir :push dest)
        (compile-form count-form env count-reg)
@@ -2600,8 +2874,11 @@
   "Compile (mem-ref addr type) - raw memory read.
    Address is a tagged fixnum. Type controls width and tagging."
   (compile-form addr-form env dest)
-  ;; Untag address: sar by 1
-  (emit-ir :sar dest dest +fixnum-shift+)
+  ;; Untag address: logical shift right by 1
+  ;; Must use SHR (not SAR) because on 32-bit targets, addresses >= 0x40000000
+  ;; have the sign bit set in their tagged representation, and SAR would
+  ;; sign-extend to the wrong address.
+  (emit-ir :shr dest dest +fixnum-shift+)
   ;; Load from memory
   (let* ((wt (memory-width-code type-form))
          (width (car wt))
@@ -2631,8 +2908,8 @@
            (compile-form addr-form env addr-reg)
            ;; Restore value
            (emit-ir :pop dest)
-           ;; Untag address
-           (emit-ir :sar addr-reg addr-reg +fixnum-shift+)
+           ;; Untag address (logical shift right, not arithmetic — see compile-mem-ref)
+           (emit-ir :shr addr-reg addr-reg +fixnum-shift+)
            ;; Untag value for sub-64-bit stores
            (when needs-untag
              (emit-ir :sar dest dest +fixnum-shift+))
@@ -2706,19 +2983,19 @@
 (defun compile-set-alloc-ptr (form env dest)
   "Compile (set-alloc-ptr value) - set VA from tagged fixnum"
   (compile-form form env dest)
-  (emit-ir :sar dest dest +fixnum-shift+)
+  (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :mov +vreg-va+ dest))
 
 (defun compile-set-alloc-limit (form env dest)
   "Compile (set-alloc-limit value) - set VL from tagged fixnum"
   (compile-form form env dest)
-  (emit-ir :sar dest dest +fixnum-shift+)
+  (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :mov +vreg-vl+ dest))
 
 (defun compile-untag (form env dest)
-  "Compile (untag value) - remove fixnum tag"
+  "Compile (untag value) - remove fixnum tag (logical shift, unsigned)"
   (compile-form form env dest)
-  (emit-ir :sar dest dest +fixnum-shift+))
+  (emit-ir :shr dest dest +fixnum-shift+))
 
 ;;; ============================================================
 ;;; Actor/Context Primitives
@@ -2730,7 +3007,8 @@
    Untags the address before passing to save-ctx."
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
-  (emit-ir :sar dest dest +fixnum-shift+)
+  ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
+  (emit-ir :shr dest dest +fixnum-shift+)
   ;; The save-ctx MVM instruction handles the actual save.
   ;; It stores the continuation point internally.
   (emit-ir :save-ctx dest)
@@ -2743,7 +3021,8 @@
    Untags the address before passing to restore-ctx."
   (compile-form addr-form env dest)
   ;; Untag: address is a tagged fixnum, shift right by 1 to get raw address
-  (emit-ir :sar dest dest +fixnum-shift+)
+  ;; Must use SHR (not SAR) for 32-bit targets where high addresses set sign bit
+  (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :restore-ctx dest)
   ;; restore-ctx never returns, but we need dest for type consistency
   )
@@ -2755,8 +3034,8 @@
         (arg-forms (rest args)))
     ;; Compile address
     (compile-form addr-form env dest)
-    ;; Untag address
-    (emit-ir :sar dest dest +fixnum-shift+)
+    ;; Untag address (SHR for 32-bit safety)
+    (emit-ir :shr dest dest +fixnum-shift+)
     ;; Place arguments in V0, V1
     (loop for arg-form in arg-forms
           for i from 0
@@ -2789,8 +3068,8 @@
         (val-reg (alloc-temp-reg)))
     (compile-form addr-form env addr-reg)
     (compile-form val-form env val-reg)
-    ;; Untag both
-    (emit-ir :sar addr-reg addr-reg +fixnum-shift+)
+    ;; Untag both (SHR for address, SAR for value to preserve sign)
+    (emit-ir :shr addr-reg addr-reg +fixnum-shift+)
     (emit-ir :sar val-reg val-reg +fixnum-shift+)
     ;; Atomic exchange: dest = old value at [addr], [addr] = val
     (emit-ir :atomic-xchg dest addr-reg val-reg)
@@ -2828,12 +3107,79 @@
   (emit-ir :trap #x0301)
   (emit-ir :mov dest +vreg-v0+))
 
+(defun compile-rdtsc (dest)
+  "Compile (rdtsc) — read timestamp counter, return 64-bit cycles.
+   Uses TRAP #x0310; result is in VR (RAX)."
+  (emit-ir :trap #x0310)
+  (emit-ir :mov dest +vreg-vr+))
+
+(defun compile-wfi (dest)
+  "Compile (wfi) — wait for interrupt. CPU sleeps until next IRQ.
+   On ARM32: WFI instruction. On other archs: NOP (TRAP falls through to SWI).
+   Returns 0."
+  (emit-ir :trap #x0304)
+  (emit-ir :li dest 0))
+
+(defun compile-setup-irq (dest)
+  "Compile (setup-irq) - architecture-specific timer interrupt setup. Returns 0."
+  (emit-ir :trap #x0320)
+  (emit-ir :li dest 0))
+
+(defun compile-timer-rearm (dest)
+  "Compile (timer-rearm) - re-arm virtual timer for WFI wake. Returns 0."
+  (emit-ir :trap #x0321)
+  (emit-ir :li dest 0))
+
+(defun compile-setup-nic-idt (dest)
+  "Compile (setup-nic-idt) — install NIC IDT entry and unmask NIC IRQ.
+   NIC IRQ number must be stored at [0x600024] before calling. Returns 0."
+  (emit-ir :trap #x0322)
+  (emit-ir :li dest 0))
+
+(defun compile-nic-irq-unmask (dest)
+  "Compile (nic-irq-unmask) — re-enable NIC IRQ in PIC after servicing. Returns 0."
+  (emit-ir :trap #x0323)
+  (emit-ir :li dest 0))
+
+(defun compile-mmio-do-read32 (dest)
+  "Compile (mmio-do-read32) — read 32-bit value from raw address at 0x600140,
+   store result at 0x600148. Returns 0. Used for MMIO above 2GB on i386."
+  (emit-ir :trap #x0330)
+  (emit-ir :li dest 0))
+
+(defun compile-mmio-do-write32 (dest)
+  "Compile (mmio-do-write32) — write 32-bit value from 0x600148 to raw address
+   at 0x600140. Returns 0. Used for MMIO above 2GB on i386."
+  (emit-ir :trap #x0331)
+  (emit-ir :li dest 0))
+
+(defun compile-io-in-dword-raw (dest)
+  "Compile (io-in-dword-raw) — read 32-bit I/O port (port in low 16 of [0x600140]),
+   store raw result at 0x600148. Returns 0. Used for PCI reads with bit 31."
+  (emit-ir :trap #x0332)
+  (emit-ir :li dest 0))
+
+(defun compile-pci-config-read-raw (addr-form env dest)
+  "Compile (pci-config-read-raw ADDR) — native PCI config cycle.
+   ADDR is PCI address without enable bit (fits in fixnum).
+   Native code: untag, OR 0x80000000, outl 0xCF8, inl 0xCFC, store at 0x600148.
+   Returns byte 0 of result."
+  (compile-form addr-form env +vreg-v0+)
+  (emit-ir :trap #x0333)
+  (emit-ir :mov dest +vreg-vr+))
+
 (defun compile-memory-barrier (dest)
   "Compile (memory-barrier) — full system DSB.
    On AArch64 without MMU, peripheral registers are Normal Non-cacheable,
    so writes to different 4KB pages can be reordered by the write buffer.
    This forces all pending writes to complete before proceeding."
   (emit-ir :trap #x0302)
+  (emit-ir :li dest 0))
+
+(defun compile-wbinvd (dest)
+  "Compile (wbinvd) — flush all CPU caches (write-back, invalidate).
+   Required on real x86 hardware so NIC DMA sees descriptor writes."
+  (emit-ir :trap #x0334)
   (emit-ir :li dest 0))
 
 (defun compile-sti (dest)
@@ -2899,7 +3245,7 @@
 (defun compile-set-rsp (addr-form env dest)
   "Compile (set-rsp addr) - set stack pointer from tagged fixnum"
   (compile-form addr-form env dest)
-  (emit-ir :sar dest dest +fixnum-shift+)
+  (emit-ir :shr dest dest +fixnum-shift+)
   ;; Move to stack pointer register
   (emit-ir :mov +vreg-vsp+ dest)
   (emit-ir :li dest 0))
@@ -2907,7 +3253,7 @@
 (defun compile-lidt (addr-form env dest)
   "Compile (lidt addr) - load IDT register. Returns 0."
   (compile-form addr-form env dest)
-  (emit-ir :sar dest dest +fixnum-shift+)
+  (emit-ir :shr dest dest +fixnum-shift+)
   (emit-ir :trap 3)  ; trap code 3 = LIDT
   (emit-ir :li dest 0))
 
@@ -3264,6 +3610,11 @@
       (:add   4)
       (:sub   4)
       (:mul   4)
+      (:mul26lo 4)
+      (:mul26hi 4)
+      (:mul64lo 4)
+      (:mul64hi 4)
+      (:acc128  4)
       (:div   4)
       (:mod   4)
       (:and   4)
@@ -3290,20 +3641,20 @@
       ;; Function address: 1 opcode + 1 reg + 4 imm32 = 6 bytes
       (:fn-addr 6)
 
-      ;; Branch (unconditional): 1 opcode + 2 off16 = 3 bytes
-      (:br    3)
+      ;; Branch (unconditional): 1 opcode + 4 off32 = 5 bytes
+      (:br    5)
 
-      ;; Conditional branches: 1 opcode + 2 off16 = 3 bytes
-      (:beq   3)
-      (:bne   3)
-      (:blt   3)
-      (:bge   3)
-      (:ble   3)
-      (:bgt   3)
+      ;; Conditional branches: 1 opcode + 4 off32 = 5 bytes
+      (:beq   5)
+      (:bne   5)
+      (:blt   5)
+      (:bge   5)
+      (:ble   5)
+      (:bgt   5)
 
-      ;; Branch-null: 1 opcode + 1 reg + 2 off16 = 4 bytes
-      (:bnull  4)
-      (:bnnull 4)
+      ;; Branch-null: 1 opcode + 1 reg + 4 off32 = 6 bytes
+      (:bnull  6)
+      (:bnnull 6)
 
       ;; Call: 1 opcode + 4 imm32 = 5 bytes
       (:call  5)
@@ -3464,6 +3815,16 @@
            (mvm-sub buf (second insn) (third insn) (fourth insn)))
           (:mul
            (mvm-mul buf (second insn) (third insn) (fourth insn)))
+          (:mul26lo
+           (mvm-mul26lo buf (second insn) (third insn) (fourth insn)))
+          (:mul26hi
+           (mvm-mul26hi buf (second insn) (third insn) (fourth insn)))
+          (:mul64lo
+           (mvm-mul64lo buf (second insn) (third insn) (fourth insn)))
+          (:mul64hi
+           (mvm-mul64hi buf (second insn) (third insn) (fourth insn)))
+          (:acc128
+           (mvm-acc128 buf (second insn) (third insn) (fourth insn)))
           (:div
            (mvm-div buf (second insn) (third insn) (fourth insn)))
           (:mod
@@ -3511,64 +3872,64 @@
                               (function-info-bytecode-offset fn-info)
                               0))))
 
-          ;; ---- Branches ----
+          ;; ---- Branches (1 opcode + 4 off32 = 5 bytes) ----
           (:br
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-br buf rel-offset)))
 
           (:beq
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-beq buf rel-offset)))
           (:bne
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bne buf rel-offset)))
           (:blt
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-blt buf rel-offset)))
           (:bge
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bge buf rel-offset)))
           (:ble
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-ble buf rel-offset)))
           (:bgt
            (let* ((target-label (second insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 3))
+                  (insn-end (+ current-offset 5))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bgt buf rel-offset)))
 
-          ;; ---- Branch-null (reg + offset) ----
+          ;; ---- Branch-null (1 opcode + 1 reg + 4 off32 = 6 bytes) ----
           (:bnull
            (let* ((reg (second insn))
                   (target-label (third insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 4))
+                  (insn-end (+ current-offset 6))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bnull buf reg rel-offset)))
           (:bnnull
            (let* ((reg (second insn))
                   (target-label (third insn))
                   (target-pos (gethash target-label label-positions))
-                  (insn-end (+ current-offset 4))
+                  (insn-end (+ current-offset 6))
                   (rel-offset (- target-pos insn-end)))
              (mvm-bnnull buf reg rel-offset)))
 
@@ -3678,6 +4039,15 @@
     ;; result is (function-info . ir-list)
     (let ((info (car result))
           (ir (cdr result)))
+      ;; Record source location
+      (setf (function-info-source-location info) *current-source-location*)
+      ;; Warn on redefinition with source locations
+      (let ((existing (gethash (function-info-name info) *functions*)))
+        (when existing
+          (format t "  NOTE: redefining ~A  (old: ~A, new: ~A)~%"
+                  (function-info-name info)
+                  (or (function-info-source-location existing) "?")
+                  (or *current-source-location* "?"))))
       ;; Register in function table
       (setf (gethash (function-info-name info) *functions*) info)
       (push info *function-table*)
@@ -3814,14 +4184,14 @@
          ;; Positional constructor with internal name to avoid macro recursion
          (setf ctor-params (loop for s in slot-names
                                  collect (intern (format nil "P-~A" (symbol-name s))
-                                                 :modus64.mvm)))
+                                                 :modus.mvm)))
          (setf ctor-body
                `(let ((obj (make-array ,nslots)))
                   ,@(loop for i from 0
                           for p in ctor-params
                           collect `(aset obj ,i ,p))
                   obj))
-         (push `(defun ,(intern internal-ctor-name :modus64.mvm)
+         (push `(defun ,(intern internal-ctor-name :modus.mvm)
                     ,ctor-params
                   ,ctor-body)
                forms-to-compile)
@@ -3830,7 +4200,7 @@
          ;; with keyword args reordered to positional
          (let ((slot-kw-names (mapcar (lambda (s) (normalize-name s)) slot-names))
                (defaults slot-defaults)
-               (internal-ctor-sym (intern internal-ctor-name :modus64.mvm)))
+               (internal-ctor-sym (intern internal-ctor-name :modus.mvm)))
            (mvm-define-macro ctor-name
              (lambda (form)
                (let ((args (cdr form))
@@ -3854,17 +4224,17 @@
        (loop for slot in slot-names
              for i from 0
              do (let ((acc-name (format nil "~A-~A" struct-str (symbol-name slot))))
-                  (push `(defun ,(intern acc-name :modus64.mvm) (obj)
+                  (push `(defun ,(intern acc-name :modus.mvm) (obj)
                            (aref obj ,i))
                         forms-to-compile)
                   ;; Register SETF handler for this accessor
                   (let ((setter-name (format nil "SET-~A-~A" struct-str (symbol-name slot))))
-                    (push `(defun ,(intern setter-name :modus64.mvm) (obj val)
+                    (push `(defun ,(intern setter-name :modus.mvm) (obj val)
                              (aset obj ,i val)
                              val)
                           forms-to-compile)
                     ;; Register setf macro: (setf (foo-bar x) v) → (set-foo-bar x v)
-                    (let ((setter-sym (intern setter-name :modus64.mvm)))
+                    (let ((setter-sym (intern setter-name :modus.mvm)))
                       (let ((setf-key (compute-name-hash (format nil "SETF-~A" acc-name))))
                         (mvm-define-macro setf-key
                           (lambda (form)
@@ -3876,7 +4246,7 @@
 
        ;; Type predicate (name-p) — always returns t for any array (simple check)
        (let ((pred-name (format nil "~A-P" struct-str)))
-         (push `(defun ,(intern pred-name :modus64.mvm) (obj)
+         (push `(defun ,(intern pred-name :modus.mvm) (obj)
                   (arrayp obj))
                forms-to-compile))
 
@@ -3893,10 +4263,11 @@
      (let ((thunk-name (format nil "TOPLEVEL-~D" (make-compiler-label))))
        (mvm-compile-function thunk-name nil (list form))))))
 
-(defun mvm-compile-all (forms)
+(defun mvm-compile-all (forms &key source-lines)
   "Compile a list of top-level forms into a complete MVM module.
    Returns a compiled-module containing bytecode, function table,
-   and constant table."
+   and constant table.
+   SOURCE-LINES: optional vector mapping form index to source line number."
   (let ((*functions* (make-hash-table :test 'equal))
         (*function-table* nil)
         (*constant-table* nil)
@@ -3914,8 +4285,14 @@
     (register-mvm-bootstrap-macros)
 
     ;; Phase 1 & 2: Compile all forms to IR
+    (let ((form-index 0))
     (dolist (form forms)
       (setf *pending-flet-ir* nil)
+      (setf *current-source-location*
+            (if (and source-lines (< form-index (length source-lines)))
+                (format nil "line ~D" (aref source-lines form-index))
+                (format nil "form#~D" form-index)))
+      (incf form-index)
       (let* ((result (mvm-compile-toplevel form)))
         (cond
           ;; Multi-result from defstruct: collect all sub-results
@@ -3936,7 +4313,7 @@
         (let ((info (car flet-result))
               (ir (cdr flet-result)))
           (when (and info ir)
-            (push (cons info ir) all-ir)))))
+            (push (cons info ir) all-ir))))))
 
     ;; Reverse to get compilation order
     (setf all-ir (nreverse all-ir))
@@ -3949,7 +4326,7 @@
                      (>= (length name) 5)
                      (string= name "INIT-" :end1 5))
             (format t "  init thunk: ~A~%" name)
-            (push (list (intern name :modus64.mvm)) init-calls))))
+            (push (list (intern name :modus.mvm)) init-calls))))
       (when init-calls
         (let* ((result (mvm-compile-toplevel
                          `(defun init-all-globals ()
@@ -3977,6 +4354,16 @@
             ;; Update function in hash table so calls can resolve
             (setf (gethash (function-info-name info) *functions*) info)
             (incf global-offset fn-size))))
+
+      ;; Debug: show bytecode offsets for key functions
+      (dolist (name '("ED-SCALAR-MULT" "C64-ED-SCALAR-MULT" "ED-BASE-MULT"
+                      "ED-ADD" "ED-DOUBLE" "USB-KEEPALIVE" "ED25519-SIGN-FAST"))
+        (let ((fi (gethash name *functions*)))
+          (when fi
+            (format t "  FN ~A: offset=~D len=~D (~A)~%"
+                    name (function-info-bytecode-offset fi)
+                    (function-info-bytecode-length fi)
+                    (or (function-info-source-location fi) "?")))))
 
       ;; Second pass: emit bytecode with resolved offsets
       ;; Note: label-positions are LOCAL to each function (starting at 0).

@@ -5,7 +5,7 @@
 ;;;;
 ;;;; Reference: https://www.gnu.org/software/grub/manual/multiboot2/
 
-(in-package :modus64.cross)
+(in-package :modus.cross)
 
 ;;; ============================================================
 ;;; Multiboot2 Constants

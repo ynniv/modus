@@ -38,7 +38,7 @@
 ;;;;   - MOVEM for saving/restoring multiple registers
 ;;;;   - PEA for pushing effective addresses
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; 68k Register Encoding
@@ -455,6 +455,18 @@
   (m68k-emit-word buf (logior (ash (logand dst 7) 12)
                               (ash 1 11)    ; signed
                               0)))          ; 32-bit result
+
+(defun m68k-emit-mulu-64 (buf src dlo dhi)
+  "MULU.L Ds, Dhi:Dlo - unsigned multiply (32x32->64)"
+  ;; 68020+ long multiply with 64-bit result
+  ;; Extension word bit 10=1 for 64-bit result, bit 11=0 for unsigned
+  (m68k-emit-word buf (logior (ash #b01001100 8)
+                              (ash #b00 6)
+                              (ash +ea-mode-dn+ 3)
+                              (logand src 7)))
+  (m68k-emit-word buf (logior (ash (logand dlo 7) 12)
+                              (ash 1 10)   ; 64-bit result
+                              (logand dhi 7))))
 
 (defun m68k-emit-divs (buf src dst)
   "DIVS.L Ds, Dd - signed divide (Dd / Ds -> Dd quotient)"
@@ -1145,6 +1157,45 @@
            (m68k-emit-muls buf db +68k-d0+)
            (m68k-store-vreg buf vd +68k-d0+))))
 
+      (#.+op-mul26lo+
+       ;; Low 26 bits of untag(Va)*untag(Vb), tagged
+       (let ((vd (first operands))
+             (va (second operands))
+             (vb (third operands)))
+         (m68k-load-vreg buf +68k-d0+ va)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)  ; untag va
+         (m68k-load-vreg buf +68k-d1+ vb)
+         (m68k-emit-asr-imm buf +68k-d1+ 1)  ; untag vb
+         ;; MULS.L d1, d0 (32-bit result is fine for low 26 bits)
+         (m68k-emit-muls buf +68k-d1+ +68k-d0+)
+         ;; AND #0x3FFFFFF (mask to 26 bits)
+         (m68k-emit-andi buf +68k-d0+ #x3FFFFFF)
+         ;; Retag: ADD d0, d0
+         (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
+      (#.+op-mul26hi+
+       ;; Bits 26+ of untag(Va)*untag(Vb), tagged
+       (let ((vd (first operands))
+             (va (second operands))
+             (vb (third operands)))
+         (m68k-load-vreg buf +68k-d0+ va)
+         (m68k-emit-asr-imm buf +68k-d0+ 1)  ; untag va
+         (m68k-load-vreg buf +68k-d1+ vb)
+         (m68k-emit-asr-imm buf +68k-d1+ 1)  ; untag vb
+         ;; MULU.L d1, d1:d0 (64-bit unsigned: low→d0, high→d1)
+         (m68k-emit-mulu-64 buf +68k-d1+ +68k-d0+ +68k-d1+)
+         ;; Result in d1:d0. We want bits 26+.
+         ;; LSR d0, #26 (get top 6 bits of low word)
+         (m68k-emit-lsr-imm buf +68k-d0+ 26)
+         ;; LSL d1, #6 (shift high word left 6)
+         (m68k-emit-lsl-imm buf +68k-d1+ 6)
+         ;; OR d1, d0 (merge)
+         (m68k-emit-or-dn-dn buf +68k-d1+ +68k-d0+)
+         ;; Retag: ADD d0, d0
+         (m68k-emit-add-dn-dn buf +68k-d0+ +68k-d0+)
+         (m68k-store-vreg buf vd +68k-d0+)))
+
       (#.+op-div+
        (let ((vd (first operands))
              (va (second operands))
@@ -1815,14 +1866,14 @@
                  (when info
                    (let ((op-types (opcode-info-operands info)))
                      (cond
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (not (member :reg op-types)))
                         (let ((off (first operands)))
                           (let ((target (+ new-pc off)))
                             (unless (gethash target label-map)
                               (setf (gethash target label-map)
                                     (mvm-make-label))))))
-                       ((and (member :off16 op-types)
+                       ((and (member :off32 op-types)
                              (member :reg op-types))
                         (let ((off (second operands)))
                           (let ((target (+ new-pc off)))

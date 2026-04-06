@@ -1,4 +1,4 @@
-;;;; alloc.lisp - Memory Allocator for Modus64
+;;;; alloc.lisp - Memory Allocator for Modus
 ;;;;
 ;;;; Simple bump allocator. GC will be added later.
 ;;;;
@@ -9,7 +9,7 @@
 ;;;;   0x04000000 (64MB)  - Cons area
 ;;;;   0x05000000 (80MB)  - General area
 
-(in-package :modus64.runtime)
+(in-package :modus.runtime)
 
 ;;; ============================================================
 ;;; Memory Regions

@@ -2,7 +2,7 @@
 
 ## Overview
 
-The self-hosting pipeline produces a bootable Modus64 kernel in three stages:
+The self-hosting pipeline produces a bootable Modus kernel in three stages:
 
 ```
 SBCL + MVM     →  Gen0 (x86-64 ELF, ~1.2MB)
@@ -29,8 +29,8 @@ The kernel is a flat Multiboot ELF loaded at 0x100000.
 ```bash
 sbcl --control-stack-size 64 \
      --eval '(push (truename ".") asdf:*central-registry*)' \
-     --eval '(asdf:load-system :modus64)' \
-     --eval '(modus64.build:build-kernel-mvm "/tmp/modus64-gen0.elf")' \
+     --eval '(asdf:load-system :modus)' \
+     --eval '(modus.build:build-kernel-mvm "/tmp/modus-gen0.elf")' \
      --eval '(quit)'
 ```
 

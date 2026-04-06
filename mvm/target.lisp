@@ -4,7 +4,7 @@
 ;;;; registers to physical registers and defines platform-specific
 ;;;; translation parameters.
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Target Descriptor Structure
@@ -396,6 +396,41 @@
    :features '(:no-hw-divide nil :32-bit t)))
 
 ;;; ============================================================
+;;; ARMv7-A RPi (raspi2b — Cortex-A7, DWC2 USB, PL011 UART)
+;;; ============================================================
+;;;
+;;; Same ISA as ARMv7 (virt) but different UART base (0x3F201000).
+;;; Uses same translator with RPi-specific UART address.
+
+(defparameter *target-armv7-rpi*
+  (make-target
+   :name :armv7-rpi
+   :word-size 4
+   :endianness :little
+   :reg-map #(:r0 :r1 :r2 :r3       ; V0-V3 (args)
+              :r4 :r5 :r6 :r7       ; V4-V7 (callee-saved)
+              nil nil nil nil         ; V8-V11 (spill)
+              nil nil nil nil         ; V12-V15 (spill)
+              :r0                     ; VR (aliases V0)
+              :r9                     ; VA (alloc pointer)
+              :r10                    ; VL (alloc limit)
+              :r8                     ; VN (NIL)
+              :r13                    ; VSP (SP)
+              :r11                    ; VFP (FP)
+              nil)                    ; VPC
+   :n-phys-regs 16
+   :callee-saved '(4 5 6 7)
+   :arg-regs '(0 1 2 3)
+   :scratch-regs nil
+   :max-inline-regs 8
+   :page-size 4096
+   :translate-fn nil
+   :emit-prologue nil
+   :emit-epilogue nil
+   :emit-boot nil
+   :features '(:no-hw-divide nil :32-bit t)))
+
+;;; ============================================================
 ;;; Target Registry
 ;;; ============================================================
 
@@ -419,6 +454,7 @@
 (register-target *target-68k*)
 (register-target *target-arm32*)
 (register-target *target-armv7*)
+(register-target *target-armv7-rpi*)
 
 (defun list-targets ()
   "List all registered target names"

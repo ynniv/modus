@@ -6,6 +6,6 @@ source "$(dirname "$0")/lib.sh"
 echo "Building AArch64 REPL kernel..."
 sbcl --script mvm/build-aarch64-repl.lisp > /dev/null 2>&1
 
-boot_aarch64_virt /tmp/modus64-aarch64.bin
+boot_aarch64_virt /tmp/modus-aarch64.bin
 wait_for ">"
 pass

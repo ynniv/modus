@@ -1,4 +1,4 @@
-;;;; boot-aarch64.lisp - AArch64 Boot Sequence for Modus64
+;;;; boot-aarch64.lisp - AArch64 Boot Sequence for Modus
 ;;;;
 ;;;; AArch64 boot protocol (for -machine virt with UEFI or direct kernel):
 ;;;;   1. Firmware hands off in EL1 (or EL2 with virtualization)
@@ -14,7 +14,7 @@
 ;;;; SMP via PSCI (Power State Coordination Interface):
 ;;;;   - PSCI CPU_ON to wake secondary cores
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; AArch64 Boot Constants
@@ -226,12 +226,15 @@
           (mvm-emit-u32 buf #xB9400C01)
           ;; STR w1, [x0, #0x10]        (GICC_EOIR = w1 — end of interrupt)
           (mvm-emit-u32 buf #xB9001001)
+          ;; Re-arm timer: CNTV_TVAL_EL0 = 62500 (1ms at 62.5MHz)
+          (mvm-emit-u32 buf #xD29E8480)  ; MOVZ x0, #0xF424
+          (mvm-emit-u32 buf #xD51BE300)  ; MSR CNTV_TVAL_EL0, x0
           ;; LDP x0, x1, [SP], #16      (restore scratch regs)
           (mvm-emit-u32 buf #xA8C107E0)
           ;; ERET                        (return from exception)
           (mvm-emit-u32 buf #xD69F03E0)
-          ;; Fill remaining 26 instructions with NOP
-          (dotimes (i 26)
+          ;; Fill remaining 24 instructions with NOP
+          (dotimes (i 24)
             (mvm-emit-u32 buf #xD503201F)))
         ;; All other entries: B . (infinite loop for debugging)
         (progn
@@ -368,8 +371,8 @@
 
 ;; VA addresses for fixpoint runtime (same as x64)
 (defconstant +tdk-stack-va+      #x00200000)  ; Stack top
-(defconstant +tdk-cons-base-va+  #x04000000)  ; Cons alloc
-(defconstant +tdk-cons-limit-va+ #x07F00000)  ; Cons limit (63MB, safe below 0x08000000 image buffer)
+(defconstant +tdk-cons-base-va+  #x09000000)  ; Cons alloc (above image buffer at 0x08000000)
+(defconstant +tdk-cons-limit-va+ #x10000000)  ; Cons limit (112MB heap, below E1000 BAR at 0x10000000)
 (defconstant +tdk-uart-va+       #x20000000)  ; UART via page tables
 (defconstant +tdk-percpu-va+     #x00360000)  ; Per-CPU data (same as x64)
 
@@ -495,21 +498,32 @@
                                       (ash (logand offset #x7FFFF) 5)
                                       x2))))
 
-    ;; 7. L2[256] = 2MB block, device memory for UART
-    ;;    VA 0x20000000 → PA 0x09000000, AttrIndx=1
-    ;;    entry = 0x09000000 | (1<<10) | (3<<8) | (1<<2) | 0b01 = 0x09000705
-    ;;    L2 entry 256 is at L2_base + 256*8 = L2_base + 0x800
+    ;; 7. Fill L2[128..511] = identity-mapped device memory for PCI MMIO
+    ;;    VA 0x10000000-0x3FFFFFFF → PA 0x10000000-0x3FFFFFFF
+    ;;    Covers entire PCI MMIO window (E1000 BAR can be anywhere in range)
+    ;;    entry = PA | 0x705 (device nGnRnE, AF, SH=inner, AttrIndx=1)
+    ;;    L2[128] at L2_base + 128*8 = L2_base + 0x400
+    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ #x400))  ; x0 = &L2[128]
+    (emit-aarch64-load-imm64 buf x1 #x10000705)                     ; x1 = first entry (PA 0x10000000)
+    (emit-aarch64-movz buf x2 384 0)                                 ; x2 = count (128..511 = 384 entries)
+    ;; Reuse x3 = 0x200000 (2MB step, already loaded from step 6)
+    (let ((pci-loop-pos (mvm-buffer-position buf)))
+      ;; STR X1, [X0], #8
+      (emit-aarch64-u32 buf #xF8008401)
+      ;; ADD X1, X1, X3 (next PA)
+      (emit-aarch64-u32 buf #x8B030021)
+      ;; SUB X2, X2, #1
+      (emit-aarch64-u32 buf (logior (ash 1 31) (ash #b10 29) (ash #b100010 23) (ash 1 10) (ash x2 5) x2))
+      ;; CBNZ X2, pci_loop
+      (let ((offset (/ (- pci-loop-pos (mvm-buffer-position buf)) 4)))
+        (emit-aarch64-u32 buf (logior (ash #b10110101 24)
+                                      (ash (logand offset #x7FFFF) 5)
+                                      x2))))
+
+    ;; 7c. Restore L2[256] = UART (was overwritten by PCI loop above)
+    ;;    VA 0x20000000 → PA 0x09000000 (device)
     (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ (* 256 8)))
     (emit-aarch64-load-imm64 buf x1 #x09000705)
-    (emit-aarch64-str-x buf x1 x0 0)
-
-    ;; 7b. L2[128] = 2MB block, device memory for E1000 BAR
-    ;;    VA 0x10000000 → PA 0x10000000 (identity-mapped, overrides offset map)
-    ;;    L2[128] was filled with PA 0x50000000 by the loop; overwrite now.
-    ;;    entry = 0x10000705 (device, AF, SH, AttrIndx=1)
-    ;;    L2 entry 128 at L2_base + 128*8 = L2_base + 0x400
-    (emit-aarch64-load-imm64 buf x0 (+ +tdk-l2-table-pa+ #x400))
-    (emit-aarch64-load-imm64 buf x1 #x10000705)
     (emit-aarch64-str-x buf x1 x0 0)
 
     ;; ================================================================
@@ -587,10 +601,7 @@
     (emit-aarch64-load-imm64 buf x16 +tdk-percpu-va+)
     (emit-aarch64-u32 buf #xD518D090)            ; MSR TPIDR_EL1, X16
 
-    ;; 19. Set VBAR_EL1 for minimal exception vectors
-    ;; We'll point to a spin-loop vector at the start of the image (VA 0x800)
-    ;; But first we need to emit vectors. For now, point to a safe address.
-    ;; Vectors will be emitted at a known offset.
+    ;; 19. Set VBAR_EL1 for exception vectors at VA 0x800
     (emit-aarch64-movz buf x16 #x0800 0)         ; x16 = VA 0x800
     (emit-aarch64-u32 buf #xD518C010)            ; MSR VBAR_EL1, X16
     (emit-aarch64-u32 buf #xD5033FDF)            ; ISB

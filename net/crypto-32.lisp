@@ -53,7 +53,7 @@
 
 ;; Scale pair by 16: (hi . lo) * 16
 ;; NOTE: overflows on i386 when hi >= 27 bits. i386 uses triple-based
-;; fe-mul override in i386-overrides.lisp instead.
+;; fe-mul override in 32bit-overrides.lisp instead.
 (defun pshl4 (p)
   (let ((lo (cdr p)))
     (cons (+ (ash (car p) 4) (ash lo -22))

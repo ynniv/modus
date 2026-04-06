@@ -44,8 +44,8 @@
 
 (in-package :cl-user)
 
-(defpackage :modus64.mvm.i386
-  (:use :cl :modus64.mvm)
+(defpackage :modus.mvm.i386
+  (:use :cl :modus.mvm)
   (:export
    #:translate-mvm-to-i386
    #:translate-i386-function
@@ -55,7 +55,7 @@
    #:i386-buffer-to-bytes
    #:i386-disassemble-native))
 
-(in-package :modus64.mvm.i386)
+(in-package :modus.mvm.i386)
 
 ;;; ============================================================
 ;;; i386 Physical Register Encoding
@@ -438,7 +438,7 @@
 (defmacro def-i386-alu (name opcode-rr opcode-ri-8 opcode-ri-32 modrm-ext
                          &optional (opcode-rm nil) (opcode-mr nil))
   "Define i386 ALU instruction forms: reg-reg, reg-imm, reg-mem, mem-reg."
-  (let ((pkg (find-package :modus64.mvm.i386)))
+  (let ((pkg (find-package :modus.mvm.i386)))
     `(progn
        (defun ,(intern (format nil "I386-EMIT-~A-REG-REG" name) pkg) (buf dst src)
          ,(format nil "~A dst, src (register-register)" name)
@@ -547,6 +547,11 @@
   (i386-emit-byte buf #x0F)
   (i386-emit-byte buf #xAF)
   (i386-emit-byte buf (i386-modrm #b11 dst src)))
+
+(defun i386-emit-mul-reg (buf reg)
+  "MUL reg: unsigned multiply EDX:EAX = EAX * reg"
+  (i386-emit-byte buf #xF7)
+  (i386-emit-byte buf (i386-modrm #b11 4 reg)))
 
 (defun i386-emit-idiv-reg (buf reg)
   "IDIV reg: signed divide EDX:EAX by reg, quotient->EAX, remainder->EDX"
@@ -880,6 +885,355 @@
              ((= code #x0302)
               ;; Memory barrier: NOP on i386 (strong ordering)
               nil)
+             ((= code #x0320)
+              ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
+              ;; Save regs we clobber
+              (i386-emit-byte buf #x51)  ; push ecx
+              (i386-emit-byte buf #x52)  ; push edx
+              (i386-emit-byte buf #x57)  ; push edi
+              ;; --- PIC remap ---
+              (dolist (pv '((#x20 #x11) (#xA0 #x11)   ; ICW1
+                           (#x21 #x20) (#xA1 #x28)   ; ICW2
+                           (#x21 #x04) (#xA1 #x02)   ; ICW3
+                           (#x21 #x01) (#xA1 #x01)   ; ICW4
+                           (#x21 #xFC) (#xA1 #xFF))) ; masks (IRQ0+IRQ1 unmasked)
+                (i386-emit-byte buf #xB0) (i386-emit-byte buf (second pv))   ; mov al, val
+                (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)
+                (i386-emit-byte buf (logand (first pv) #xFF))
+                (i386-emit-byte buf (ash (first pv) -8))  ; mov dx, port
+                (i386-emit-byte buf #xEE))               ; out dx, al
+              ;; --- PIT channel 0: ~1000Hz (divisor 1193 = 0x04A9) ---
+              (dolist (pv '((#x43 #x34) (#x40 #xA9) (#x40 #x04)))
+                (i386-emit-byte buf #xB0) (i386-emit-byte buf (second pv))
+                (i386-emit-byte buf #x66) (i386-emit-byte buf #xBA)
+                (i386-emit-byte buf (logand (first pv) #xFF))
+                (i386-emit-byte buf (ash (first pv) -8))
+                (i386-emit-byte buf #xEE))
+              ;; --- Zero IDT area (384 bytes at 0x90000) ---
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90000)  ; mov edi
+              (i386-emit-byte buf #x31) (i386-emit-byte buf #xC0)     ; xor eax, eax
+              (i386-emit-byte buf #xB9) (i386-emit-u32 buf 96)        ; mov ecx, 96
+              (i386-emit-byte buf #xF3) (i386-emit-byte buf #xAB)     ; rep stosd
+              ;; --- Write IDT entry 0x20 at 0x90100 (8 bytes) ---
+              ;; ISR at 0x90400
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90100)
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x07)
+              (i386-emit-u32 buf #x00080400)  ; selector<<16|offset_lo
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x47) (i386-emit-byte buf #x04)
+              (i386-emit-u32 buf #x00098E00)  ; offset_hi<<16|type
+              ;; --- Write ISR at 0x90400 (7 bytes) ---
+              ;; push eax; mov al,0x20; out 0x20,al; pop eax; iret
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90400)
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x07)
+              (i386-emit-u32 buf #xE620B050)  ; 50 B0 20 E6
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xC7)
+              (i386-emit-byte buf #x47) (i386-emit-byte buf #x04)
+              (i386-emit-byte buf #x20) (i386-emit-byte buf #x58)  ; 20 58
+              (i386-emit-byte buf #xC6) (i386-emit-byte buf #x47)
+              (i386-emit-byte buf #x06) (i386-emit-byte buf #xCF)  ; CF (iret)
+              ;; --- Write keyboard ISR at 0x90410 (33 bytes) ---
+              ;; Stores raw scancode into ring buffer at 0x600040.
+              ;; Ring write index at 0x600030, 64-byte circular buffer.
+              ;; push eax; push ebx; in al,0x60; mov ebx,[0x600030];
+              ;; mov [ebx+0x600040],al; inc ebx; and ebx,0x3F;
+              ;; mov [0x600030],ebx; mov al,0x20; out 0x20,al;
+              ;; pop ebx; pop eax; iret
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90410)  ; mov edi, 0x90410
+              ;; Write ISR bytes as dwords via stosd
+              (i386-emit-byte buf #xFC)  ; cld
+              ;; Bytes: 50 53 E4 60
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x60E45350)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 8B 1D 30 00
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x00301D8B)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 60 00 88 83
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x83880060)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 40 00 60 00
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x00600040)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 43 83 E3 3F
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x3FE38343)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 89 1D 30 00
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x00301D89)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: 60 00 B0 20
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x20B00060)
+              (i386-emit-byte buf #xAB)
+              ;; Bytes: E6 20 5B 58
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x585B20E6)
+              (i386-emit-byte buf #xAB)
+              ;; Byte: CF (iret) — write as single byte
+              (i386-emit-byte buf #xC6) (i386-emit-byte buf #x07) (i386-emit-byte buf #xCF)
+              ;; --- Write IDT entry 0x21 at 0x90108 (keyboard IRQ1) ---
+              ;; ISR at 0x90410, selector 0x0008, type 0x8E (32-bit interrupt gate)
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90108)
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x07)
+              (i386-emit-u32 buf #x00080410)  ; selector<<16 | offset_lo
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x47) (i386-emit-byte buf #x04)
+              (i386-emit-u32 buf #x00098E00)  ; offset_hi<<16 | type
+              ;; --- Zero keyboard ring buffer state ---
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x05)
+              (i386-emit-u32 buf #x600030) (i386-emit-u32 buf 0)  ; write idx = 0
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x05)
+              (i386-emit-u32 buf #x600034) (i386-emit-u32 buf 0)  ; read idx = 0
+              ;; --- Zero NIC interrupt state ---
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x05)
+              (i386-emit-u32 buf #x600020) (i386-emit-u32 buf 0)  ; nic_pkt_pending = 0
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x05)
+              (i386-emit-u32 buf #x600024) (i386-emit-u32 buf 0)  ; nic_irq = 0
+              ;; --- Write NIC ISR (master PIC, IRQ 0-7) at 0x90450 (20 bytes) ---
+              ;; push eax; mov byte [0x600020],1; in al,0x21; or al,XX;
+              ;; out 0x21,al; mov al,0x20; out 0x20,al; pop eax; iret
+              ;; The OR byte (offset 11) is patched at runtime by TRAP #x0322.
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90450)
+              (i386-emit-byte buf #xFC)
+              ;; 50 C6 05 20 : push eax; mov byte [0x600020],...
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x05C62050)
+              (i386-emit-byte buf #xAB)
+              ;; 00 60 00 01 : ...addr+value
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x01006000)
+              (i386-emit-byte buf #xAB)
+              ;; E4 21 0C 00 : in al,0x21; or al,0x00(patch)
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x000C21E4)
+              (i386-emit-byte buf #xAB)
+              ;; E6 21 B0 20 : out 0x21,al; mov al,0x20
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x20B021E6)
+              (i386-emit-byte buf #xAB)
+              ;; E6 20 58 CF : out 0x20,al; pop eax; iret
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #xCF5820E6)
+              (i386-emit-byte buf #xAB)
+              ;; --- Write NIC ISR (slave PIC, IRQ 8-15) at 0x90470 (22 bytes) ---
+              ;; push eax; mov byte [0x600020],1; in al,0xA1; or al,XX;
+              ;; out 0xA1,al; mov al,0x20; out 0xA0,al; out 0x20,al; pop eax; iret
+              (i386-emit-byte buf #xBF) (i386-emit-u32 buf #x90470)
+              ;; 50 C6 05 20 : push eax; mov byte [0x600020],...
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x05C62050)
+              (i386-emit-byte buf #xAB)
+              ;; 00 60 00 01 : ...addr+value
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x01006000)
+              (i386-emit-byte buf #xAB)
+              ;; E4 A1 0C 00 : in al,0xA1; or al,0x00(patch)
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x000CA1E4)
+              (i386-emit-byte buf #xAB)
+              ;; E6 A1 B0 20 : out 0xA1,al; mov al,0x20
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x20B0A1E6)
+              (i386-emit-byte buf #xAB)
+              ;; E6 A0 E6 20 : out 0xA0,al; out 0x20,al
+              (i386-emit-byte buf #xB8) (i386-emit-u32 buf #x20E6A0E6)
+              (i386-emit-byte buf #xAB)
+              ;; 58 CF : pop eax; iret (+ 2 pad bytes)
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xC7)
+              (i386-emit-byte buf #x47) (i386-emit-byte buf #x14)
+              (i386-emit-byte buf #x58) (i386-emit-byte buf #xCF)
+              ;; --- LIDT ---
+              (i386-emit-byte buf #x83) (i386-emit-byte buf #xEC) (i386-emit-byte buf #x08)  ; sub esp, 8
+              (i386-emit-byte buf #x66) (i386-emit-byte buf #xC7)
+              (i386-emit-byte buf #x04) (i386-emit-byte buf #x24)
+              (i386-emit-byte buf #x7F) (i386-emit-byte buf #x01)  ; mov word [esp], 383
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x44)
+              (i386-emit-byte buf #x24) (i386-emit-byte buf #x02)
+              (i386-emit-u32 buf #x90000)  ; mov dword [esp+2], base
+              (i386-emit-byte buf #x0F) (i386-emit-byte buf #x01)
+              (i386-emit-byte buf #x1C) (i386-emit-byte buf #x24)  ; lidt [esp]
+              (i386-emit-byte buf #x83) (i386-emit-byte buf #xC4) (i386-emit-byte buf #x08)  ; add esp, 8
+              (i386-emit-byte buf #x5F)  ; pop edi
+              (i386-emit-byte buf #x5A)  ; pop edx
+              (i386-emit-byte buf #x59)) ; pop ecx
+             ((= code #x0321)
+              ;; TIMER-REARM: NOP on i386 (only meaningful on AArch64 virt)
+              nil)
+             ((= code #x0322)
+              ;; SETUP-NIC-IDT: Install NIC IDT entry and unmask NIC IRQ.
+              ;; IRQ number must be at [0x600024]. Handles both master/slave PIC.
+              ;; Patches OR byte in ISR, writes IDT entry, unmasks PIC.
+              (i386-emit-byte buf #x50)  ; push eax
+              (i386-emit-byte buf #x53)  ; push ebx
+              (i386-emit-byte buf #x51)  ; push ecx
+              (i386-emit-byte buf #x52)  ; push edx
+              ;; eax = IRQ number
+              (i386-emit-byte buf #xA1) (i386-emit-u32 buf #x600024)
+              ;; ebx = IDT entry addr = 0x90000 + (IRQ + 0x20) * 8
+              (i386-emit-byte buf #x8D) (i386-emit-byte buf #x58) (i386-emit-byte buf #x20) ; lea ebx,[eax+0x20]
+              (i386-emit-byte buf #xC1) (i386-emit-byte buf #xE3) (i386-emit-byte buf #x03) ; shl ebx,3
+              (i386-emit-byte buf #x81) (i386-emit-byte buf #xC3) (i386-emit-u32 buf #x90000) ; add ebx,0x90000
+              ;; edx = 1 << (IRQ & 7)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC1) ; mov ecx, eax
+              (i386-emit-byte buf #x83) (i386-emit-byte buf #xE1) (i386-emit-byte buf #x07) ; and ecx, 7
+              (i386-emit-byte buf #xBA) (i386-emit-u32 buf 1)     ; mov edx, 1
+              (i386-emit-byte buf #xD3) (i386-emit-byte buf #xE2) ; shl edx, cl
+              ;; Branch: IRQ < 8 → master (0x90450), else slave (0x90470)
+              (i386-emit-byte buf #x3C) (i386-emit-byte buf #x08) ; cmp al, 8
+              (i386-emit-byte buf #x72) (i386-emit-byte buf 35)   ; jb master (skip 35 bytes)
+              ;; --- Slave PIC path ---
+              ;; Write IDT entry: ISR at 0x90470
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x03)
+              (i386-emit-u32 buf #x00080470)  ; [ebx] = selector:16|offset_lo:16
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x43) (i386-emit-byte buf #x04)
+              (i386-emit-u32 buf #x00098E00)  ; [ebx+4] = offset_hi:16|type:16
+              ;; Patch OR byte in slave ISR (0x90470 + 11 = 0x9047B)
+              (i386-emit-byte buf #x88) (i386-emit-byte buf #x15) (i386-emit-u32 buf #x9047B)
+              ;; Unmask slave PIC: in al,0xA1; not dl; and al,dl; out 0xA1,al
+              (i386-emit-byte buf #xE4) (i386-emit-byte buf #xA1)
+              (i386-emit-byte buf #xF6) (i386-emit-byte buf #xD2) ; not dl
+              (i386-emit-byte buf #x20) (i386-emit-byte buf #xD0) ; and al, dl
+              (i386-emit-byte buf #xE6) (i386-emit-byte buf #xA1)
+              ;; Unmask cascade IRQ2 on master: in al,0x21; and al,~4; out 0x21,al
+              (i386-emit-byte buf #xE4) (i386-emit-byte buf #x21)
+              (i386-emit-byte buf #x24) (i386-emit-byte buf #xFB) ; and al, 0xFB
+              (i386-emit-byte buf #xE6) (i386-emit-byte buf #x21)
+              (i386-emit-byte buf #xEB) (i386-emit-byte buf 27)   ; jmp done (skip master)
+              ;; --- Master PIC path ---
+              ;; Write IDT entry: ISR at 0x90450
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x03)
+              (i386-emit-u32 buf #x00080450)
+              (i386-emit-byte buf #xC7) (i386-emit-byte buf #x43) (i386-emit-byte buf #x04)
+              (i386-emit-u32 buf #x00098E00)
+              ;; Patch OR byte in master ISR (0x90450 + 11 = 0x9045B)
+              (i386-emit-byte buf #x88) (i386-emit-byte buf #x15) (i386-emit-u32 buf #x9045B)
+              ;; Unmask master PIC
+              (i386-emit-byte buf #xE4) (i386-emit-byte buf #x21)
+              (i386-emit-byte buf #xF6) (i386-emit-byte buf #xD2)
+              (i386-emit-byte buf #x20) (i386-emit-byte buf #xD0)
+              (i386-emit-byte buf #xE6) (i386-emit-byte buf #x21)
+              ;; done:
+              (i386-emit-byte buf #x5A)  ; pop edx
+              (i386-emit-byte buf #x59)  ; pop ecx
+              (i386-emit-byte buf #x5B)  ; pop ebx
+              (i386-emit-byte buf #x58)) ; pop eax
+             ((= code #x0323)
+              ;; NIC-IRQ-UNMASK: Re-enable NIC IRQ in PIC after servicing.
+              ;; Reads IRQ from [0x600024].
+              (i386-emit-byte buf #x50)  ; push eax
+              (i386-emit-byte buf #x51)  ; push ecx
+              (i386-emit-byte buf #x52)  ; push edx
+              ;; edx = ~(1 << (IRQ & 7))
+              (i386-emit-byte buf #xA1) (i386-emit-u32 buf #x600024)
+              (i386-emit-byte buf #x89) (i386-emit-byte buf #xC1) ; mov ecx, eax
+              (i386-emit-byte buf #x83) (i386-emit-byte buf #xE1) (i386-emit-byte buf #x07)
+              (i386-emit-byte buf #xBA) (i386-emit-u32 buf 1)
+              (i386-emit-byte buf #xD3) (i386-emit-byte buf #xE2) ; shl edx, cl
+              (i386-emit-byte buf #xF6) (i386-emit-byte buf #xD2) ; not dl
+              ;; Branch: IRQ < 8 → master, else slave
+              (i386-emit-byte buf #x3C) (i386-emit-byte buf #x08)
+              (i386-emit-byte buf #x72) (i386-emit-byte buf 6)    ; jb master
+              ;; Slave: in al,0xA1; and al,dl; out 0xA1,al
+              (i386-emit-byte buf #xE4) (i386-emit-byte buf #xA1)
+              (i386-emit-byte buf #x20) (i386-emit-byte buf #xD0)
+              (i386-emit-byte buf #xE6) (i386-emit-byte buf #xA1)
+              (i386-emit-byte buf #xEB) (i386-emit-byte buf 6)    ; jmp done
+              ;; Master: in al,0x21; and al,dl; out 0x21,al
+              (i386-emit-byte buf #xE4) (i386-emit-byte buf #x21)
+              (i386-emit-byte buf #x20) (i386-emit-byte buf #xD0)
+              (i386-emit-byte buf #xE6) (i386-emit-byte buf #x21)
+              ;; done:
+              (i386-emit-byte buf #x5A)
+              (i386-emit-byte buf #x59)
+              (i386-emit-byte buf #x58))
+             ((= code #x0330)
+              ;; MMIO-DO-READ32: read 32-bit value from raw address at [0x600140]
+              ;; Result stored at [0x600148]. Bypasses fixnum tagging entirely.
+              ;; push eax
+              (i386-emit-byte buf #x50)
+              ;; mov eax, [0x600140]  — load raw 32-bit address
+              (i386-emit-byte buf #xA1)
+              (i386-emit-u32 buf #x600140)
+              ;; mov eax, [eax]  — read 32-bit value from that address
+              (i386-emit-byte buf #x8B)
+              (i386-emit-byte buf #x00)
+              ;; mov [0x600148], eax  — store raw result
+              (i386-emit-byte buf #xA3)
+              (i386-emit-u32 buf #x600148)
+              ;; pop eax
+              (i386-emit-byte buf #x58))
+             ((= code #x0331)
+              ;; MMIO-DO-WRITE32: write 32-bit value from [0x600148] to address [0x600140]
+              ;; push eax; push ecx
+              (i386-emit-byte buf #x50)
+              (i386-emit-byte buf #x51)
+              ;; mov eax, [0x600140]  — load raw 32-bit address
+              (i386-emit-byte buf #xA1)
+              (i386-emit-u32 buf #x600140)
+              ;; mov ecx, [0x600148]  — load raw 32-bit value
+              (i386-emit-byte buf #x8B)
+              (i386-emit-byte buf #x0D)
+              (i386-emit-u32 buf #x600148)
+              ;; mov [eax], ecx  — write value to address
+              (i386-emit-byte buf #x89)
+              (i386-emit-byte buf #x08)
+              ;; pop ecx; pop eax
+              (i386-emit-byte buf #x59)
+              (i386-emit-byte buf #x58))
+             ((= code #x0332)
+              ;; IO-IN-DWORD-RAW: read 32-bit I/O port, store raw result at 0x600148
+              ;; Port number from low 16 bits of [0x600140]
+              ;; push eax; push edx
+              (i386-emit-byte buf #x50)
+              (i386-emit-byte buf #x52)
+              ;; mov dx, [0x600140]  — load 16-bit port number
+              (i386-emit-byte buf #x66)       ; operand size prefix
+              (i386-emit-byte buf #x8B)       ; mov r16, [disp32]
+              (i386-emit-byte buf #x15)       ; mod=00 reg=DX r/m=101 (disp32)
+              (i386-emit-u32 buf #x600140)
+              ;; in eax, dx  — read 32-bit value from port
+              (i386-emit-byte buf #xED)
+              ;; mov [0x600148], eax  — store raw result
+              (i386-emit-byte buf #xA3)
+              (i386-emit-u32 buf #x600148)
+              ;; pop edx; pop eax
+              (i386-emit-byte buf #x5A)
+              (i386-emit-byte buf #x58))
+             ((= code #x0333)
+              ;; PCI-CONFIG-READ-RAW: full PCI config read cycle in native code
+              ;; V0 (ESI) = tagged PCI address (without enable bit)
+              ;; Result: raw 32-bit value stored at [0x600148], byte 0 tagged in V0/VR
+              ;; push edx
+              (i386-emit-byte buf #x52)
+              ;; mov eax, esi (V0 = tagged addr)
+              (i386-emit-byte buf #x89)
+              (i386-emit-byte buf #xF0)
+              ;; shr eax, 1 (untag fixnum)
+              (i386-emit-byte buf #xD1)
+              (i386-emit-byte buf #xE8)
+              ;; or eax, 0x80000000 (set enable bit — can't do in Lisp!)
+              (i386-emit-byte buf #x0D)       ; or eax, imm32
+              (i386-emit-u32 buf #x80000000)
+              ;; mov dx, 0x0CF8
+              (i386-emit-byte buf #x66)
+              (i386-emit-byte buf #xBA)
+              (i386-emit-byte buf #xF8)
+              (i386-emit-byte buf #x0C)
+              ;; out dx, eax (write PCI config address)
+              (i386-emit-byte buf #xEF)
+              ;; mov dx, 0x0CFC
+              (i386-emit-byte buf #x66)
+              (i386-emit-byte buf #xBA)
+              (i386-emit-byte buf #xFC)
+              (i386-emit-byte buf #x0C)
+              ;; in eax, dx (read PCI config data)
+              (i386-emit-byte buf #xED)
+              ;; mov [0x600148], eax (store raw 32-bit result)
+              (i386-emit-byte buf #xA3)
+              (i386-emit-u32 buf #x600148)
+              ;; Return byte 0 tagged as fixnum in EAX
+              (i386-emit-byte buf #x0F)       ; movzx eax, al
+              (i386-emit-byte buf #xB6)
+              (i386-emit-byte buf #xC0)
+              (i386-emit-byte buf #xD1)       ; shl eax, 1 (tag)
+              (i386-emit-byte buf #xE0)
+              ;; pop edx
+              (i386-emit-byte buf #x5A)
+              ;; mov esi, eax (result in V0)
+              (i386-emit-byte buf #x89)
+              (i386-emit-byte buf #xC6))
+             ((= code #x0334)
+              ;; WBINVD: flush all CPU caches so DMA-visible memory is coherent.
+              ;; Required on real hardware where NIC reads descriptors via DMA.
+              ;; 0F 09 = WBINVD instruction
+              (i386-emit-byte buf #x0F)
+              (i386-emit-byte buf #x09))
              (t
               ;; Unknown trap: NOP (avoid crash via INT with no IDT)
               nil))))
@@ -965,6 +1319,41 @@
            (i386-emit-sar-reg-imm buf +i386-eax+ 1)   ; untag one operand
            (i386-emit-imul-reg-reg buf +i386-eax+ +scratch0+)
            ;; Result is already correctly tagged (a * (b<<1) = (a*b)<<1)
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-mul26lo+)
+         ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
+         ;; Load vb into ECX, va into EAX, untag both, MUL → EDX:EAX
+         ;; AND EAX, 0x3FFFFFF ; SHL EAX, 1 (retag)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (i386-load-vreg buf +scratch0+ vb)            ; ECX = vb
+           (i386-load-vreg buf +i386-eax+ va)            ; EAX = va
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)      ; untag vb
+           (i386-emit-sar-reg-imm buf +i386-eax+ 1)      ; untag va
+           (i386-emit-mul-reg buf +scratch0+)             ; EDX:EAX = EAX * ECX
+           (i386-emit-and-reg-imm buf +i386-eax+ #x3FFFFFF) ; mask to 26 bits
+           (i386-emit-shl-reg-imm buf +i386-eax+ 1)      ; retag
+           (i386-store-vreg buf vd +i386-eax+)))
+
+        ((op= +op-mul26hi+)
+         ;; (mul26hi Vd Va Vb) — bits 26+ of untag(Va)*untag(Vb), tagged
+         ;; Load vb into ECX, va into EAX, untag both, MUL → EDX:EAX
+         ;; SHRD EAX, EDX, 26 — or just: SHR EAX,26 + SHL EDX,6 + OR
+         ;; Use: SHR EAX, 26 ; SHL EDX, 6 ; OR EAX, EDX ; SHL EAX, 1 (retag)
+         (let ((vd (first operands))
+               (va (second operands))
+               (vb (third operands)))
+           (i386-load-vreg buf +scratch0+ vb)            ; ECX = vb
+           (i386-load-vreg buf +i386-eax+ va)            ; EAX = va
+           (i386-emit-sar-reg-imm buf +scratch0+ 1)      ; untag vb
+           (i386-emit-sar-reg-imm buf +i386-eax+ 1)      ; untag va
+           (i386-emit-mul-reg buf +scratch0+)             ; EDX:EAX = EAX * ECX
+           (i386-emit-shr-reg-imm buf +i386-eax+ 26)     ; EAX = low>>26 (top 6 bits)
+           (i386-emit-shl-reg-imm buf +i386-edx+ 6)      ; EDX = hi<<6
+           (i386-emit-or-reg-reg buf +i386-eax+ +i386-edx+) ; merge
+           (i386-emit-shl-reg-imm buf +i386-eax+ 1)      ; retag
            (i386-store-vreg buf vd +i386-eax+)))
 
         ((op= +op-div+)
@@ -1692,12 +2081,8 @@
                 (3 (i386-emit-out-dx-eax buf)))))))
 
         ((op= +op-halt+)
-         ;; Infinite halt loop
-         (let ((halt-label (i386-make-label)))
-           (i386-emit-label buf halt-label)
-           (i386-emit-cli buf)
-           (i386-emit-hlt buf)
-           (i386-emit-jmp-rel32 buf halt-label)))
+         ;; HLT: F4 — single instruction, CPU wakes on next interrupt
+         (i386-emit-hlt buf))
 
         ((op= +op-cli+)
          (i386-emit-cli buf))
@@ -1754,9 +2139,9 @@
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-types (opcode-info-operands info)))
-                     (when (member :off16 op-types)
+                     (when (member :off32 op-types)
                        ;; Find the offset operand value
-                       (let ((off-idx (position :off16 op-types)))
+                       (let ((off-idx (position :off32 op-types)))
                          (when off-idx
                            (let* ((off (nth off-idx operands))
                                   (target-pos (+ new-pos off)))
@@ -1878,13 +2263,13 @@
 
 (defun install-i386-translator ()
   "Install the i386 translator into the *target-i386* descriptor."
-  (setf (target-translate-fn modus64.mvm:*target-i386*)
+  (setf (target-translate-fn modus.mvm:*target-i386*)
         #'translate-mvm-to-i386)
-  (setf (target-emit-prologue modus64.mvm:*target-i386*)
+  (setf (target-emit-prologue modus.mvm:*target-i386*)
         (lambda (target buf) (declare (ignore target)) (i386-emit-prologue buf)))
-  (setf (target-emit-epilogue modus64.mvm:*target-i386*)
+  (setf (target-emit-epilogue modus.mvm:*target-i386*)
         (lambda (target buf) (declare (ignore target)) (i386-emit-epilogue buf)))
-  modus64.mvm:*target-i386*)
+  modus.mvm:*target-i386*)
 
 ;;; ============================================================
 ;;; Debugging Utilities
@@ -1928,8 +2313,8 @@
   (format t "  ~20A ~8A ~A~%" "----" "----" "-----")
   (dotimes (i (length *i386-vreg-map*))
     (let ((phys (aref *i386-vreg-map* i))
-          (name (if (< i (length modus64.mvm::*vreg-names*))
-                    (aref modus64.mvm::*vreg-names* i)
+          (name (if (< i (length modus.mvm::*vreg-names*))
+                    (aref modus.mvm::*vreg-names* i)
                     (format nil "?~D" i))))
       (if phys
           (format t "  ~20A ~8A~%" name (i386-reg-name phys))

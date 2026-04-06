@@ -409,11 +409,8 @@
                     ;; S = (r + k*s) mod L
                     (let ((ks (ed-scalar-mult-mod-l k s)))
                       (let ((sig-s (ed-scalar-add r ks)))
-                        (let ((signature (make-array 64)))
-                          (dotimes (i 32)
-                            (aset signature i (aref r-enc i))
-                            (aset signature (+ i 32) (aref sig-s i)))
-                          signature)))))))))))))
+                        (concat-bytes r-enc 32 sig-s 32)))))))))))))
+
 
 ;; USB keep-alive: poll USB to prevent host NETDEV WATCHDOG timeout
 (defun usb-keepalive ()

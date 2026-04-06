@@ -6,7 +6,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-LOGFILE="/tmp/modus64-rpi-hid.log"
+LOGFILE="/tmp/modus-rpi-hid.log"
 QEMU_PID=""
 
 cleanup() {

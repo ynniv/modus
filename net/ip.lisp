@@ -26,10 +26,16 @@
           (logand (ash v -8) #xFF)))
 
 (defun htonl (v)
-  (logior (ash (logand v #xFF) 24)
-          (logior (ash (logand (ash v -8) #xFF) 16)
-                  (logior (ash (logand (ash v -16) #xFF) 8)
-                          (logand (ash v -24) #xFF)))))
+  (let ((b0 (logand v #xFF)))
+    (let ((b1 (logand (ash v -8) #xFF)))
+      (let ((b2 (logand (ash v -16) #xFF)))
+        (let ((b3 (logand (ash v -24) #xFF)))
+          (let ((hi (ash b0 24)))
+            (let ((mid (ash b1 16)))
+              (let ((lo (ash b2 8)))
+                (let ((hm (logior hi mid)))
+                  (let ((hml (logior hm lo)))
+                    (logior hml b3)))))))))))
 
 (defun buf-write-u16 (buf off val)
   (aset buf off (logand (ash val -8) #xFF))
@@ -46,10 +52,16 @@
           (aref buf (+ off 1))))
 
 (defun buf-read-u32 (buf off)
-  (logior (ash (aref buf off) 24)
-          (logior (ash (aref buf (+ off 1)) 16)
-                  (logior (ash (aref buf (+ off 2)) 8)
-                          (aref buf (+ off 3))))))
+  (let ((b0 (aref buf off)))
+    (let ((b1 (aref buf (+ off 1))))
+      (let ((b2 (aref buf (+ off 2))))
+        (let ((b3 (aref buf (+ off 3))))
+          (let ((hi (ash b0 24)))
+            (let ((mid (ash b1 16)))
+              (let ((lo (ash b2 8)))
+                (let ((hm (logior hi mid)))
+                  (let ((hml (logior hm lo)))
+                    (logior hml b3)))))))))))
 
 (defun buf-copy-mac (buf dest-off src-addr)
   (dotimes (i 6)
@@ -60,10 +72,16 @@
           (mem-ref (+ addr off 1) :u8)))
 
 (defun buf-read-u32-mem (addr off)
-  (logior (ash (mem-ref (+ addr off) :u8) 24)
-          (logior (ash (mem-ref (+ addr off 1) :u8) 16)
-                  (logior (ash (mem-ref (+ addr off 2) :u8) 8)
-                          (mem-ref (+ addr off 3) :u8)))))
+  (let ((b0 (mem-ref (+ addr off) :u8)))
+    (let ((b1 (mem-ref (+ addr (+ off 1)) :u8)))
+      (let ((b2 (mem-ref (+ addr (+ off 2)) :u8)))
+        (let ((b3 (mem-ref (+ addr (+ off 3)) :u8)))
+          (let ((hi (ash b0 24)))
+            (let ((mid (ash b1 16)))
+              (let ((lo (ash b2 8)))
+                (let ((hm (logior hi mid)))
+                  (let ((hml (logior hm lo)))
+                    (logior hml b3)))))))))))
 
 ;; ================================================================
 ;; Ethernet / ARP
@@ -222,11 +240,17 @@
     (setf (mem-ref (+ state #x74) :u16)
           (logior (ash (mem-ref udp-offset :u8) 8)
                   (mem-ref (+ udp-offset 1) :u8)))
-    (setf (mem-ref (+ state #x76) :u32)
-          (logior (ash (mem-ref (+ buf ip-offset 12) :u8) 24)
-                  (logior (ash (mem-ref (+ buf ip-offset 13) :u8) 16)
-                          (logior (ash (mem-ref (+ buf ip-offset 14) :u8) 8)
-                                  (mem-ref (+ buf ip-offset 15) :u8)))))
+    (let ((b0 (mem-ref (+ buf (+ ip-offset 12)) :u8)))
+      (let ((b1 (mem-ref (+ buf (+ ip-offset 13)) :u8)))
+        (let ((b2 (mem-ref (+ buf (+ ip-offset 14)) :u8)))
+          (let ((b3 (mem-ref (+ buf (+ ip-offset 15)) :u8)))
+            (let ((hi (ash b0 24)))
+              (let ((mid (ash b1 16)))
+                (let ((lo (ash b2 8)))
+                  (let ((hm (logior hi mid)))
+                    (let ((hml (logior hm lo)))
+                      (setf (mem-ref (+ state #x76) :u32)
+                            (logior hml b3)))))))))))
     (let ((udp-len (logior (ash (mem-ref (+ udp-offset 4) :u8) 8)
                            (mem-ref (+ udp-offset 5) :u8))))
       (let ((data-len (- udp-len 8)))
@@ -563,10 +587,11 @@
           (tcp-data-off (ash (logand (mem-ref (+ buf 46) :u8) #xF0) -2)))
       (let ((data-len (- ip-total (+ 20 tcp-data-off))))
         (when (> data-len 0)
-          (let ((their-seq (buf-read-u32-mem buf 38)))
-            (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
-            (tcp-ack-conn cb))
-          (let ((buf-len (mem-ref (+ ssh #x6D4) :u32))
+          ;; Copy data BEFORE sending ACK — the ACK triggers DWC2 MMIO which
+          ;; can cause QEMU to complete a pending bulk IN transfer on another
+          ;; channel, overwriting the receive buffer while we're still reading it.
+          (let ((their-seq (buf-read-u32-mem buf 38))
+                (buf-len (mem-ref (+ ssh #x6D4) :u32))
                 (data-start (+ (+ (+ buf 14) 20) tcp-data-off)))
             (let ((i 0))
               (loop
@@ -574,7 +599,9 @@
                 (setf (mem-ref (+ (+ (+ ssh #x6D8) buf-len) i) :u8)
                       (mem-ref (+ data-start i) :u8))
                 (setq i (+ i 1))))
-            (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))))))))
+            (setf (mem-ref (+ ssh #x6D4) :u32) (+ buf-len data-len))
+            (setf (mem-ref (+ cb #x014) :u32) (+ their-seq data-len))
+            (tcp-ack-conn cb)))))))
 
 (defun net-wait-ack (conn)
   (let ((cb (conn-base conn))
@@ -696,8 +723,10 @@
                         (let ((proto (mem-ref (+ buf 23) :u8)))
                           (if (eq proto 1)
                               (icmp-handle buf 14)
-                              (when (eq proto 6)
-                                (net-handle-tcp buf pkt-len))))))
+                              (if (eq proto 17)
+                                  (udp-handle buf 14)
+                                  (when (eq proto 6)
+                                    (net-handle-tcp buf pkt-len)))))))
                   ())))))))
 
 ;; ================================================================
@@ -886,6 +915,149 @@
   (ping 167772674))
 
 ;; ================================================================
+;; IP fragment reassembly
+;; ================================================================
+;;
+;; State at e1000-state-base + 0xA00 (28 bytes):
+;;   +0x00: active (u32) — 1 if reassembly in progress
+;;   +0x04: ident (u32) — IP identification field
+;;   +0x08: src-ip (u32)
+;;   +0x0C: proto (u32) — IP protocol number
+;;   +0x10: have-first (u32) — 1 if first fragment (offset=0) received
+;;   +0x14: expected-total (u32) — total payload len (set when last frag arrives)
+;;   +0x18: received-bytes (u32) — total data bytes received so far
+;;
+;; Reassembled packet at e1000-state-base + 0xA20:
+;;   First 34 bytes: ethernet + IP header (copied from first fragment)
+;;   Byte 34+: reassembled IP payload (up to 8KB)
+;;
+;; Supports out-of-order reassembly: fragments can arrive in any order.
+;; Complete when have-first=1 AND expected-total>0 AND received>=expected.
+
+(defun ip-frag-base () (+ (e1000-state-base) #xA00))
+(defun ip-frag-pkt () (+ (e1000-state-base) #xA20))
+
+;; Save first fragment (offset=0, MF=1): copy headers + data, record metadata
+(defun ip-frag-start (buf)
+  (let ((b buf))
+    (let ((fb (ip-frag-base)))
+      (let ((ident (buf-read-u16-mem b 18)))
+        (let ((proto (mem-ref (+ b 23) :u8)))
+          (let ((src-ip (buf-read-u32-mem b 26)))
+            (setf (mem-ref fb :u32) 1)
+            (setf (mem-ref (+ fb 4) :u32) ident)
+            (setf (mem-ref (+ fb 8) :u32) src-ip)
+            (setf (mem-ref (+ fb #xC) :u32) proto)
+            (setf (mem-ref (+ fb #x10) :u32) 0)
+            (setf (mem-ref (+ fb #x14) :u32) 0)
+            (setf (mem-ref (+ fb #x18) :u32) 0)))))))
+
+;; Copy headers from first fragment (offset=0) into reassembly buffer
+(defun ip-frag-save-headers (buf)
+  (let ((b buf))
+    (let ((fp (ip-frag-pkt)))
+      (let ((fb (ip-frag-base)))
+        (setf (mem-ref (+ fb #x10) :u32) 1)
+        (dotimes (i 34)
+          (setf (mem-ref (+ fp i) :u8) (mem-ref (+ b i) :u8)))))))
+
+;; Copy fragment data into reassembly buffer at correct offset
+(defun ip-frag-copy-data (buf frag-off data-len)
+  (let ((b buf))
+    (let ((off frag-off))
+      (let ((dlen data-len))
+        (let ((fp (ip-frag-pkt)))
+          (let ((buf-off (* off 8)))
+            (dotimes (i dlen)
+              (setf (mem-ref (+ fp (+ 34 (+ buf-off i))) :u8)
+                    (mem-ref (+ b (+ 34 i)) :u8)))))))))
+
+;; Process one fragment: copy data, update state, check completion
+(defun ip-frag-handle (buf)
+  (let ((b buf))
+    (let ((fb (ip-frag-base)))
+      (let ((frag-word (buf-read-u16-mem b 20)))
+        (let ((frag-off (logand frag-word #x1FFF)))
+          (let ((mf (logand frag-word #x2000)))
+            (let ((ip-total (buf-read-u16-mem b 16)))
+              (let ((data-len (- ip-total 20)))
+                (ip-frag-copy-data b frag-off data-len)
+                (ip-frag-handle2 b fb frag-off mf data-len)))))))))
+
+(defun ip-frag-handle2 (buf fb frag-off mf data-len)
+  (let ((b buf))
+    (let ((f fb))
+      ;; First fragment? Save headers
+      (when (zerop frag-off)
+        (ip-frag-save-headers b))
+      ;; Last fragment? Record expected total
+      (when (zerop mf)
+        (setf (mem-ref (+ f #x14) :u32) (+ (* frag-off 8) data-len)))
+      ;; Track received bytes
+      (setf (mem-ref (+ f #x18) :u32)
+            (+ (mem-ref (+ f #x18) :u32) data-len))
+      ;; Check completion
+      (ip-frag-check-complete f))))
+
+;; Returns total payload length if reassembly complete, 0 otherwise
+(defun ip-frag-check-complete (fb)
+  (let ((f fb))
+    (let ((have-first (mem-ref (+ f #x10) :u32)))
+      (let ((expected (mem-ref (+ f #x14) :u32)))
+        (let ((received (mem-ref (+ f #x18) :u32)))
+          (if (zerop have-first) 0
+              (if (zerop expected) 0
+                  (if (>= received expected)
+                      (progn (setf (mem-ref f :u32) 0) expected)
+                      0))))))))
+
+;; (old ip-frag-save-first and ip-frag-continue removed — replaced by
+;;  ip-frag-start, ip-frag-handle, ip-frag-handle2, ip-frag-check-complete)
+
+;; Dispatch a reassembled packet from the fragment buffer
+(defun ip-frag-dispatch (total-len)
+  (let ((fp (ip-frag-pkt)))
+    (let ((proto (mem-ref (+ fp 23) :u8)))
+      ;; Update IP total length in the reassembled header
+      (let ((new-total (+ 20 total-len)))
+        (setf (mem-ref (+ fp 16) :u8) (logand (ash new-total -8) #xFF))
+        (setf (mem-ref (+ fp 17) :u8) (logand new-total #xFF)))
+      ;; Clear fragment flags in reassembled header
+      (setf (mem-ref (+ fp 20) :u8) 0)
+      (setf (mem-ref (+ fp 21) :u8) 0)
+      (if (eq proto 1)
+          (progn (icmp-handle fp 14) 0)
+          (if (eq proto 17)
+              (progn (udp-handle fp 14) 0)
+              total-len)))))
+
+;; Check fragment flags and handle. Returns:
+;;   0 if fragment queued (more expected) or dropped
+;;   positive value if reassembly complete (dispatched)
+;;   -1 if not fragmented (caller should process normally)
+(defun ip-check-frag (buf)
+  (let ((b buf))
+    (let ((frag-word (buf-read-u16-mem b 20)))
+      ;; Check if fragmented: MF set or offset > 0
+      (if (zerop (logand frag-word #x3FFF))
+          -1  ; not fragmented
+          (ip-check-frag2 b)))))
+
+(defun ip-check-frag2 (buf)
+  (let ((b buf))
+    (let ((fb (ip-frag-base)))
+      (let ((ident (buf-read-u16-mem b 18)))
+        ;; New session or matching session?
+        (when (not (eq (mem-ref fb :u32) 1))
+          (ip-frag-start b))
+        (when (not (eq (mem-ref (+ fb 4) :u32) ident))
+          ;; Different ident — restart with new packet
+          (ip-frag-start b))
+        (let ((total (ip-frag-handle b)))
+          (if (zerop total) 0
+              (ip-frag-dispatch total)))))))
+
+;; ================================================================
 ;; Net receive (single dispatch)
 ;; ================================================================
 
@@ -914,13 +1086,19 @@
                             (arp-reply buf))))
                       0)
                     (if (zerop et-lo)
-                        (let ((ip-proto (mem-ref (+ buf 23) :u8))
-                              (ip-total (buf-read-u16-mem buf 16)))
-                          (if (eq ip-proto 1)
-                              (progn (icmp-handle buf 14) 0)
-                              (if (eq ip-proto 17)
-                                  (progn (udp-handle buf 14) 0)
-                                  (- ip-total 20))))
+                        ;; IPv4: check for fragments first
+                        (let ((frag-result (ip-check-frag buf)))
+                          (if (not (eq frag-result -1))
+                              ;; Fragmented — queued, dropped, or dispatched
+                              (if (> frag-result 0) frag-result 0)
+                              ;; Not fragmented — normal dispatch
+                              (let ((ip-proto (mem-ref (+ buf 23) :u8))
+                                    (ip-total (buf-read-u16-mem buf 16)))
+                                (if (eq ip-proto 1)
+                                    (progn (icmp-handle buf 14) 0)
+                                    (if (eq ip-proto 17)
+                                        (progn (udp-handle buf 14) 0)
+                                        (- ip-total 20))))))
                         0))
                 0))))))
 
@@ -1014,10 +1192,7 @@
   (let ((state (e1000-state-base))
         (data-addr (mem-ref (+ (e1000-state-base) #x7C) :u32))
         (data-len (mem-ref (+ (e1000-state-base) #x80) :u32)))
-    (let ((yiaddr (logior (ash (mem-ref (+ data-addr 16) :u8) 24)
-                          (logior (ash (mem-ref (+ data-addr 17) :u8) 16)
-                                  (logior (ash (mem-ref (+ data-addr 18) :u8) 8)
-                                          (mem-ref (+ data-addr 19) :u8))))))
+    (let ((yiaddr (buf-read-u32-mem data-addr 16)))
       (setf (mem-ref (+ state #x68) :u32) yiaddr)
       (let ((opt-offset 240) (done 0))
         (dotimes (iter 50)
@@ -1031,28 +1206,16 @@
                         (let ((opt-len (mem-ref (+ data-addr opt-offset 1) :u8)))
                           (when (eq opt-type 1)
                             (setf (mem-ref (+ state #x5C) :u32)
-                                  (logior (ash (mem-ref (+ data-addr opt-offset 2) :u8) 24)
-                                          (logior (ash (mem-ref (+ data-addr opt-offset 3) :u8) 16)
-                                                  (logior (ash (mem-ref (+ data-addr opt-offset 4) :u8) 8)
-                                                          (mem-ref (+ data-addr opt-offset 5) :u8))))))
+                                  (buf-read-u32-mem data-addr (+ opt-offset 2))))
                           (when (eq opt-type 3)
                             (setf (mem-ref (+ state #x1C) :u32)
-                                  (logior (ash (mem-ref (+ data-addr opt-offset 2) :u8) 24)
-                                          (logior (ash (mem-ref (+ data-addr opt-offset 3) :u8) 16)
-                                                  (logior (ash (mem-ref (+ data-addr opt-offset 4) :u8) 8)
-                                                          (mem-ref (+ data-addr opt-offset 5) :u8))))))
+                                  (buf-read-u32-mem data-addr (+ opt-offset 2))))
                           (when (eq opt-type 6)
                             (setf (mem-ref (+ state #x58) :u32)
-                                  (logior (ash (mem-ref (+ data-addr opt-offset 2) :u8) 24)
-                                          (logior (ash (mem-ref (+ data-addr opt-offset 3) :u8) 16)
-                                                  (logior (ash (mem-ref (+ data-addr opt-offset 4) :u8) 8)
-                                                          (mem-ref (+ data-addr opt-offset 5) :u8))))))
+                                  (buf-read-u32-mem data-addr (+ opt-offset 2))))
                           (when (eq opt-type 54)
                             (setf (mem-ref (+ state #x6C) :u32)
-                                  (logior (ash (mem-ref (+ data-addr opt-offset 2) :u8) 24)
-                                          (logior (ash (mem-ref (+ data-addr opt-offset 3) :u8) 16)
-                                                  (logior (ash (mem-ref (+ data-addr opt-offset 4) :u8) 8)
-                                                          (mem-ref (+ data-addr opt-offset 5) :u8))))))
+                                  (buf-read-u32-mem data-addr (+ opt-offset 2))))
                           (setq opt-offset (+ opt-offset 2 opt-len))))))))))
       yiaddr)))
 
@@ -1222,10 +1385,7 @@
                                    (mem-ref (+ data-addr pos 1) :u8))))
                 (setq pos (+ pos 10))
                 (if (eq rtype 1)
-                    (logior (ash (mem-ref (+ data-addr pos) :u8) 24)
-                            (logior (ash (mem-ref (+ data-addr pos 1) :u8) 16)
-                                    (logior (ash (mem-ref (+ data-addr pos 2) :u8) 8)
-                                            (mem-ref (+ data-addr pos 3) :u8))))
+                    (buf-read-u32-mem data-addr pos)
                     0))))))))
 
 (defun dns-resolve (name-array name-len)

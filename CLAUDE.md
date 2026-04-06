@@ -5,11 +5,15 @@ Modus is a self-hosting bare-metal Lisp operating system. It compiles Lisp to na
 ## Directory Structure
 
 ```
-cross/          SBCL-hosted cross-compiler and x64 assembler
-  cross-compile.lisp   Phase 0 cross-compiler (1845L)
-  build.lisp           Runtime + self-hosting kernel builder (~16500L)
-  x64-asm.lisp         x86-64 assembler (484L)
-  packages.lisp        Package definitions
+cross/          Vestigial cross-compiler (see cross/README.md)
+  packages.lisp        Package definitions (used by MVM)
+  x64-asm.lisp         x86-64 assembler (used by MVM)
+  cross-compile.lisp   Original Phase 0 cross-compiler (historical)
+  build.lisp           Original kernel builder (historical)
+
+lib/            Shared utilities
+  load-mvm.lisp        MVM system loading boilerplate
+  hash.lisp            Dual-FNV-1a symbol hashing
 
 boot/           Architecture boot sequences
   boot-aarch64.lisp    AArch64 QEMU virt boot
@@ -21,6 +25,7 @@ boot/           Architecture boot sequences
   boot-i386.lisp       i386 boot
   boot-68k.lisp        Motorola 68k boot
   boot-arm32.lisp      ARM32 boot
+  boot-uefi-x64.lisp   UEFI x86-64 boot (PE32+ EFI application)
 
 mvm/            MVM compiler, translators, and build scripts
   mvm.lisp             ISA definition (~50 opcodes)
@@ -48,14 +53,15 @@ net/            Networking, crypto, USB, actor system
   ip.lisp              ARP/IP/TCP/UDP/DHCP/DNS
   crypto.lisp          SHA-256/512, ChaCha20, Poly1305, X25519, Ed25519
   crypto-32.lisp       32-bit safe field/poly multiply (pair arithmetic)
-  crypto-i386.lisp     i386 SHA-256/512, ChaCha20 (w32 pair arithmetic)
+  crypto-w32.lisp      32-bit SHA-256/512, ChaCha20 (w32 pair arithmetic)
   ssh.lisp             SSH-2 server (key exchange, auth, channels)
   ne2000.lisp          NE2000 ISA NIC driver (i386)
   http.lisp            HTTP/1.0 server
   http-client.lisp     HTTP client (URL parsing, GET, fetch)
   aarch64-overrides.lisp   Line editor, buffer reader, SSH I/O overrides
-  i386-overrides.lisp      i386 30-bit fixnum safety overrides (crypto, SSH)
+  32bit-overrides.lisp     30-bit fixnum safety overrides (crypto, SSH)
   arch-i386.lisp           i386 NE2000 adapter, NIC state, allocation
+  uefi-console.lisp        GOP framebuffer + PS/2 keyboard for UEFI x64
   uart-bootloader.lisp     UART bootloader for rapid kernel redeploy
   bcm2835-periph.lisp      BCM2835 GPIO, SPI, I2C, PWM
 
@@ -64,6 +70,7 @@ scripts/        Deployment and boot scripts
   build-pizero2w.sh    Build kernel + SD card image
   fuse-pizero2w.sh     Program USB boot OTP fuse on Pi Zero 2 W
   make-sdcard-bootloader.sh  Create SD card with UART bootloader
+  make-uefi-usb.sh     Create bootable USB image for UEFI hardware
   run-rpi-periph.sh    Launch RPi peripheral test in QEMU
 
 runtime/        Runtime type system
@@ -90,7 +97,7 @@ sbcl --script mvm/build-aarch64-repl.lisp
 QEMU launch (actors example):
 ```bash
 qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-  -kernel /tmp/modus64-aarch64-actors.bin -nographic -semihosting \
+  -kernel /tmp/modus-aarch64-actors.bin -nographic -semihosting \
   -device 'e1000,netdev=net0,romfile=,rombar=0' \
   -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
 ```
@@ -111,16 +118,33 @@ sbcl --script mvm/build-i386-ssh.lisp     # SSH (NE2000 ISA NIC)
 
 QEMU launch (REPL):
 ```bash
-qemu-system-i386 -kernel /tmp/modus64-i386.bin -m 256 \
+qemu-system-i386 -kernel /tmp/modus-i386.bin -m 256 \
   -display none -serial stdio -no-reboot
 ```
 
 QEMU launch (SSH):
 ```bash
 qemu-system-i386 -m 256 -nographic -no-reboot \
-  -kernel /tmp/modus64-i386-ssh.bin \
+  -kernel /tmp/modus-i386-ssh.bin \
   -device ne2k_isa,netdev=net0,iobase=0x300,irq=9 \
   -netdev 'user,id=net0,hostfwd=tcp::2222-:22'
+```
+
+### UEFI x86-64 (OVMF, for real hardware)
+```bash
+sbcl --script mvm/build-uefi-repl.lisp   # REPL (serial + framebuffer + PS/2 keyboard)
+```
+
+QEMU launch (requires OVMF + mtools):
+```bash
+./scripts/run-uefi-repl.sh               # interactive (serial)
+./scripts/run-uefi-repl.sh "(+ 1 2)"     # eval expression
+```
+
+Bootable USB for real hardware (ThinkPad T420 etc.):
+```bash
+./scripts/make-uefi-usb.sh               # create /tmp/modus-usb.img
+sudo dd if=/tmp/modus-usb.img of=/dev/sdX bs=1M status=progress  # write to USB
 ```
 
 ### Pi Zero 2 W (real hardware, DWC2 USB gadget, CDC-ECM)
@@ -154,22 +178,87 @@ Key subtags: string=#x10, symbol=#x50, closure=#x52, array=#x32, hash-table=#x41
 ### Array Access
 Raw address from object pointer: `(ash (logand obj (- 0 4)) 1)` — strips tag bits, doubles to byte address. Data starts at +8 (past header).
 
+## x86-64 Memory Layout
+
+The kernel image loads at 0x100000 (1MB). Memory regions must not overlap:
+- **0x100000**: Kernel image (native code + bytecode + fn table + metadata)
+- **0x500000**: Metadata (64 bytes, at image offset 0x400000)
+- **0x504000**: Page tables (16KB, identity map for 1GB)
+- **0x600000**: Global variable store (alist head pointer, 8 bytes)
+- **0x800000**: Stack top (grows downward)
+- **0x10000000**: Heap start (R12 alloc pointer)
+- **0x1E000000**: Heap limit (R14)
+
+The image (especially fixpoint-ssh with networking) can grow past 0x400000. The fn table
+at the end of the image must not overlap the globals or stack. Build scripts assert this.
+
 ## MVM Compiler Limitations
 
 These are known compiler bugs/limitations — work around them, don't try to fix:
 
 1. **3-arg `+` is broken**: Always use nested 2-arg `+`: `(+ a (+ b c))` not `(+ a b c)`
-2. **set-car/set-cdr with function call args clobber registers**: Pre-compute to a let binding:
+2. **Function arguments are clobbered by ANY function call**: Args live in registers (RSI, RDI, R8, R9) and are never spilled to the stack frame. After calling any function, all arg values are garbage. Always `let`-bind args at function entry if they're used after a call:
    ```lisp
-   ;; BAD: (set-car cell (some-fn x))
-   ;; GOOD:
-   (let ((val (some-fn x)))
-     (set-car cell val))
+   ;; BAD: args ssh, payload are in registers, clobbered after first call
+   (defun handle (ssh payload)
+     (some-fn payload)      ; payload works here
+     (other-fn ssh))        ; ssh is GARBAGE — clobbered by some-fn
+
+   ;; GOOD: let-bind args to frame slots immediately
+   (defun handle (ssh payload)
+     (let ((s ssh))
+       (let ((p payload))
+         (some-fn p)         ; p is in frame slot, survives calls
+         (other-fn s))))     ; s is in frame slot, survives calls
    ```
+   This also applies to `set-car`/`set-cdr` with function call args — pre-compute to a let binding.
 3. **Last-defun-wins**: All calls resolve to the LAST defun of a given name. You cannot alias a function before overriding it. Use different names.
 4. **18+ nested lets**: May miscompile. Split into helper functions.
-5. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
-6. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
+5. **~~25+ sequential forms — DEBUNKED**: Tested up to 1000 sequential forms on x64, i386, and AArch64 — all pass. Functions previously split for this reason were likely hitting the nested-let or nested-logior bugs instead. Sequential form count is not a compiler limitation.
+6. **YIELD opcode**: Emitted at end of every `loop` iteration. On AArch64 bare metal, must be SEV+WFE (not just WFE which would stall on Cortex-A53).
+7. **cons cells in actor context**: May get corrupted across yield/context-switch boundaries. Inline data construction instead of relying on cons returns when the result crosses scheduling points.
+8. **Nested logior/logand/ash clobber**: 3+ levels of nesting like `(logior b0 (logior (ash b1 8) (logior (ash b2 16) (ash b3 24))))` silently produces wrong values. Break into flat `let` bindings:
+   ```lisp
+   ;; BAD: nested logior with ash
+   (logior b0 (logior (ash b1 8) (logior (ash b2 16) (ash b3 24))))
+   ;; GOOD: flat let bindings
+   (let ((a (ash b3 24))) (let ((b (ash b2 16))) (let ((c (logior a b)))
+     (let ((d (ash b1 8))) (let ((e (logior c d))) (logior e b0))))))
+   ```
+
+## Fixpoint Build (`mvm/build-fixpoint.lisp`)
+
+The fixpoint build combines source from multiple architectures into a single multi-arch binary.
+It uses an `*override-fns*` dispatch system to select 32-bit vs 64-bit function variants at runtime.
+
+### `*override-fns*` dispatch pitfall
+
+Functions listed in `*override-fns*` get their `defun` names renamed: `c64-*` in text-64 source,
+`c32-*` in text-32 source. A dispatch wrapper checks `(mem-ref #x48006D :u8)` at runtime.
+
+**Critical**: Within text-64, multiple `arch-*.lisp` files define the same function with different
+addresses (e.g., `edit-line-len` in `arch-i386.lisp`, `arch-x86.lisp`, `arch-aarch64.lisp`).
+Since `arch-aarch64.lisp` loads LAST, `c64-edit-line-len` uses AArch64's address (`#x41112800`).
+On x64, this address is past the 1GB identity map → page fault → silent hang.
+
+**Rule**: Any function in `*override-fns*` that uses architecture-specific base addresses
+MUST be overridden in `*fixpoint-extra-source*` with a dynamic version using `(ssh-ipc-base)`.
+Functions already correctly overridden: `write-byte`, `edit-line-len`, `edit-set-line-len`,
+`edit-cursor-pos`, `edit-set-cursor-pos`. Check before adding new address-dependent functions
+to `*override-fns*`.
+
+### Fixpoint SSH test
+
+```bash
+# Build Gen0
+sbcl --script mvm/build-fixpoint.lisp
+
+# Run x64→x64 SSH chain
+./scripts/run-fixpoint-ssh.sh x64 x64
+
+# Test
+echo '(+ 1 2)' | ssh -p 2223 test@localhost   # → = 3
+```
 
 ## Actor System
 
@@ -221,3 +310,23 @@ ssh -o StrictHostKeyChecking=no -o ConnectTimeout=30 test@10.0.0.2
 ```
 
 SSH credentials: username `test`, any password accepted (no real auth).
+
+## Development Hosts
+
+### modulator (Pi Zero 2 W — USB gadget for T420)
+Connected to the T420 via USB, presenting as composite device: HID keyboard + mass storage + CDC ACM serial.
+
+- **SSH**: `ssh modus@modulator`
+- **Type at T420 console**: `ssh modus@modulator 'echo "(expr)" | sudo python3 ~/type.py'`
+- **Force reboot T420**: `ssh modus@modulator 'sudo python3 ~/force-reboot.py'` (Ctrl+Alt+Delete — only works if BIOS/OS handles it)
+- **Deploy image**: `scp /tmp/modus-i386-diag-ssh.img modus@modulator:/home/modus/modus.img` (T420 boots from this via mass storage gadget)
+- **Gadget setup**: `~/setup-gadget.sh` (creates `/dev/hidg0` + mass storage backed by `~/modus.img`)
+- **Boot helper**: `~/boot-helper.py` (sends ESC periodically to help T420 boot menu)
+- **Note**: `(reboot)` from the Modus REPL may fail — if so, retry or physically power-cycle the T420
+
+### modus-pi (Raspberry Pi — webcam + monitoring)
+Has a USB webcam pointed at the T420 screen for remote VGA capture.
+
+- **SSH**: `ssh modus@modus-pi`
+- **Capture T420 screen**: `rpi-webcam.sh` (runs on this host, SSHes to modus-pi, captures frame, SCPs back `image.jpg`)
+- **View screenshot**: Read `image.jpg` in working directory after capture

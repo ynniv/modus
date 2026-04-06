@@ -2,7 +2,7 @@
 
 ## Overview
 
-Modus64 runs bare-metal on the Pi Zero 2 W (BCM2710A1, Cortex-A53). The system boots from SD card into a UART bootloader that accepts kernel uploads over serial, eliminating SD card swapping during development. A built-in SSH server over USB CDC-ECM Ethernet provides remote Lisp evaluation.
+Modus runs bare-metal on the Pi Zero 2 W (BCM2710A1, Cortex-A53). The system boots from SD card into a UART bootloader that accepts kernel uploads over serial, eliminating SD card swapping during development. A built-in SSH server over USB CDC-ECM Ethernet provides remote Lisp evaluation.
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -60,7 +60,7 @@ sudo ip addr add 10.0.0.1/24 dev "$IFACE"
 sudo ip link set "$IFACE" up
 ssh test@10.0.0.2
 
-modus64> (+ 1 2)
+modus> (+ 1 2)
 = 3
 ```
 

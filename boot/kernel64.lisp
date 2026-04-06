@@ -7,7 +7,7 @@
 ;;;; 3. Sets up runtime registers (NIL, alloc, etc.)
 ;;;; 4. Jumps to the Lisp runtime
 
-(in-package :modus64.cross)
+(in-package :modus.cross)
 
 ;;; ============================================================
 ;;; Serial Port Constants (COM1 at 0x3F8)
@@ -195,7 +195,7 @@
     (emit-serial-init buf)
 
     ;; Print boot message
-    (emit-serial-print-string buf "Modus64: 64-bit mode active!")
+    (emit-serial-print-string buf "Modus: 64-bit mode active!")
     (emit64-mov-al-imm8 buf 13)  ; CR
     (emit-serial-putchar buf)
     (emit64-mov-al-imm8 buf 10)  ; LF
@@ -319,6 +319,6 @@
 
 (defun test-build-image ()
   "Test building a complete kernel image"
-  (build-kernel-image "/tmp/modus64-test.img"
+  (build-kernel-image "/tmp/modus-test.img"
                       :lisp-forms '((defun hello ()
                                      (+ 1 2 3)))))

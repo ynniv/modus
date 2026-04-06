@@ -1,4 +1,4 @@
-;;;; cross.lisp - Universal Cross-Compilation for Modus64
+;;;; cross.lisp - Universal Cross-Compilation for Modus
 ;;;;
 ;;;; The endgame: a running Modus instance on any architecture can
 ;;;; build kernel images for any other architecture.
@@ -11,7 +11,7 @@
 ;;;;   5. Emit bootable kernel image with target's boot code
 ;;;;   6. Embed same source text in new image (for self-replication)
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;;; ============================================================
 ;;; Compilation Module
@@ -60,12 +60,14 @@
    Delegates to the MVM compiler (compiler.lisp) for the actual
    compilation, then converts the result to an mvm-module for
    the image building pipeline."
-  ;; Read source forms
-  (let* ((forms (read-all-forms source-text))
+  ;; Read source forms with line numbers
+  (let* ((forms-and-lines (read-all-forms-with-locations source-text))
+         (forms (car forms-and-lines))
+         (source-lines (cdr forms-and-lines))
          ;; Compile all forms through the MVM compiler
          ;; mvm-compile-all is defined in compiler.lisp and returns
          ;; a compiled-module struct
-         (compiled-mod (mvm-compile-all forms))
+         (compiled-mod (mvm-compile-all forms :source-lines source-lines))
          ;; Convert to mvm-module for the image pipeline
          (module (compiled-module-to-mvm-module compiled-mod source-text)))
     (setf (mvm-module-name module) name)
@@ -84,24 +86,26 @@
            ;; Build function table in the format each translator expects
            (fn-table (build-translator-fn-table fn-list target)))
       ;; Call the bulk translator — returns (values buf fn-map)
-      ;; fn-map maps function-name → label with actual native positions
+      ;; fn-map maps function-name → label (x86-64/i386/arm32)
+      ;; or bytecode-offset → native-byte-offset (aarch64/riscv/ppc/68k)
       (multiple-value-bind (buf fn-map)
           (funcall translator bytecode fn-table)
         (let ((native-bytes (extract-native-bytes buf target)))
-          ;; Use actual label positions from fn-map when available (x86-64, i386)
-          ;; Fall back to proportional mapping for other architectures
           (if (and fn-map (hash-table-p fn-map))
-              ;; Accurate: look up each function's native position from fn-map
-              ;; fn-map values may be modus64.asm:label structs (x86-64)
-              ;; or raw integer positions (i386, resolved by translator)
+              ;; Accurate mapping from translator
               (dolist (fn-info fn-list)
                 (let* ((name (string (mvm-function-info-name fn-info)))
-                       (entry (gethash name fn-map)))
+                       ;; Try name-keyed lookup first (x86-64/i386/arm32)
+                       (entry (gethash name fn-map))
+                       ;; Fall back to bytecode-offset-keyed (aarch64 etc)
+                       (bc-entry (unless entry
+                                   (gethash (mvm-function-info-bytecode-offset fn-info)
+                                            fn-map))))
                   (let ((pos (cond
-                               ((null entry) nil)
                                ((integerp entry) entry)
-                               ((typep entry 'modus64.asm::label)
-                                (modus64.asm:label-position entry))
+                               ((and entry (typep entry 'modus.asm::label))
+                                (modus.asm:label-position entry))
+                               ((integerp bc-entry) bc-entry)
                                (t nil))))
                     (if pos
                         (setf (mvm-function-info-native-offset fn-info) pos)
@@ -113,7 +117,7 @@
                                              total-native) total-bc)))))
                   ;; Native length: distance to next function or end of code
                   (setf (mvm-function-info-native-length fn-info) 0)))
-              ;; Proportional mapping (other architectures)
+              ;; Proportional mapping (fallback for architectures without fn-map)
               (let ((total-bc (max 1 (length bytecode)))
                     (total-native (length native-bytes)))
                 (dolist (fn-info fn-list)
@@ -130,7 +134,7 @@
    x86-64 and i386 want a list of (name offset length).
    Others want a hash-table of index → bytecode-offset."
   (let ((name (target-name target)))
-    (if (member name '(:x86-64 :i386))
+    (if (member name '(:x86-64 :i386 :arm32 :armv7 :armv7-rpi))
         ;; List of (name offset length)
         (mapcar (lambda (fi)
                   (list (string (mvm-function-info-name fi))
@@ -163,13 +167,13 @@
               (rv-buffer-to-bytes buf))
              (:aarch64  (a64-buffer-to-bytes buf))
              ((:ppc64 :ppc32) (ppc-buffer-to-bytes buf))
-             (:i386     (modus64.mvm.i386:i386-buffer-to-bytes buf))
+             (:i386     (modus.mvm.i386:i386-buffer-to-bytes buf))
              (:68k      (m68k-buffer-to-bytes buf))
-             ((:arm32 :armv7) (arm32-buffer-to-bytes buf))
+             ((:arm32 :armv7 :armv7-rpi) (arm32-buffer-to-bytes buf))
              (:x86-64
-              ;; x64 translator uses code-buffer from modus64.asm
-              (let* ((raw (modus64.asm:code-buffer-bytes buf))
-                     (len (modus64.asm:code-buffer-position buf))
+              ;; x64 translator uses code-buffer from modus.asm
+              (let* ((raw (modus.asm:code-buffer-bytes buf))
+                     (len (modus.asm:code-buffer-position buf))
                      (result (make-array len)))
                 (dotimes (i len result)
                   (setf (aref result i) (aref raw i))))))
@@ -190,6 +194,9 @@
              (mvm-emit-u32 buf (ash constant 1))))
         (string
          ;; String object: [header:word | chars...]
+         ;; NOTE: constant pool strings are NOT fully functional.
+         ;; LI-CONST loads a table index, not an object address.
+         ;; Use write-string-codes with cons lists instead.
          (let ((header (logior #x10 (ash (length constant) 16))))
            (if (= word-size 8)
                (mvm-emit-u64 buf header)
@@ -421,6 +428,7 @@
         (setf (kernel-image-boot-code image)
               (mvm-buffer-used-bytes boot-buf))))
     ;; Find kernel-main entry point (native offset within code buffer)
+    ;; Use LAST match — "last-defun-wins" means the last kernel-main is the real one.
     (dolist (fn-info (mvm-module-function-table module))
       (when (string-equal (string (mvm-function-info-name fn-info)) "KERNEL-MAIN")
         (setf (kernel-image-entry-point image)
@@ -438,13 +446,40 @@
       ;; After the JMP, native code starts, so rel32 = kernel-main native offset.
       (let ((entry-native-offset (kernel-image-entry-point image))
             (jmp-size 0))
-        (when (and entry-native-offset
-                   boot-descriptor
-                   (member (getf boot-descriptor :arch) '(:x86-64 :i386)))
-          ;; x86/x86-64 JMP rel32 (5 bytes)
-          (mvm-emit-byte final-buf #xE9)
-          (mvm-emit-u32 final-buf (logand #xFFFFFFFF entry-native-offset))
-          (setq jmp-size 5))
+        (when (and entry-native-offset boot-descriptor)
+          (let ((arch (getf boot-descriptor :arch)))
+            (cond
+              ((member arch '(:x86-64 :i386))
+               ;; x86/x86-64 JMP rel32 (5 bytes)
+               (mvm-emit-byte final-buf #xE9)
+               (mvm-emit-u32 final-buf (logand #xFFFFFFFF entry-native-offset))
+               (setq jmp-size 5))
+              ((member arch '(:arm32 :armv7 :armv7-rpi))
+               ;; ARM32 B (unconditional branch, 4 bytes)
+               ;; offset in instruction words: (entry_native_offset - 4) / 4
+               ;; -4 because ARM reads PC as current+8, and native code starts
+               ;; 4 bytes after this instruction (1 instruction unit)
+               (let* ((byte-offset entry-native-offset)  ; bytes from native code start
+                      (arm-offset (ash (- byte-offset 4) -2))  ; instruction units, adjusted for PC+8
+                      (insn (logior #xEA000000 (logand arm-offset #xFFFFFF))))
+                 (mvm-emit-byte final-buf (logand insn #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                 (setq jmp-size 4)))
+              ((member arch '(:aarch64 :rpi))
+               ;; AArch64 B (unconditional branch, 4 bytes)
+               ;; B target = PC + imm26*4 (PC = this instruction).
+               ;; Native code starts 4 bytes after this B instruction,
+               ;; so imm26 = (byte-offset + 4) / 4 to skip past the B itself.
+               (let* ((byte-offset entry-native-offset)
+                      (a64-offset (ash (+ byte-offset 4) -2))  ; +4 for B instruction size
+                      (insn (logior #x14000000 (logand a64-offset #x3FFFFFF))))
+                 (mvm-emit-byte final-buf (logand insn #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -8) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -16) #xFF))
+                 (mvm-emit-byte final-buf (logand (ash insn -24) #xFF))
+                 (setq jmp-size 4))))))
         ;; Native code
         (let ((code-offset (mvm-buffer-position final-buf)))
           (loop for b across native-code
@@ -474,19 +509,26 @@
             (mvm-emit-u32 final-buf (- (mvm-buffer-position final-buf)
                                         (length source-blob) 4))))
       (let ((raw-bytes (mvm-buffer-used-bytes final-buf)))
-        ;; Wrap in ELF if target requires it (for QEMU -kernel loading)
+        ;; UEFI: patch stub with kernel data offset/size, then wrap in PE32+
+        (when (and boot-descriptor (getf boot-descriptor :uefi))
+          (patch-uefi-stub raw-bytes
+                           (length (kernel-image-boot-code image))))
+        ;; Wrap in target-appropriate format
         (setf (kernel-image-image-bytes image)
               (if boot-descriptor
-                  (let ((elf-machine (getf boot-descriptor :elf-machine))
-                        (load-addr (or (getf boot-descriptor :load-addr) 0))
-                        (elf-class (getf boot-descriptor :elf-class 32))
-                        (elf-flags (getf boot-descriptor :elf-flags 0)))
-                    (cond
-                      ((and elf-machine (= elf-class 32))
-                       (wrap-in-elf32-be raw-bytes load-addr elf-machine))
-                      ((and elf-machine (= elf-class 64))
-                       (wrap-in-elf64-be raw-bytes load-addr elf-machine elf-flags))
-                      (t raw-bytes)))
+                  (cond
+                    ((getf boot-descriptor :uefi)
+                     (wrap-in-pe32plus raw-bytes))
+                    (t (let ((elf-machine (getf boot-descriptor :elf-machine))
+                             (load-addr (or (getf boot-descriptor :load-addr) 0))
+                             (elf-class (getf boot-descriptor :elf-class 32))
+                             (elf-flags (getf boot-descriptor :elf-flags 0)))
+                         (cond
+                           ((and elf-machine (= elf-class 32))
+                            (wrap-in-elf32-be raw-bytes load-addr elf-machine))
+                           ((and elf-machine (= elf-class 64))
+                            (wrap-in-elf64-be raw-bytes load-addr elf-machine elf-flags))
+                           (t raw-bytes)))))
                   raw-bytes))))
     image))
 
@@ -500,6 +542,9 @@
   (case target
     (:rpi :aarch64)
     (:fixpoint :aarch64)
+    (:uefi-x64 :x86-64)
+    (:x64-console :x86-64)
+    (:i386-console :i386)
     (otherwise target)))
 
 (defun build-image (&key (target :x86-64) (source nil) (source-text nil))
@@ -560,8 +605,12 @@
     (:68k     (m68k-boot-descriptor))
     (:arm32   (arm32-boot-descriptor))
     (:armv7   (armv7-boot-descriptor))
+    (:armv7-rpi (armv7-rpi-boot-descriptor))
     (:rpi     (rpi-boot-descriptor))
     (:fixpoint (aarch64-fixpoint-boot-descriptor))
+    (:uefi-x64 (uefi-x64-boot-descriptor))
+    (:x64-console (x64-console-boot-descriptor))
+    (:i386-console (i386-console-boot-descriptor))
     (otherwise nil)))
 
 (defun write-kernel-image (image pathname)
@@ -604,6 +653,24 @@
     (loop for form = (read stream nil :eof)
           until (eq form :eof)
           collect form)))
+
+(defun read-all-forms-with-locations (source-text)
+  "Read all Lisp forms from SOURCE-TEXT, tracking line numbers.
+   Returns (forms . line-numbers) where line-numbers is a vector
+   mapping form index to approximate source line."
+  (let ((forms nil)
+        (lines nil)
+        (line-count 1))
+    (with-input-from-string (stream source-text)
+      (loop
+        ;; Count lines up to current position
+        (let ((pos (file-position stream)))
+          (setf line-count (1+ (count #\Newline source-text :end pos)))
+          (let ((form (read stream nil :eof)))
+            (when (eq form :eof) (return))
+            (push form forms)
+            (push line-count lines)))))
+    (cons (nreverse forms) (coerce (nreverse lines) 'vector))))
 
 (defun compute-name-hash (name-string)
   "Compute dual-FNV-1a hash for a function name.

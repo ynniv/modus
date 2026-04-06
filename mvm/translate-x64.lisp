@@ -15,14 +15,14 @@
 
 (in-package :cl-user)
 
-(defpackage :modus64.mvm.x64
-  (:use :cl :modus64.mvm :modus64.asm)
+(defpackage :modus.mvm.x64
+  (:use :cl :modus.mvm :modus.asm)
   (:export
    #:translate-mvm-to-x64
    #:translate-function
    #:install-x64-translator))
 
-(in-package :modus64.mvm.x64)
+(in-package :modus.mvm.x64)
 
 ;;; ============================================================
 ;;; Physical Register Mapping
@@ -103,9 +103,11 @@
    Frame slots grow downward: slot N is at RBP + frame-slot-base - N*8.
    Above this: callee-saved saves (32 bytes) + spill slots (56 bytes) = 88.")
 
-(defconstant +frame-total-size+ 352
+(defconstant +frame-total-size+ 1120
   "Total frame reservation in bytes. Callee-saved saves (32) + spill slots (56)
-   + 32 frame slots for local variables (256) = 344, rounded to 352.")
+   + 128 frame slots for local variables (1024) = 1112, rounded to 1120.
+   Note: fe-mul (crypto.lisp) has ~74 nested let/let* bindings requiring 74
+   frame slots. 32 was too few, causing silent stack corruption.")
 
 ;;; ============================================================
 ;;; Scratch Register for Spill Mediation
@@ -320,6 +322,96 @@
              ((= code #x0302)
               ;; Memory barrier: mfence
               (emit-bytes buf #x0F #xAE #xF0))
+             ((= code #x0304)
+              ;; WFI: PAUSE on x86 (hint to yield CPU in spin-wait loops)
+              (emit-bytes buf #xF3 #x90))
+             ((= code #x0320)
+              ;; SETUP-IRQ: PIC remap + PIT timer + IDT + ISR for HLT-based io-delay
+              ;; Clobbers RAX, RCX, RDX, RDI — save/restore around
+              (emit-bytes buf #x51)  ; push rcx
+              (emit-bytes buf #x52)  ; push rdx
+              (emit-bytes buf #x57)  ; push rdi
+              ;; --- PIC remap: master IRQ0→0x20, slave IRQ8→0x28 ---
+              ;; ICW1: init + ICW4 needed
+              (emit-bytes buf #xB0 #x11 #x66 #xBA #x20 #x00 #xEE)  ; mov al,0x11; mov dx,0x20; out dx,al
+              (emit-bytes buf #xB0 #x11 #x66 #xBA #xA0 #x00 #xEE)  ; slave ICW1
+              ;; ICW2: vector offsets
+              (emit-bytes buf #xB0 #x20 #x66 #xBA #x21 #x00 #xEE)  ; master→0x20
+              (emit-bytes buf #xB0 #x28 #x66 #xBA #xA1 #x00 #xEE)  ; slave→0x28
+              ;; ICW3: wiring
+              (emit-bytes buf #xB0 #x04 #x66 #xBA #x21 #x00 #xEE)  ; master: slave on IRQ2
+              (emit-bytes buf #xB0 #x02 #x66 #xBA #xA1 #x00 #xEE)  ; slave: cascade
+              ;; ICW4: 8086 mode
+              (emit-bytes buf #xB0 #x01 #x66 #xBA #x21 #x00 #xEE)
+              (emit-bytes buf #xB0 #x01 #x66 #xBA #xA1 #x00 #xEE)
+              ;; Mask: unmask only IRQ0 (PIT) on master, mask all on slave
+              ;; IRQ2 (cascade) masked too — prevents spurious slave IRQ 0x2F triple fault
+              (emit-bytes buf #xB0 #xFE #x66 #xBA #x21 #x00 #xEE)  ; master: 0xFE = ~IRQ0 only
+              (emit-bytes buf #xB0 #xFF #x66 #xBA #xA1 #x00 #xEE)  ; slave: 0xFF = all masked
+              ;; --- PIT channel 0: ~1000Hz (divisor 1193 = 0x04A9) ---
+              (emit-bytes buf #xB0 #x34 #x66 #xBA #x43 #x00 #xEE)  ; mode 2, lobyte/hibyte
+              (emit-bytes buf #xB0 #xA9 #x66 #xBA #x40 #x00 #xEE)  ; divisor low
+              (emit-bytes buf #xB0 #x04 #x66 #xBA #x40 #x00 #xEE)  ; divisor high
+              ;; --- Zero IDT area (768 bytes = 96 qwords at 0x4F0000) ---
+              (emit-bytes buf #x48 #xBF) (emit-u32 buf #x4F0000) (emit-u32 buf 0)  ; mov rdi, 0x4F0000
+              (emit-bytes buf #x48 #x31 #xC0)  ; xor rax, rax
+              (emit-bytes buf #x48 #xB9) (emit-u32 buf 96) (emit-u32 buf 0)  ; mov rcx, 96
+              (emit-bytes buf #xF3 #x48 #xAB)  ; rep stosq
+              ;; --- Write IDT entry 0x20 at 0x4F0200 ---
+              ;; ISR at 0x4F0800: offset_lo=0x0800, selector=0x10, type=0x8E
+              (emit-bytes buf #x48 #xBF) (emit-u32 buf #x4F0200) (emit-u32 buf 0)  ; mov rdi, 0x4F0200
+              (emit-bytes buf #xC7 #x07) (emit-u32 buf #x00100800)  ; [rdi] = selector<<16|offset_lo
+              (emit-bytes buf #xC7 #x47 #x04) (emit-u32 buf #x004F8E00)  ; [rdi+4] = offset_mid<<16|type
+              (emit-bytes buf #xC7 #x47 #x08) (emit-u32 buf 0)  ; [rdi+8] = offset_hi
+              (emit-bytes buf #xC7 #x47 #x0C) (emit-u32 buf 0)  ; [rdi+12] = reserved
+              ;; --- Write IDT entry 0x2B at 0x4F0000 + 0x2B*16 = 0x4F02B0 ---
+              ;; E1000 IRQ 11 → vector 0x2B, ISR at 0x4F0810
+              (emit-bytes buf #x48 #xBF) (emit-u32 buf #x4F02B0) (emit-u32 buf 0)  ; mov rdi, 0x4F02B0
+              (emit-bytes buf #xC7 #x07) (emit-u32 buf #x00100810)  ; [rdi] = selector<<16|offset_lo
+              (emit-bytes buf #xC7 #x47 #x04) (emit-u32 buf #x004F8E00)  ; [rdi+4] = offset_mid<<16|type
+              (emit-bytes buf #xC7 #x47 #x08) (emit-u32 buf 0)  ; [rdi+8] = offset_hi
+              (emit-bytes buf #xC7 #x47 #x0C) (emit-u32 buf 0)  ; [rdi+12] = reserved
+              ;; --- Write PIT ISR at 0x4F0800 (8 bytes) ---
+              ;; push rax; mov al,0x20; out 0x20,al; pop rax; iretq
+              (emit-bytes buf #x48 #xBF) (emit-u32 buf #x4F0800) (emit-u32 buf 0)  ; mov rdi, 0x4F0800
+              (emit-bytes buf #xC7 #x07) (emit-u32 buf #xE620B050)  ; ISR bytes 0-3
+              (emit-bytes buf #xC7 #x47 #x04) (emit-u32 buf #xCF485820)  ; ISR bytes 4-7
+              ;; --- Write E1000 ISR at 0x4F0810 (10 bytes) ---
+              ;; Slave IRQ EOI: send 0x20 to slave PIC (0xA0) then master PIC (0x20)
+              ;; Byte sequence: 50 B0 20 E6 A0 E6 20 58 48 CF
+              ;; push rax; mov al,0x20; out 0xA0,al; out 0x20,al; pop rax; iretq
+              (emit-bytes buf #x48 #xBF) (emit-u32 buf #x4F0810) (emit-u32 buf 0)  ; mov rdi, 0x4F0810
+              ;; LE dwords: [50 B0 20 E6]=0xE620B050, [A0 E6 20 58]=0x5820E6A0, [48 CF xx xx]
+              (emit-bytes buf #xC7 #x07) (emit-u32 buf #xE620B050)  ; bytes 0-3
+              (emit-bytes buf #xC7 #x47 #x04) (emit-u32 buf #x5820E6A0)  ; bytes 4-7
+              ;; bytes 8-9: 48 CF (REX prefix + iretq)
+              (emit-bytes buf #x66 #xC7 #x47 #x08) (emit-u16 buf #xCF48)  ; mov word [rdi+8], 0xCF48
+              ;; --- LIDT ---
+              (emit-bytes buf #x48 #x83 #xEC #x10)  ; sub rsp, 16
+              (emit-bytes buf #x66 #xC7 #x04 #x24 #xFF #x02)  ; mov word [rsp], 767
+              (emit-bytes buf #xC7 #x44 #x24 #x02) (emit-u32 buf #x4F0000)  ; [rsp+2] = base low
+              (emit-bytes buf #xC7 #x44 #x24 #x06) (emit-u32 buf 0)  ; [rsp+6] = base high
+              (emit-bytes buf #x0F #x01 #x1C #x24)  ; lidt [rsp]
+              (emit-bytes buf #x48 #x83 #xC4 #x10)  ; add rsp, 16
+              (emit-bytes buf #x5F)  ; pop rdi
+              (emit-bytes buf #x5A)  ; pop rdx
+              (emit-bytes buf #x59)) ; pop rcx
+             ((= code #x0321)
+              ;; TIMER-REARM: NOP on x64 (only meaningful on AArch64 virt)
+              nil)
+             ((= code #x0310)
+              ;; RDTSC: Read timestamp counter, return 64-bit result in RAX
+              ;; Combine EDX:EAX into full 64-bit value
+              ;; rdtsc
+              (emit-bytes buf #x0F #x01 #xF9)  ; RDTSCP (waits for instructions)
+              ;; mov ecx, eax (save low 32)
+              (emit-bytes buf #x89 #xC1)
+              ;; mov eax, edx
+              (emit-bytes buf #x89 #xD0)
+              ;; shl rax, 32
+              (emit-bytes buf #x48 #xC1 #xE0 #x20)
+              ;; or rax, rcx
+              (emit-bytes buf #x48 #x09 #xC8))
              (t
               ;; Real CPU trap
               (emit-mov-reg-imm buf 'rax code)
@@ -406,6 +498,132 @@
            ;; Fix tagging: SAR d, 1
            (emit-sar-reg-imm buf d 1)
            (maybe-store-scratch buf vd)))
+
+        ((op= +op-mul26lo+)
+         ;; (mul26lo Vd Va Vb) — low 26 bits of untag(Va)*untag(Vb), tagged
+         ;; On x64: untag both, IMUL (64-bit result is enough), AND 0x3FFFFFF, retag
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf va d)
+           (emit-sar-reg-imm buf d 1)        ; untag va
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-mov-reg-reg buf 'r13 pb)
+                   (emit-sar-reg-imm buf 'r13 1)  ; untag vb
+                   (emit-imul-reg-reg buf d 'r13)
+                   (emit-pop buf 'r13))
+                 (progn
+                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                     (emit-push buf tmp)
+                     (emit-load-vreg buf vb tmp)
+                     (emit-sar-reg-imm buf tmp 1)
+                     (emit-imul-reg-reg buf d tmp)
+                     (emit-pop buf tmp)))))
+           (emit-and-reg-imm buf d #x3FFFFFF)
+           (emit-shl-reg-imm buf d 1)         ; retag
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-mul26hi+)
+         ;; (mul26hi Vd Va Vb) — bits 26+ of untag(Va)*untag(Vb), tagged
+         ;; On x64: untag both, IMUL, SHR 26, retag
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands))
+                (d (dest-phys-or-scratch vd)))
+           (emit-load-vreg buf va d)
+           (emit-sar-reg-imm buf d 1)        ; untag va
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-mov-reg-reg buf 'r13 pb)
+                   (emit-sar-reg-imm buf 'r13 1)  ; untag vb
+                   (emit-imul-reg-reg buf d 'r13)
+                   (emit-pop buf 'r13))
+                 (progn
+                   (let ((tmp (if (eq d 'rax) 'r13 'rax)))
+                     (emit-push buf tmp)
+                     (emit-load-vreg buf vb tmp)
+                     (emit-sar-reg-imm buf tmp 1)
+                     (emit-imul-reg-reg buf d tmp)
+                     (emit-pop buf tmp)))))
+           (emit-shr-reg-imm buf d 26)
+           (emit-shl-reg-imm buf d 1)         ; retag
+           (maybe-store-scratch buf vd)))
+
+        ((op= +op-mul64lo+)
+         ;; (mul64lo Vd Va Vb) — low 64 bits of raw Va*Vb (no tag/untag)
+         ;; On x64: MOV RAX, Va; MUL Vb → RDX:RAX; result in RAX
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands)))
+           ;; Save RDX (V6) — MUL clobbers it
+           (emit-push buf 'rdx)
+           ;; Load Va into RAX
+           (emit-load-vreg buf va 'rax)
+           ;; Get Vb into a register for MUL
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 ;; MUL r/m64: REX.W F7 /4  (unsigned multiply RDX:RAX = RAX * r/m)
+                 (emit-mul-reg buf pb)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf vb 'r13)
+                   (emit-mul-reg buf 'r13)
+                   (emit-pop buf 'r13))))
+           ;; Result (low 64) is in RAX
+           (emit-store-vreg buf vd 'rax)
+           (emit-pop buf 'rdx)))
+
+        ((op= +op-mul64hi+)
+         ;; (mul64hi Vd Va Vb) — high 64 bits of raw Va*Vb (no tag/untag)
+         ;; On x64: MOV RAX, Va; MUL Vb → RDX:RAX; result in RDX
+         (let* ((vd (first operands))
+                (va (second operands))
+                (vb (third operands)))
+           ;; Save RDX (V6) unless Vd is V6 (RDX)
+           (unless (= vd 6) (emit-push buf 'rdx))
+           ;; Load Va into RAX
+           (emit-load-vreg buf va 'rax)
+           ;; Get Vb into a register for MUL
+           (let ((pb (vreg-phys vb)))
+             (if pb
+                 (emit-mul-reg buf pb)
+                 (progn
+                   (emit-push buf 'r13)
+                   (emit-load-vreg buf vb 'r13)
+                   (emit-mul-reg buf 'r13)
+                   (emit-pop buf 'r13))))
+           ;; Result (high 64) is in RDX
+           (emit-store-vreg buf vd 'rdx)
+           (unless (= vd 6) (emit-pop buf 'rdx))))
+
+        ((op= +op-acc128+)
+         ;; (acc128 Vaddr Vlo Vhi) — mem128[Vaddr] += Vhi:Vlo (raw)
+         ;; On x64: ADD [addr], lo; ADC [addr+8], hi
+         (let ((vaddr (first operands))
+               (vlo (second operands))
+               (vhi (third operands)))
+           ;; Save scratch regs
+           (emit-push buf 'r13)
+           ;; Load addr into r13
+           (emit-load-vreg buf vaddr 'r13)
+           ;; Load lo into RAX (save/restore around it)
+           (emit-push buf 'rax)
+           (emit-load-vreg buf vlo 'rax)
+           ;; ADD [r13], RAX — sets carry flag
+           (emit-add-mem-reg buf 'r13 'rax 0)
+           ;; Load hi
+           (emit-load-vreg buf vhi 'rax)
+           ;; ADC [r13+8], RAX — add with carry
+           (emit-adc-mem-reg buf 'r13 'rax 8)
+           ;; Restore
+           (emit-pop buf 'rax)
+           (emit-pop buf 'r13)))
 
         ((op= +op-div+)
          ;; (div Vd Va Vb) — tagged fixnum division
@@ -1012,6 +1230,7 @@
                        (emit-mov-mem-reg buf 'rbp 'rax (+ +frame-slot-base+ (* idx -8)))
                        (emit-pop buf 'rax))))
                ;; Normal object slot store
+               ;; Slot address = (Vobj - 9) + 16 + idx*8 = Vobj + (idx*8 + 7)
                (let ((offset (+ (* idx 8) -1 8))
                      (po (vreg-phys vobj))
                      (ps (vreg-phys vs)))
@@ -1076,6 +1295,7 @@
          ;; (aref Vd Vobj Vidx) — variable-index array load
          ;; Element at [Vobj + Vidx*4 + 7]
          ;; (Vidx is tagged fixnum: real_idx*2, *4 gives real_idx*8)
+         ;; Offset: (Vobj - 9) + 16 + idx*8 = Vobj + idx*8 + 7
          (let* ((vd (first operands))
                 (vobj (second operands))
                 (vidx (third operands))
@@ -1508,6 +1728,71 @@
     (emit-bytes buf #x0F #xAF)
     (emit-byte buf (modrm #b11 (reg-code dst) (reg-code src)))))
 
+(defun emit-mul-reg (buf src)
+  "MUL src — unsigned multiply RDX:RAX = RAX * src (one-operand form).
+   REX.W + F7 /4"
+  (emit-byte buf (rex-prefix t nil nil (reg-extended-p src)))
+  (emit-byte buf #xF7)
+  (emit-byte buf (modrm #b11 4 (reg-code src))))
+
+(defun emit-add-mem-reg (buf base src offset)
+  "ADD [base+offset], src — add register to memory (sets carry flag).
+   REX.W + 01 /r [ModRM + disp]"
+  (let ((r (reg-extended-p src))
+        (b (reg-extended-p base)))
+    (emit-byte buf (rex-prefix t r nil b))
+    (emit-byte buf #x01)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((zerop offset)
+         (cond
+           ((= (logand (reg-code base) 7) 5) ; RBP/R13 need disp8
+            (emit-byte buf (modrm #b01 (reg-code src) (reg-code base)))
+            (when needs-sib (emit-byte buf #x24))
+            (emit-byte buf 0))
+           (needs-sib
+            (emit-byte buf (modrm #b00 (reg-code src) 4))
+            (emit-byte buf #x24))
+           (t
+            (emit-byte buf (modrm #b00 (reg-code src) (reg-code base))))))
+        ((<= -128 offset 127)
+         (emit-byte buf (modrm #b01 (reg-code src) (if needs-sib 4 (reg-code base))))
+         (when needs-sib (emit-byte buf #x24))
+         (emit-byte buf (logand offset #xFF)))
+        (t
+         (emit-byte buf (modrm #b10 (reg-code src) (if needs-sib 4 (reg-code base))))
+         (when needs-sib (emit-byte buf #x24))
+         (emit-s32 buf offset))))))
+
+(defun emit-adc-mem-reg (buf base src offset)
+  "ADC [base+offset], src — add with carry register to memory.
+   REX.W + 11 /r [ModRM + disp]"
+  (let ((r (reg-extended-p src))
+        (b (reg-extended-p base)))
+    (emit-byte buf (rex-prefix t r nil b))
+    (emit-byte buf #x11)
+    (let ((needs-sib (= (logand (reg-code base) 7) 4)))
+      (cond
+        ((zerop offset)
+         (cond
+           ((= (logand (reg-code base) 7) 5)
+            (emit-byte buf (modrm #b01 (reg-code src) (reg-code base)))
+            (when needs-sib (emit-byte buf #x24))
+            (emit-byte buf 0))
+           (needs-sib
+            (emit-byte buf (modrm #b00 (reg-code src) 4))
+            (emit-byte buf #x24))
+           (t
+            (emit-byte buf (modrm #b00 (reg-code src) (reg-code base))))))
+        ((<= -128 offset 127)
+         (emit-byte buf (modrm #b01 (reg-code src) (if needs-sib 4 (reg-code base))))
+         (when needs-sib (emit-byte buf #x24))
+         (emit-byte buf (logand offset #xFF)))
+        (t
+         (emit-byte buf (modrm #b10 (reg-code src) (if needs-sib 4 (reg-code base))))
+         (when needs-sib (emit-byte buf #x24))
+         (emit-s32 buf offset))))))
+
 (defun emit-neg-reg (buf reg)
   "NEG reg (two's complement negate).
    REX.W + F7 /3"
@@ -1746,10 +2031,10 @@
                (let ((info (gethash opcode *opcode-table*)))
                  (when info
                    (let ((op-specs (opcode-info-operands info)))
-                     ;; Branch instructions have :off16 in their operand spec
-                     (when (member :off16 op-specs)
+                     ;; Branch instructions have :off32 in their operand spec
+                     (when (member :off32 op-specs)
                        ;; Find the offset operand
-                       (let ((off-idx (position :off16 op-specs)))
+                       (let ((off-idx (position :off32 op-specs)))
                          (when off-idx
                            (let* ((off (nth off-idx operands))
                                   (target-pos (+ new-pos off)))
@@ -1834,13 +2119,13 @@
 (defun install-x64-translator ()
   "Install the x86-64 translator into the target descriptor.
    Sets translate-fn, emit-prologue, and emit-epilogue on *target-x86-64*."
-  (setf (target-translate-fn modus64.mvm:*target-x86-64*)
+  (setf (target-translate-fn modus.mvm:*target-x86-64*)
         #'translate-mvm-to-x64)
-  (setf (target-emit-prologue modus64.mvm:*target-x86-64*)
+  (setf (target-emit-prologue modus.mvm:*target-x86-64*)
         #'emit-function-prologue)
-  (setf (target-emit-epilogue modus64.mvm:*target-x86-64*)
+  (setf (target-emit-epilogue modus.mvm:*target-x86-64*)
         #'emit-function-epilogue)
-  modus64.mvm:*target-x86-64*)
+  modus.mvm:*target-x86-64*)
 
 (defun translate-single-instruction (opcode operands target buf)
   "Translate one MVM instruction to native code.

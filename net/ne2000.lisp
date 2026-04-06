@@ -121,17 +121,23 @@
   (io-out-byte #x303 (ne2k-rx-start))   ;; BNRY
   ;; Clear ISR
   (io-out-byte #x307 #xFF)
-  ;; Disable interrupts (we poll)
-  (io-out-byte #x30F #x00)
+  ;; Enable PRX interrupt (bit 0) — packet received fires IRQ.
+  ;; IRQs stay masked at CPU (EFLAGS.IF=0) so no ISR runs for receive,
+  ;; but the pending interrupt signal wakes HLT in io-delay.
+  (io-out-byte #x30F #x01)
+  ;; Read MAC from NE2000 PROM via remote DMA
+  ;; PROM is at NIC address 0x0000, 32 bytes. In byte mode, each MAC byte
+  ;; is duplicated: [MAC0,MAC0,MAC1,MAC1,...]. Read 12 bytes, use even offsets.
+  (ne2k-dma-read 0 12 (ne2k-rx-host))
   ;; Switch to page 1 for MAC and CURR
   (ne2k-page1-start)
-  ;; Set fixed MAC: 52:54:00:12:34:56
-  (io-out-byte #x301 #x52)  ;; PAR0
-  (io-out-byte #x302 #x54)  ;; PAR1
-  (io-out-byte #x303 #x00)  ;; PAR2
-  (io-out-byte #x304 #x12)  ;; PAR3
-  (io-out-byte #x305 #x34)  ;; PAR4
-  (io-out-byte #x306 #x56)  ;; PAR5
+  ;; Set MAC from PROM (even offsets: 0,2,4,6,8,10)
+  (io-out-byte #x301 (mem-ref (ne2k-rx-host) :u8))         ;; PAR0
+  (io-out-byte #x302 (mem-ref (+ (ne2k-rx-host) 2) :u8))   ;; PAR1
+  (io-out-byte #x303 (mem-ref (+ (ne2k-rx-host) 4) :u8))   ;; PAR2
+  (io-out-byte #x304 (mem-ref (+ (ne2k-rx-host) 6) :u8))   ;; PAR3
+  (io-out-byte #x305 (mem-ref (+ (ne2k-rx-host) 8) :u8))   ;; PAR4
+  (io-out-byte #x306 (mem-ref (+ (ne2k-rx-host) 10) :u8))  ;; PAR5
   ;; CURR = rx_start + 1 (first free page for NIC to write)
   (io-out-byte #x307 (+ (ne2k-rx-start) 1))
   ;; Accept all multicast
@@ -147,14 +153,15 @@
   (ne2k-page0-start)
   ;; TCR: normal transmit (no loopback)
   (io-out-byte #x30D #x00)
-  ;; Store MAC in state area for networking code
-  (let ((sb (e1000-state-base)))
-    (setf (mem-ref (+ sb 8) :u8) #x52)
-    (setf (mem-ref (+ sb 9) :u8) #x54)
-    (setf (mem-ref (+ sb 10) :u8) #x00)
-    (setf (mem-ref (+ sb 11) :u8) #x12)
-    (setf (mem-ref (+ sb 12) :u8) #x34)
-    (setf (mem-ref (+ sb 13) :u8) #x56)))
+  ;; Store MAC in state area for networking code (from PROM)
+  (let ((sb (e1000-state-base))
+        (rx (ne2k-rx-host)))
+    (setf (mem-ref (+ sb 8) :u8) (mem-ref rx :u8))
+    (setf (mem-ref (+ sb 9) :u8) (mem-ref (+ rx 2) :u8))
+    (setf (mem-ref (+ sb 10) :u8) (mem-ref (+ rx 4) :u8))
+    (setf (mem-ref (+ sb 11) :u8) (mem-ref (+ rx 6) :u8))
+    (setf (mem-ref (+ sb 12) :u8) (mem-ref (+ rx 8) :u8))
+    (setf (mem-ref (+ sb 13) :u8) (mem-ref (+ rx 10) :u8))))
 
 ;; ================================================================
 ;; Remote DMA: read bytes from NIC RAM to host
@@ -254,6 +261,9 @@
     curr))
 
 (defun ne2k-receive ()
+  ;; Clear PRX interrupt flag (bit 0 of ISR at 0x307) so HLT can sleep
+  ;; until next packet arrives. Write 0x01 to clear PRX bit (write-1-to-clear).
+  (io-out-byte #x307 #x01)
   ;; Check if packet available: BNRY+1 != CURR
   (let ((bnry (io-in-byte #x303))
         (curr (ne2k-get-curr)))

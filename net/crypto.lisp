@@ -1379,7 +1379,7 @@
         (result 1))
     (dotimes (i 32)
       (unless (eq (aref ab i) (aref bb i))
-        (setq result 0)))
+        (setq result nil)))
     result))
 
 ;; u^((p+3)/8) = u^(2^252-2) for square root
@@ -1636,7 +1636,7 @@
     (dotimes (byte-idx 32)
       (let ((byte-val (aref scalar byte-idx)))
         (dotimes (bit-idx 8)
-          (when (logand byte-val (ash 1 bit-idx))
+          (unless (zerop (logand byte-val (ash 1 bit-idx)))
             (setq result (ed-add result temp)))
           (setq temp (ed-double temp))))
       ;; Poll USB every 4 bytes to prevent host watchdog timeout
@@ -1713,7 +1713,7 @@
         (xhigh (make-array 36))
         (prod (make-array 52))
         (out (make-array 32))
-        (negated 0))
+        (negated nil))
     ;; Copy input
     (dotimes (i 64) (aset x i (aref hash i)))
     ;; Iterate reduction
@@ -1723,11 +1723,11 @@
         (loop
           (if (< j 64)
               (progn
-                (unless (zerop (aref x j)) (setq fits 0))
+                (unless (zerop (aref x j)) (setq fits nil))
                 (setq j (+ j 1)))
               (return ())))
         (when fits
-          (unless (< (aref x 31) #x10) (setq fits 0)))
+          (unless (< (aref x 31) #x10) (setq fits nil)))
         (when fits (return ())))
       ;; Clear product
       (dotimes (i 52) (aset prod i 0))
@@ -1772,7 +1772,7 @@
               (let ((pb (aref prod ci))
                     (xlb (if (< ci 32) (aref xlow ci) 0)))
                 (if (< xlb pb)
-                    (progn (setq x-low-ge 0) (return ()))
+                    (progn (setq x-low-ge nil) (return ()))
                     (if (< pb xlb)
                         (return ())
                         (setq ci (- ci 1)))))))
@@ -1788,7 +1788,7 @@
                         (progn (aset x i (+ diff 256)) (setq borrow 1))
                         (progn (aset x i diff) (setq borrow 0))))))
               (progn
-                (setq negated (logxor negated 1))
+                (setq negated (if negated nil 1))
                 (dotimes (i 50)
                   (let ((xlb (if (< i 32) (aref xlow i) 0))
                         (pb (aref prod i)))
@@ -1799,7 +1799,7 @@
     ;; Copy to output
     (dotimes (i 32) (aset out i (aref x i)))
     ;; Subtract L while out >= L
-    (let ((done 0))
+    (let ((done nil))
       (loop
         (when done (return ()))
         (let ((ge-l 1) (ci 31))
@@ -1809,7 +1809,7 @@
                       (lb (ed-l-byte ci)))
                   (if (< lb ob) (return ())
                       (if (< ob lb)
-                          (progn (setq ge-l 0) (return ()))
+                          (progn (setq ge-l nil) (return ()))
                           (setq ci (- ci 1)))))))
           (if ge-l
               (let ((borrow 0))
@@ -1825,7 +1825,7 @@
     (when negated
       (let ((is-zero 1))
         (dotimes (i 32)
-          (unless (zerop (aref out i)) (setq is-zero 0)))
+          (unless (zerop (aref out i)) (setq is-zero nil)))
         (unless is-zero
           (let ((borrow 0))
             (dotimes (i 32)
@@ -1848,7 +1848,7 @@
                   (lb (ed-l-byte ci)))
               (if (< lb rb) (return ())
                   (if (< rb lb)
-                      (progn (setq ge-l 0) (return ()))
+                      (progn (setq ge-l nil) (return ()))
                       (setq ci (- ci 1)))))))
       (when ge-l
         (let ((borrow 0))
@@ -1979,7 +1979,7 @@
                     (equal 1))
                 (dotimes (i 32)
                   (unless (eq (aref sb-e i) (aref rka-e i))
-                    (setq equal 0)))
+                    (setq equal nil)))
                 equal))))))))
 
 ;; Test Ed25519 with RFC 8032 test vector 1

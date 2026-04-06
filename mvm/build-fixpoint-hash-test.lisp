@@ -2,9 +2,9 @@
 ;;;;
 ;;;; Usage: sbcl --script mvm/build-fixpoint-hash-test.lisp
 ;;;;
-;;;; Produces /tmp/modus64-fixpoint-ht.bin — boot with:
+;;;; Produces /tmp/modus-fixpoint-ht.bin — boot with:
 ;;;;   qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 \
-;;;;     -kernel /tmp/modus64-fixpoint-ht.bin -nographic
+;;;;     -kernel /tmp/modus-fixpoint-ht.bin -nographic
 ;;;;
 ;;;; Expected output:
 ;;;;   42
@@ -15,48 +15,8 @@
 ;;;;   PASS
 ;;;;
 
-;;; ============================================================
-;;; Load MVM system
-;;; ============================================================
-
-(defvar *modus-base*
-  (let* ((mvm-dir (directory-namestring (truename *load-truename*)))
-         (modus-dir (namestring (truename (merge-pathnames "../" mvm-dir)))))
-    (pathname modus-dir)))
-
-(defun mvm-load (relative-path)
-  (let ((path (merge-pathnames relative-path *modus-base*)))
-    (load path :verbose nil :print nil)))
-
-(format t "Loading MVM system...~%")
-
-(mvm-load "cross/packages.lisp")
-(mvm-load "cross/x64-asm.lisp")
-(mvm-load "mvm/mvm.lisp")
-(mvm-load "mvm/target.lisp")
-(mvm-load "mvm/compiler.lisp")
-(mvm-load "mvm/interp.lisp")
-(mvm-load "boot/boot-x64.lisp")
-(mvm-load "boot/boot-riscv.lisp")
-(mvm-load "boot/boot-aarch64.lisp")
-(mvm-load "boot/boot-rpi.lisp")
-(mvm-load "boot/boot-ppc64.lisp")
-(mvm-load "boot/boot-ppc32.lisp")
-(mvm-load "boot/boot-i386.lisp")
-(mvm-load "boot/boot-68k.lisp")
-(mvm-load "boot/boot-arm32.lisp")
-(mvm-load "mvm/translate-x64.lisp")
-(mvm-load "mvm/translate-riscv.lisp")
-(mvm-load "mvm/translate-aarch64.lisp")
-(mvm-load "mvm/translate-ppc.lisp")
-(mvm-load "mvm/translate-i386.lisp")
-(mvm-load "mvm/translate-68k.lisp")
-(mvm-load "mvm/translate-arm32.lisp")
-(mvm-load "mvm/cross.lisp")
-
-;;; ============================================================
-;;; Read prelude source
-;;; ============================================================
+(load (merge-pathnames "../lib/load-mvm.lisp"
+                       (directory-namestring (truename *load-truename*))))
 
 (format t "Reading prelude source...~%")
 
@@ -117,7 +77,7 @@
 ;;; Build fixpoint hash table test image
 ;;; ============================================================
 
-(in-package :modus64.mvm)
+(in-package :modus.mvm)
 
 ;; Install the AArch64 translator
 (install-aarch64-translator)
@@ -130,6 +90,6 @@
                       cl-user::*test-source*
                       cl-user::*prelude-source*))
        (image (build-image :target :fixpoint :source-text full-source)))
-  (write-kernel-image image "/tmp/modus64-fixpoint-ht.bin")
+  (write-kernel-image image "/tmp/modus-fixpoint-ht.bin")
   (format t "Done. Boot with:~%")
-  (format t "  qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel /tmp/modus64-fixpoint-ht.bin -nographic~%"))
+  (format t "  qemu-system-aarch64 -machine virt -cpu cortex-a57 -m 512 -kernel /tmp/modus-fixpoint-ht.bin -nographic~%"))

@@ -112,10 +112,10 @@
     n))
 
 ;; Store ASCII string in fixed memory for version/algo strings
-;; "SSH-2.0-Modus64_1.0" = 20 bytes
+;; "SSH-2.0-Modus_1.0" = 18 bytes
 ;; Stored at e1000-state-base + 0x1000
 (defun ssh-init-strings ()
-  ;; Server version: "SSH-2.0-Modus64_1.0" (19 bytes)
+  ;; Server version: "SSH-2.0-Modus_1.0" (17 bytes)
   ;; Using u32 stores to reduce setf count (MVM codegen issue with 20+ setf calls)
   (let ((b (e1000-state-base)))
     (let ((b1 (+ b #x1000)))
@@ -125,11 +125,11 @@
     (let ((b3 (+ b #x1008)))
       (setf (mem-ref b3 :u32) #x75646F4D))        ;; Modu
     (let ((b4 (+ b #x100C)))
-      (setf (mem-ref b4 :u32) #x5F343673))        ;; s64_
+      (setf (mem-ref b4 :u32) #x312E5F73))        ;; s_1.
     (let ((b5 (+ b #x1010)))
-      (setf (mem-ref b5 :u32) #x00302E31))        ;; 1.0\0
-    (let ((b6 (+ b #x1013)))
-      (setf (mem-ref b6 :u32) 19)))                ;; version len
+      (setf (mem-ref b5 :u8) 48))                  ;; 0
+    (let ((b6 (+ b #x1011)))
+      (setf (mem-ref b6 :u32) 17)))                ;; version len
   )
 
 ;; Build KEXINIT payload (returns array + length via cons)
@@ -471,15 +471,15 @@
 
 ;; Send version string
 (defun ssh-send-version (ssh)
-  ;; "SSH-2.0-Modus64_1.0\r\n" = 21 bytes
-  (let ((v (make-array 21)))
+  ;; "SSH-2.0-Modus_1.0\r\n" = 19 bytes
+  (let ((v (make-array 19)))
     (aset v 0 83) (aset v 1 83) (aset v 2 72) (aset v 3 45)    ; SSH-
     (aset v 4 50) (aset v 5 46) (aset v 6 48) (aset v 7 45)    ; 2.0-
     (aset v 8 77) (aset v 9 111) (aset v 10 100) (aset v 11 117) ; Modu
-    (aset v 12 115) (aset v 13 54) (aset v 14 52) (aset v 15 95)  ; s64_
-    (aset v 16 49) (aset v 17 46) (aset v 18 48)                ; 1.0
-    (aset v 19 13) (aset v 20 10)                               ; \r\n
-    (tcp-send-conn (- ssh #x20) v 21)))
+    (aset v 12 115) (aset v 13 95) (aset v 14 49) (aset v 15 46) ; s_1.
+    (aset v 16 48)                                               ; 0
+    (aset v 17 13) (aset v 18 10)                               ; \r\n
+    (tcp-send-conn (- ssh #x20) v 19)))
 
 ;; Receive client version string
 ;; Returns 1 on success, 0 on failure
@@ -532,14 +532,14 @@
       (let ((vc (make-array vc-len)))
         (ssh-mem-load vc (+ ssh #x650) vc-len)
         (let ((vc-str (ssh-make-str vc vc-len)))
-          ;; V_S = server version as SSH string (19 bytes without \r\n)
-          (let ((vs (make-array 19)))
+          ;; V_S = server version as SSH string (17 bytes without \r\n)
+          (let ((vs (make-array 17)))
             (aset vs 0 83) (aset vs 1 83) (aset vs 2 72) (aset vs 3 45)
             (aset vs 4 50) (aset vs 5 46) (aset vs 6 48) (aset vs 7 45)
             (aset vs 8 77) (aset vs 9 111) (aset vs 10 100) (aset vs 11 117)
-            (aset vs 12 115) (aset vs 13 54) (aset vs 14 52) (aset vs 15 95)
-            (aset vs 16 49) (aset vs 17 46) (aset vs 18 48)
-            (let ((vs-str (ssh-make-str vs 19)))
+            (aset vs 12 115) (aset vs 13 95) (aset vs 14 49) (aset vs 15 46)
+            (aset vs 16 48)
+            (let ((vs-str (ssh-make-str vs 17)))
               ;; I_C = client kexinit as SSH string (per-connection at cb+0x1F00)
               (let ((ic-len (mem-ref (+ ssh #x20) :u32)))
                 (let ((ic (make-array ic-len)))
@@ -769,13 +769,12 @@
               (progn (aset out j (aref str i)) (setq j (+ j 1)))))
         (ssh-send-channel-data ssh cli-chan out j)))))
 
-;; Send prompt "modus64> "
+;; Send prompt "modus> "
 (defun ssh-send-prompt (ssh)
-  (let ((p (make-array 9)))
+  (let ((p (make-array 7)))
     (aset p 0 109) (aset p 1 111) (aset p 2 100) (aset p 3 117)  ; modu
-    (aset p 4 115) (aset p 5 54) (aset p 6 52) (aset p 7 62)     ; s64>
-    (aset p 8 32)                                                  ; space
-    (ssh-send-string ssh p 9)))
+    (aset p 4 115) (aset p 5 62) (aset p 6 32)                    ; s> space
+    (ssh-send-string ssh p 7)))
 
 ;; Set host key (32-byte private key)
 (defun ssh-set-host-key (privkey)

@@ -30,6 +30,97 @@
   (e1000-tx-buf-base))
 
 ;; ============================================================
+;; MAC address reading from USB CDC Ethernet descriptor
+;; ============================================================
+
+(defun cdc-hex-val (ch)
+  ;; Parse hex ASCII char to 0-15
+  (if (>= ch 97)
+      (+ (- ch 97) 10)
+      (if (>= ch 65)
+          (+ (- ch 65) 10)
+          (- ch 48))))
+
+(defun cdc-find-mac-string-idx (buf total-len)
+  ;; Walk config descriptor for CDC Ethernet Networking Functional Descriptor
+  ;; (type=0x24 CS_INTERFACE, subtype=0x0F Ethernet Networking).
+  ;; Returns iMACAddress string descriptor index, or 0 if not found.
+  (let ((pos 0) (result 0))
+    (loop
+      (when (>= pos total-len) (return result))
+      (let ((desc-len (mem-ref (+ buf pos) :u8)))
+        (when (< desc-len 2) (return result))
+        (let ((desc-type (mem-ref (+ buf (+ pos 1)) :u8)))
+          (when (eq desc-type #x24)
+            (when (>= desc-len 4)
+              (let ((subtype (mem-ref (+ buf (+ pos 2)) :u8)))
+                (when (eq subtype #x0F)
+                  (setq result (mem-ref (+ buf (+ pos 3)) :u8))
+                  (return result))))))
+        (setq pos (+ pos desc-len))))))
+
+(defun cdc-try-config-mac (devaddr dbuf cfg-idx)
+  ;; Read config descriptor at cfg-idx, find CDC Ethernet MAC string index.
+  ;; Returns string index > 0 if found, 0 otherwise.
+  (loop
+    (let ((r (usb-get-descriptor devaddr (usb-desc-configuration) cfg-idx dbuf 9)))
+      (when (<= r 0) (return 0))
+      (let ((total-len (usb-desc-u16 dbuf 2)))
+        (when (> total-len 512) (setq total-len 512))
+        (let ((r2 (usb-get-descriptor devaddr (usb-desc-configuration) cfg-idx dbuf total-len)))
+          (when (<= r2 0) (return 0))
+          (return (cdc-find-mac-string-idx dbuf total-len)))))))
+
+(defun cdc-read-mac-string (devaddr dbuf str-idx state)
+  ;; Read USB string descriptor str-idx, parse 12-char hex MAC into
+  ;; state+0x08..0x0D. String descriptor: [bLen][bType=3][UTF-16LE chars...]
+  ;; MAC string: "AABBCCDDEEFF" — 12 hex chars, 24 bytes UTF-16LE + 2 header.
+  ;; Returns 1 on success, 0 on failure.
+  (loop
+    ;; GET_DESCRIPTOR string: wValue=(3<<8)|idx, wIndex=0x0409 (English)
+    (let ((wvalue (logior (ash 3 8) str-idx)))
+      (let ((r (usb-control-transfer devaddr #x80 (usb-req-get-descriptor)
+                                     wvalue #x0409 dbuf 64)))
+        (when (<= r 0) (return 0))
+        ;; Verify string descriptor type
+        (let ((btype (mem-ref (+ dbuf 1) :u8)))
+          (when (not (eq btype 3)) (return 0))
+          (let ((blen (mem-ref dbuf :u8)))
+            ;; Need at least 26 bytes (2 header + 12 chars * 2 UTF-16LE)
+            (when (< blen 26) (return 0))
+            ;; Parse 6 MAC bytes from UTF-16LE hex chars
+            ;; Char i*2 at offset 2+(i*4), char i*2+1 at offset 4+(i*4)
+            (let ((i 0))
+              (loop
+                (when (>= i 6) (return nil))
+                (let ((hi-off (+ 2 (ash i 2))))
+                  (let ((lo-off (+ 4 (ash i 2))))
+                    (let ((hi-ch (mem-ref (+ dbuf hi-off) :u8)))
+                      (let ((lo-ch (mem-ref (+ dbuf lo-off) :u8)))
+                        (let ((byte-val (logior (ash (cdc-hex-val hi-ch) 4)
+                                                (cdc-hex-val lo-ch))))
+                          (setf (mem-ref (+ state (+ #x08 i)) :u8) byte-val))))))
+                (setq i (+ i 1))))
+            (return 1)))))))
+
+(defun cdc-read-mac (state)
+  ;; Read MAC address from USB device's CDC Ethernet descriptor.
+  ;; Stores MAC at state+0x08..0x0D.
+  ;; Returns 1 if MAC read from device, 0 if not found.
+  (let ((dbuf (usb-data-buf))
+        (devaddr (usb-dev-addr)))
+    (loop
+      ;; Try config descriptor index 0
+      (let ((idx0 (cdc-try-config-mac devaddr dbuf 0)))
+        (when (> idx0 0)
+          (return (cdc-read-mac-string devaddr dbuf idx0 state)))
+        ;; Try config descriptor index 1
+        (let ((idx1 (cdc-try-config-mac devaddr dbuf 1)))
+          (when (> idx1 0)
+            (return (cdc-read-mac-string devaddr dbuf idx1 state)))
+          (return 0))))))
+
+;; ============================================================
 ;; CDC Ethernet initialization
 ;; Uses loop + return for early exit (MVM doesn't support return-from)
 ;; ============================================================
@@ -56,14 +147,15 @@
 
         ;; 3. Initialize network state
         (let ((state (e1000-state-base)))
-          ;; Store a default MAC address (52:54:00:12:34:56)
-          ;; QEMU assigns this to usb-net by default
-          (setf (mem-ref (+ state #x08) :u8) #x52)
-          (setf (mem-ref (+ state #x09) :u8) #x54)
-          (setf (mem-ref (+ state #x0A) :u8) #x00)
-          (setf (mem-ref (+ state #x0B) :u8) #x12)
-          (setf (mem-ref (+ state #x0C) :u8) #x34)
-          (setf (mem-ref (+ state #x0D) :u8) #x56)
+          ;; Read MAC from USB device descriptor
+          (let ((mac-ok (cdc-read-mac state)))
+            (when (zerop mac-ok)
+              ;; Fallback: store zeros (will show MAC:00:00:00:00:00:00)
+              (let ((j 0))
+                (loop
+                  (when (>= j 6) (return nil))
+                  (setf (mem-ref (+ state (+ #x08 j)) :u8) 0)
+                  (setq j (+ j 1))))))
 
           ;; Initialize cursors
           (setf (mem-ref (+ state #x10) :u32) 0)  ; RX cursor
@@ -74,14 +166,14 @@
           (setf (mem-ref (+ state #x18) :u32) #x0F02000A)  ; 10.0.2.15
           (setf (mem-ref (+ state #x1C) :u32) #x0202000A)  ; 10.0.2.2
 
-          ;; Print MAC
+          ;; Print MAC (read from state, not hardcoded)
           (write-byte 77) (write-byte 65) (write-byte 67) (write-byte 58)  ; "MAC:"
-          (print-hex-byte #x52) (write-byte 58)
-          (print-hex-byte #x54) (write-byte 58)
-          (print-hex-byte #x00) (write-byte 58)
-          (print-hex-byte #x12) (write-byte 58)
-          (print-hex-byte #x34) (write-byte 58)
-          (print-hex-byte #x56) (write-byte 10)
+          (print-hex-byte (mem-ref (+ state #x08) :u8)) (write-byte 58)
+          (print-hex-byte (mem-ref (+ state #x09) :u8)) (write-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0A) :u8)) (write-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0B) :u8)) (write-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0C) :u8)) (write-byte 58)
+          (print-hex-byte (mem-ref (+ state #x0D) :u8)) (write-byte 10)
 
           ;; Print status
           (write-byte 67) (write-byte 68) (write-byte 67)  ; "CDC"

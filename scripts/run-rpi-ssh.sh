@@ -6,7 +6,8 @@ set -e
 cd "$(dirname "$0")/.."
 
 PORT=${1:-2222}
-LOGFILE="/tmp/modus64-rpi-ssh.log"
+EXPR="${2:-}"
+LOGFILE="/tmp/modus-rpi-ssh.log"
 QEMU_PID=""
 
 cleanup() {
@@ -61,12 +62,18 @@ if ! grep -q "SSH:" "$LOGFILE" 2>/dev/null; then
     exit 1
 fi
 
-echo ""
-echo "Modus64 RPi SSH server ready on port $PORT."
-echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
-echo ""
-echo "Press Ctrl-C to stop."
+if [ -n "$EXPR" ]; then
+    sleep 15
+    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=60 -p "$PORT" test@localhost "$EXPR" 2>/dev/null || true
+    cleanup
+else
+    echo ""
+    echo "Modus RPi SSH server ready on port $PORT."
+    echo "  ssh -p $PORT -o StrictHostKeyChecking=no test@localhost"
+    echo ""
+    echo "Press Ctrl-C to stop."
 
-# Wait for QEMU to exit or Ctrl-C
-wait "$QEMU_PID" 2>/dev/null
-QEMU_PID=""
+    # Wait for QEMU to exit or Ctrl-C
+    wait "$QEMU_PID" 2>/dev/null
+    QEMU_PID=""
+fi
